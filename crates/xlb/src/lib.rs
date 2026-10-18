@@ -12,6 +12,22 @@
 //! fallback + Bao verifier glue (xlb-3) + BandwidthGovernor with
 //! battery/metered auto-detection (xlb-4). Full five-tier fetch chain wired
 //! per `.yah/docs/architecture/xlb.md`.
+//!
+//! @yah:ticket(R002-F2, "Ref resolution: Hash, Version(name, semver req), Latest(name, channel) via per-class manifest")
+//! @yah:at(2026-10-17T21:01:01Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R002)
+//! @yah:next("Tier: Warrior")
+//! @yah:next("Ref::{Hash, Version(name, semver req), Latest(name, channel)} resolved through a per-class manifest.")
+//! @yah:next("Hash refs are immutable; Version/Latest re-resolve on a TTL.")
+//!
+//! @yah:ticket(R002-S3, "Spike: does xlb (iroh/iroh-blobs deps) build for wasm32?")
+//! @yah:at(2026-10-17T21:01:03Z)
+//! @yah:kind(spike)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R002)
+//! @yah:next("Tier: Warrior")
+//! @yah:next("Decides whether the browser runs xlb itself or a thin client sharing xlb's policy types (retention and ref types).")
 
 pub mod bandwidth;
 pub(crate) mod cache;

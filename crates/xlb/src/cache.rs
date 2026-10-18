@@ -44,6 +44,26 @@
 //! map at the [`AssetClass::fetch_bytes`] level — separate concern, not
 //! T3's scope. The tests in `tests/disk_cache.rs` lock in the
 //! atomicity-under-contention property.
+//!
+//! @yah:relay(R002, "xlb: retention policy, ref resolution, browser storage tier")
+//! @yah:at(2026-10-17T21:00:57Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:next("Context: noisetable R992 built a parallel mini-fetcher (crates/noise_table/marketplace/src/required_fetch.rs) plus pruning (required_manifest.rs) for app assets (fonts, HRTF, notices) that xlb should replace.")
+//!
+//! @yah:ticket(R002-F1, "Pinning plus retention per AssetClass")
+//! @yah:at(2026-10-17T21:00:59Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R002)
+//! @yah:next("Tier: Warrior")
+//! @yah:next("Pinned entries (release manifest, pinned sets) are never evicted; keep the previous N releases; the LRU byte budget applies only to unpinned entries.")
+//! @yah:next("Today cache.rs is pure LRU and the in-memory variant has no budget; add one.")
+//!
+//! @yah:ticket(R002-F4, "OPFS-backed cache variant for the browser")
+//! @yah:at(2026-10-17T21:01:05Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R002)
+//! @yah:next("Tier: Warrior")
+//! @yah:next("Third cache flavor beside the in-memory and on-disk ones in cache.rs, backed by OPFS, honoring the R002-F1 retention policy. Shape depends on R002-S3 (xlb on wasm vs thin client).")
 
 use std::{
     collections::{HashMap, VecDeque},
