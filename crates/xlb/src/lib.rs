@@ -14,24 +14,46 @@
 //! per `.yah/docs/architecture/xlb.md`.
 //!
 //! @yah:ticket(R002-F2, "Ref resolution: Hash, Version(name, semver req), Latest(name, channel) via per-class manifest")
-//! @yah:at(2026-10-17T21:01:01Z)
+//! @yah:status(review)
+//! @yah:at(2026-10-18T18:14:46Z)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R002)
 //! @yah:next("Tier: Warrior")
 //! @yah:next("Ref::{Hash, Version(name, semver req), Latest(name, channel)} resolved through a per-class manifest.")
 //! @yah:next("Hash refs are immutable; Version/Latest re-resolve on a TTL.")
+//! @yah:depends_on(R002-F1)
+//! @yah:handoff("Added crates/xlb/src/refs.rs (platform-neutral: no fs/tokio/clock): Ref::{Hash, Version(String, VersionReq), Latest(String, String)}, Manifest JSON (schema=1; release{id,hashes}; pinned_sets; entries{name,version,channels,hash,size}), ParsedManifest (validates versions/hashes up front; resolve picks highest semver; Latest filters by channel), Resolution{hash,fetched_at_ms}, is_expired(fetched_at, now, ttl) with now as a parameter.")
+//! @yah:handoff("Added crates/xlb/src/resolver.rs (native): ManifestSource async trait, HttpManifestSource (reqwest, no redirects), ResolverState (manifest + fetched_at, Ref memo, applied pin-set names). lib.rs: AssetClassConfig.manifest_url + resolve_ttl (default 300s); AssetClass::{resolve, resolve_asset, refresh_manifest, set_manifest_source}. Hash refs return immediately and never fetch. Version/Latest memoised; past TTL the manifest is refetched and the memo cleared. If the refetch fails and a manifest is cached, the stale resolution is served (stays expired, retries next call); cold failure errors.")
+//! @yah:handoff("Pin re-derivation: each manifest refresh feeds release -> record_release, pinned_sets -> pin_set, and sets the previous manifest had but the new one dropped -> unpin_set. This resolves R002-F1's 'pin state is in-memory only' gotcha; struck it from R002-F1 via board.update.")
+//! @yah:handoff("Deps added to crates/xlb/Cargo.toml: semver 1, serde 1 (derive), serde_json 1 (all already in Cargo.lock; lock unchanged by me). Updated examples/register_class.rs for the new config fields. Did not edit noisetable's required_manifest.rs (used only as format reference: release + per-asset blake3/size).")
+//! @yah:handoff("Git policy defer, no commit. Suggested: git add crates/xlb/src/refs.rs crates/xlb/src/resolver.rs crates/xlb/src/lib.rs crates/xlb/Cargo.toml crates/xlb/examples/register_class.rs && git commit -m 'xlb: Ref resolution via per-class manifest (R002-F2)'")
+//! @yah:verify("cargo test --workspace in oss/xlb: EXIT=0; xlb lib 72 -> 82 (5 refs tests + 5 resolver tests: Hash no-fetch, Version/Latest TTL re-resolve, stale-on-failure, no source, pin re-derivation + dropped-set unpin); full workspace 126 passed vs baseline 116 (log /tmp/r002f2-5.log).")
+//! @yah:gotcha("The manifest is a mutable, non-content-addressed pointer; its integrity is only the transport's (TLS). Blobs it names are still BLAKE3-verified at fetch. No signature over the manifest yet.")
+//! @yah:gotcha("Wasm-neutrality of refs.rs not compiled against wasm32 (deps: semver, serde, serde_json, thiserror, crate::BlakeHash which lives in the native lib.rs) — R002-F4 extraction must move BlakeHash too.")
 //!
 //! @yah:ticket(R002-S3, "Spike: does xlb (iroh/iroh-blobs deps) build for wasm32?")
-//! @yah:at(2026-10-17T21:01:03Z)
+//! @yah:status(review)
+//! @yah:at(2026-10-18T18:06:17Z)
 //! @yah:kind(spike)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R002)
 //! @yah:next("Tier: Warrior")
 //! @yah:next("Decides whether the browser runs xlb itself or a thin client sharing xlb's policy types (retention and ref types).")
+//! @yah:handoff("VERDICT: browser can run iroh/iroh-blobs themselves, but NOT xlb as-is; recommend a split crate (xlb-core: policy/Ref/verify types, no iroh) shared by a thin wasm client, with OPFS cache (R002-F4) implemented behind a cache trait. Do not try to compile the current xlb crate for wasm32.")
+//! @yah:handoff("EVIDENCE: `cargo check -p xlb --target wasm32-unknown-unknown` fails first in mio 1.2.0 (36 errors, mio has no wasm32-unknown-unknown backend). mio reaches xlb via (a) mshr 0.8.47 -> mdns-sd 0.21.4 (mshr/Cargo.toml non-apple dep, unconditional) and (b) tokio 1.52.3 with net-capable features pulled by iroh deps/hyper (iroh-metrics 1.0.2 -> hyper-util). xlb itself also requests tokio `rt-multi-thread`, which tokio rejects on wasm.")
+//! @yah:handoff("POSITIVE PROBE: scratch crate with iroh 1.3.0 + iroh-blobs 0.103.1 (default-features=false, no `tls-ring`) + blake3 + bytes passes `cargo check --target wasm32-unknown-unknown` (EXIT=0). Registry source confirms deliberate browser support: iroh-1.3.0/Cargo.toml has target cfg(all(target_family=wasm,target_os=unknown)) deps getrandom(wasm_js), time(wasm-bindgen), wasm-bindgen-futures, and gates noq/portmapper/tokio to non-wasm (~256 wasm cfg hits in iroh/src); iroh-blobs-0.103.1 adds chrono wasmbind + getrandom wasm_js. Browser iroh is relay-only (no UDP/mDNS/portmapper), so LAN tier is unavailable in-browser.")
+//! @yah:handoff("xlb modules NOT neutral: cache.rs (std::fs, tokio Mutex/RwLock), bandwidth.rs (std::fs /proc reads), transport/blobs.rs (iroh + mshr Endpoint), transport/http.rs (reqwest rustls-tls), seed.rs (R2 upload), testing.rs. Likely neutral: verify.rs (blake3/hmac/sha2), metrics.rs, source.rs trait/progress types, retention/Ref types -- not individually verified by compile.")
+//! @yah:handoff("RECOMMENDED SPLIT: (1) extract policy/Ref/verify/metrics/progress types into a dependency-light crate (or `default = [\"native\"]` feature on xlb where `native` gates cache/bandwidth/seed/testing/transport, iroh, mshr, reqwest-rustls, tokio rt-multi-thread, tls-ring); (2) wasm client enables iroh+iroh-blobs without tls-ring (relay/HTTP-edge tiers) and implements the cache trait over OPFS. No gate landed: lib.rs/cache.rs are being edited by R002-F1 and gating needs cfg on cache.rs's module; Cargo.toml/lib.rs untouched, so native tests unaffected.")
+//! @yah:handoff("UNVERIFIED: whether `tls-ring` (ring 0.17.14) builds for wasm32-unknown-unknown (needs clang; not tried) and whether iroh with a real Endpoint works end-to-end in a browser; reqwest rustls-tls on wasm not checked (reqwest uses its wasm backend, TLS features are ignored/unsupported there).")
+//! @yah:verify("cargo check -p xlb --target wasm32-unknown-unknown  (fails in mio; log /tmp/r002s3-1.log)")
+//! @yah:verify("cargo tree -p xlb --target wasm32-unknown-unknown -i mio")
+//! @yah:verify("scratch crate /tmp/r002s3-probe: iroh 1.3 + iroh-blobs 0.103 default-features=false, cargo check --target wasm32-unknown-unknown (EXIT=0; log /tmp/r002s3-2.log)")
+//! @yah:verify("grep wasm in ~/.cargo/registry iroh-1.3.0/Cargo.toml and iroh-blobs-0.103.1/Cargo.toml")
 
 pub mod bandwidth;
 pub(crate) mod cache;
 pub mod metrics;
+pub(crate) mod resolver;
 pub mod seed;
 pub(crate) mod source;
 pub mod testing;
@@ -41,9 +63,13 @@ pub(crate) mod verify;
 pub use bandwidth::BandwidthGovernor;
 pub use cache::CacheStats;
 pub use metrics::{FetchObserver, FetchReport};
+pub use resolver::ManifestSource;
 pub use seed::{derive_key, seed_blob, R2Target, SeedOutcome};
 pub(crate) use source::BlobSource;
 pub use source::{FetchProgress, FetchTier, ProgressSink};
+pub use xlb_core::{refs, retention};
+pub use xlb_core::{BlakeHash, InvalidHash, Ref, Resolution, ResolveError};
+pub use xlb_core::{RetentionIndex, RetentionPolicy};
 
 use bytes::Bytes;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -56,7 +82,7 @@ use crate::cache::Cache;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid hash: {0}")]
-    InvalidHash(String),
+    InvalidHash(#[from] InvalidHash),
 
     #[error("all sources exhausted for {0}")]
     FetchFailed(BlakeHash),
@@ -72,66 +98,6 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-// ─── BlakeHash ────────────────────────────────────────────────────────────────
-
-/// A BLAKE3 content-hash — the stable identity of an xlb asset.
-///
-/// All arithmetic in xlb is over these hashes; no integer IDs or paths are
-/// canonical.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlakeHash([u8; 32]);
-
-impl BlakeHash {
-    /// Compute the BLAKE3 hash of `data`.
-    pub fn hash(data: &[u8]) -> Self {
-        Self(*blake3::hash(data).as_bytes())
-    }
-
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn from_hex(s: &str) -> Result<Self> {
-        let raw = hex::decode(s).map_err(|_| Error::InvalidHash(s.to_string()))?;
-        let arr: [u8; 32] = raw
-            .try_into()
-            .map_err(|_| Error::InvalidHash(format!("expected 32 bytes: {s}")))?;
-        Ok(Self(arr))
-    }
-
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Returns `true` when `data` hashes to this value.
-    pub fn verify(&self, data: &[u8]) -> bool {
-        *self == Self::hash(data)
-    }
-}
-
-impl std::fmt::Debug for BlakeHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BlakeHash({}…)", &self.to_hex()[..8])
-    }
-}
-
-impl std::fmt::Display for BlakeHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
-    }
-}
-
-impl std::str::FromStr for BlakeHash {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self> {
-        Self::from_hex(s)
-    }
-}
 
 // ─── Policy types ─────────────────────────────────────────────────────────────
 
@@ -266,6 +232,16 @@ pub struct AssetClassConfig {
     pub cache_dir: Option<PathBuf>,
     /// LRU eviction budget for cached assets, in bytes.
     pub cache_budget_bytes: u64,
+    /// Releases before the current one whose manifest blobs stay pinned
+    /// (see [`AssetClass::record_release`]). `1` = current + previous.
+    pub keep_releases: usize,
+    /// HTTPS URL of this class's JSON manifest (see [`refs`]). `None` = no
+    /// manifest; supply one with [`AssetClass::set_manifest_source`] or use
+    /// only `Ref::Hash`.
+    pub manifest_url: Option<String>,
+    /// How long a manifest fetch (and the `Version`/`Latest` resolutions
+    /// derived from it) stays fresh before [`AssetClass::resolve`] refetches.
+    pub resolve_ttl: std::time::Duration,
     /// Called once per completed fetch with a [`FetchReport`] (R423-T7).
     ///
     /// `None` — the default — means no instrumentation and no cost. Set it to
@@ -284,6 +260,9 @@ impl Default for AssetClassConfig {
             bandwidth: BandwidthPolicy::default(),
             cache_dir: None,
             cache_budget_bytes: 1024 * 1024 * 1024,
+            keep_releases: 1,
+            manifest_url: None,
+            resolve_ttl: std::time::Duration::from_secs(300),
             observer: None,
         }
     }
@@ -304,6 +283,8 @@ struct ClassInner {
     /// Bandwidth governor — enforces per-tier caps and auto-governors
     /// (battery/metered). Updated via `set_governor_*` and `probe_os`.
     governor: BandwidthGovernor,
+    /// Manifest, resolution memo and applied pin-set names (R002-F2).
+    resolver: tokio::sync::Mutex<resolver::ResolverState>,
 }
 
 /// A registered asset class — a per-app namespace for content-addressed blobs.
@@ -312,6 +293,13 @@ struct ClassInner {
 /// Drop the last clone to stop seeding gracefully (xlb-2+).
 #[derive(Clone)]
 pub struct AssetClass(Arc<ClassInner>);
+
+/// Eviction deletes are best-effort; the index has already dropped the entries.
+fn log_evict_failure(r: Result<(), xlb_core::StoreError>) {
+    if let Err(e) = r {
+        tracing::warn!("cache eviction delete failed: {e}");
+    }
+}
 
 impl AssetClass {
     /// Register a new asset class.
@@ -347,10 +335,31 @@ impl AssetClass {
         // disk-backed at the given path with LRU eviction gated on
         // `cache_budget_bytes`. The latter survives process restart, which
         // is the whole reason this layer exists (see W160 F3).
-        let cache = Cache::new(config.cache_dir.as_deref(), config.cache_budget_bytes)?;
+        let cache = Cache::new(
+            config.cache_dir.as_deref(),
+            RetentionPolicy::new(config.cache_budget_bytes, config.keep_releases),
+        )
+        .await?;
+
+        let manifest_source: Option<Arc<dyn ManifestSource>> = match config
+            .manifest_url
+            .as_deref()
+            .map(resolver::HttpManifestSource::new)
+        {
+            Some(Ok(s)) => Some(Arc::new(s)),
+            Some(Err(e)) => {
+                tracing::warn!("manifest source init failed: {e}");
+                None
+            }
+            None => None,
+        };
 
         Ok(Self(Arc::new(ClassInner {
             config,
+            resolver: tokio::sync::Mutex::new(resolver::ResolverState {
+                source: manifest_source,
+                ..Default::default()
+            }),
             cache,
             sources: RwLock::new(initial_sources),
             role: RwLock::new((SeedRole::Participant, PeerTier::Workstation)),
@@ -414,16 +423,152 @@ impl AssetClass {
     /// from an operator surface on a timer. See [`CacheStats::disk_backed`]
     /// before drawing a used-vs-budget ratio.
     pub async fn cache_stats(&self) -> CacheStats {
-        self.0
+        self.0.cache.stats().await
+    }
+
+    /// Pin one blob: never evicted, outside the byte budget. May be called
+    /// before the blob has been fetched.
+    pub async fn pin(&self, hash: BlakeHash) {
+        self.0.cache.retention().pin(hash);
+    }
+
+    /// Drop a hash pin; the blob rejoins the LRU (and may be evicted at once
+    /// if the unpinned footprint is over budget).
+    pub async fn unpin(&self, hash: &BlakeHash) {
+        let r = self.0.cache.retention().unpin(hash).await;
+        log_evict_failure(r);
+    }
+
+    /// Define or replace a named pin set (e.g. a consumer's required-asset
+    /// list).
+    pub async fn pin_set(&self, name: &str, hashes: impl IntoIterator<Item = BlakeHash>) {
+        self.0.cache.retention().pin_set(name, hashes);
+    }
+
+    /// Remove a named pin set.
+    pub async fn unpin_set(&self, name: &str) {
+        let r = self.0.cache.retention().unpin_set(name).await;
+        log_evict_failure(r);
+    }
+
+    /// Record `release` as current with the blobs its manifest lists; releases
+    /// more than `keep_releases` back lose their protection.
+    pub async fn record_release(&self, release: &str, hashes: impl IntoIterator<Item = BlakeHash>) {
+        let r = self
+            .0
             .cache
-            .stats(self.0.config.cache_budget_bytes)
-            .await
+            .retention()
+            .record_release(release, hashes)
+            .await;
+        log_evict_failure(r);
+    }
+
+    /// Whether `hash` is currently protected from eviction.
+    pub async fn is_pinned(&self, hash: &BlakeHash) -> bool {
+        self.0.cache.retention().is_pinned(hash)
     }
 
     /// Add a fetch source to the chain (e.g. a transport adapter or mock peer).
     ///
     /// Sources are tried in `FetchTier` priority order regardless of insertion
     /// order. Safe to call after the class is registered.
+    /// Replace where this class's manifest comes from (default: HTTP GET of
+    /// `config.manifest_url`). Drops any cached manifest and resolutions.
+    pub async fn set_manifest_source(&self, source: Arc<dyn ManifestSource>) {
+        let mut st = self.0.resolver.lock().await;
+        st.source = Some(source);
+        st.manifest = None;
+        st.memo.clear();
+    }
+
+    /// Resolve `r` to a content hash through the class manifest.
+    ///
+    /// `Hash` refs return immediately and never touch the manifest.
+    /// `Version`/`Latest` are memoised and re-resolved once
+    /// `config.resolve_ttl` has elapsed; if the refetch fails and a manifest
+    /// is already cached, the stale resolution is served (and stays expired,
+    /// so the next call retries) rather than failing an offline client.
+    pub async fn resolve(&self, r: &Ref) -> std::result::Result<BlakeHash, ResolveError> {
+        self.resolve_at(r, resolver::now_ms()).await
+    }
+
+    /// Resolve `r` and return the [`Asset`] handle for the result.
+    pub async fn resolve_asset(&self, r: &Ref) -> std::result::Result<Asset, ResolveError> {
+        Ok(self.asset(self.resolve(r).await?))
+    }
+
+    /// Refetch the manifest now regardless of TTL, then re-derive pins.
+    pub async fn refresh_manifest(&self) -> std::result::Result<(), ResolveError> {
+        let mut st = self.0.resolver.lock().await;
+        self.refresh_locked(&mut st, resolver::now_ms()).await
+    }
+
+    pub(crate) async fn resolve_at(
+        &self,
+        r: &Ref,
+        now_ms: u64,
+    ) -> std::result::Result<BlakeHash, ResolveError> {
+        if let Ref::Hash(h) = r {
+            return Ok(*h);
+        }
+        let ttl_ms = self.0.config.resolve_ttl.as_millis() as u64;
+        let mut st = self.0.resolver.lock().await;
+        if let Some(hit) = st.memo.get(r) {
+            if !hit.is_expired(now_ms, ttl_ms) {
+                return Ok(hit.hash);
+            }
+        }
+        if st.manifest_stale(now_ms, ttl_ms) {
+            if let Err(e) = self.refresh_locked(&mut st, now_ms).await {
+                if st.manifest.is_none() {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    class = self.name(),
+                    "manifest refresh failed, using stale: {e}"
+                );
+            }
+        }
+        let (manifest, fetched_at_ms) = st.manifest.clone().ok_or(ResolveError::NoManifest)?;
+        let hash = manifest.resolve(r)?;
+        st.memo.insert(
+            r.clone(),
+            Resolution {
+                hash,
+                fetched_at_ms,
+            },
+        );
+        Ok(hash)
+    }
+
+    /// Fetch + install a manifest. Pins are re-derived from it so they
+    /// survive a process restart: the current release feeds
+    /// [`record_release`](Self::record_release), each pinned set feeds
+    /// [`pin_set`](Self::pin_set), and a set the previous manifest declared
+    /// but this one dropped is unpinned.
+    async fn refresh_locked(
+        &self,
+        st: &mut resolver::ResolverState,
+        now_ms: u64,
+    ) -> std::result::Result<(), ResolveError> {
+        let manifest = st.fetch_manifest().await?;
+        if let Some((id, hashes)) = manifest.release() {
+            self.record_release(id, hashes.iter().copied()).await;
+        }
+        let mut applied = std::collections::HashSet::new();
+        for (name, hashes) in manifest.pinned_sets() {
+            self.pin_set(name, hashes.iter().copied()).await;
+            applied.insert(name.to_string());
+        }
+        for gone in st.applied_sets.difference(&applied) {
+            self.unpin_set(gone).await;
+        }
+        st.applied_sets = applied;
+        st.manifest = Some((Arc::new(manifest), now_ms));
+        st.memo.clear();
+        Ok(())
+    }
+
     pub(crate) fn add_source(&self, source: Arc<dyn BlobSource>) {
         if let Ok(mut sources) = self.0.sources.try_write() {
             sources.push(source);

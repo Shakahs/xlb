@@ -1,0 +1,6 @@
+{
+  "goog:chromeOptions": {
+    "binary": "/Applications/Chrome.app/Contents/MacOS/Google Chrome",
+    "args": ["--headless=new", "--no-sandbox", "--disable-gpu"]
+  }
+}

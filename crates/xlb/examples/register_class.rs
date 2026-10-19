@@ -43,7 +43,12 @@ async fn main() -> anyhow::Result<()> {
             .role(PeerTier::Mobile, BwCaps::passive()),
         // Persistent disk cache.  Pass `None` for an in-memory-only cache.
         cache_dir: None,
-        cache_budget_bytes: 1024 * 1024 * 1024, // 1 GB LRU
+        cache_budget_bytes: 1024 * 1024 * 1024, // 1 GB LRU over unpinned blobs
+        keep_releases: 1,                       // current + previous release stay pinned
+        // Per-class manifest for Ref::Version / Ref::Latest resolution; the
+        // release and pinned sets it declares are re-pinned on every refresh.
+        manifest_url: Some("https://cdn.example.com/assets/manifest.json".into()),
+        resolve_ttl: std::time::Duration::from_secs(300),
         // Per-fetch metrics. `None` = no instrumentation, no cost.
         // Wire one up to learn which tier is actually serving your traffic —
         // a swarm that turns out to serve 5% instead of the assumed 50% is a
