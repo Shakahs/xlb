@@ -58,6 +58,15 @@ pub struct RetentionUsage {
     pub pinned_bytes: u64,
 }
 
+/// How much of one named pin set the cache holds. `present < members` means
+/// the set was declared ahead of its bytes (they arrive by fetch or seed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PinSetUsage {
+    pub members: u64,
+    pub present: u64,
+    pub present_bytes: u64,
+}
+
 /// Retention bookkeeping for one cache. Not thread-safe; callers wrap it in
 /// their own lock.
 #[derive(Debug)]

@@ -11,5 +11,5 @@ pub mod store;
 
 pub use hash::{BlakeHash, InvalidHash};
 pub use refs::{Ref, Resolution, ResolveError};
-pub use retention::{RetentionIndex, RetentionPolicy, RetentionUsage};
+pub use retention::{PinSetUsage, RetentionIndex, RetentionPolicy, RetentionUsage};
 pub use store::{BlobStore, MaybeSend, MemBlobStore, RetainingCache, StoreError};

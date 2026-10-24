@@ -53,6 +53,7 @@
 pub mod bandwidth;
 pub(crate) mod cache;
 pub mod metrics;
+pub mod pinned;
 pub(crate) mod resolver;
 pub mod seed;
 pub(crate) mod source;
@@ -63,6 +64,7 @@ pub(crate) mod verify;
 pub use bandwidth::BandwidthGovernor;
 pub use cache::CacheStats;
 pub use metrics::{FetchObserver, FetchReport};
+pub use pinned::{PinError, PinnedTreeInfo, SeedReport};
 pub use resolver::ManifestSource;
 pub use seed::{derive_key, seed_blob, R2Target, SeedOutcome};
 pub(crate) use source::BlobSource;
@@ -276,6 +278,13 @@ struct ClassInner {
     /// disk-backed with LRU eviction (gated on `config.cache_budget_bytes`)
     /// otherwise. Disk-backed entries survive process restart.
     cache: Cache,
+    /// Where pinned trees persist (`<cache_dir>/pins`); `None` on an
+    /// in-memory class, whose trees live only in the retention index.
+    trees: Option<pinned::TreeStore>,
+    /// Names of the declared pinned trees. The retention index's set
+    /// namespace also holds manifest-derived sets, so this is what tells a
+    /// tree from one of those when listing.
+    tree_names: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Fetch sources. Rebuilt into a `FetchChain` at first fetch; subsequent
     /// sources added via `add_source` are appended and the chain rebuilt.
     sources: RwLock<Vec<Arc<dyn BlobSource>>>,
@@ -335,11 +344,22 @@ impl AssetClass {
         // disk-backed at the given path with LRU eviction gated on
         // `cache_budget_bytes`. The latter survives process restart, which
         // is the whole reason this layer exists (see W160 F3).
-        let cache = Cache::new(
-            config.cache_dir.as_deref(),
-            RetentionPolicy::new(config.cache_budget_bytes, config.keep_releases),
-        )
-        .await?;
+        //
+        // Pinned trees (R1003) are loaded and declared on the index first, so
+        // the cache's replay of what is already on disk cannot evict them.
+        let trees = config.cache_dir.as_deref().map(pinned::TreeStore::under);
+        let mut index = RetentionIndex::new(RetentionPolicy::new(
+            config.cache_budget_bytes,
+            config.keep_releases,
+        ));
+        let mut tree_names = std::collections::BTreeSet::new();
+        if let Some(store) = &trees {
+            for (name, hashes) in store.load_all().map_err(std::io::Error::other)? {
+                tree_names.insert(name.clone());
+                index.pin_set(name, hashes);
+            }
+        }
+        let cache = Cache::new(config.cache_dir.as_deref(), index).await?;
 
         let manifest_source: Option<Arc<dyn ManifestSource>> = match config
             .manifest_url
@@ -356,6 +376,8 @@ impl AssetClass {
 
         Ok(Self(Arc::new(ClassInner {
             config,
+            trees,
+            tree_names: std::sync::Mutex::new(tree_names),
             resolver: tokio::sync::Mutex::new(resolver::ResolverState {
                 source: manifest_source,
                 ..Default::default()
@@ -466,6 +488,127 @@ impl AssetClass {
     /// Whether `hash` is currently protected from eviction.
     pub async fn is_pinned(&self, hash: &BlakeHash) -> bool {
         self.0.cache.retention().is_pinned(hash)
+    }
+
+    // ─── Pinned trees (R1003) ──────────────────────────────────────────────
+
+    /// Declare (or replace) the pinned tree `name` covering `hashes`. On a
+    /// disk-backed class it is persisted first, then pinned, so it survives a
+    /// restart and its members are never evicted. The bytes need not be
+    /// present: seed them with [`Self::seed_tree_from_dirs`] or let fetches
+    /// fill them in.
+    pub async fn pin_tree(
+        &self,
+        name: &str,
+        hashes: impl IntoIterator<Item = BlakeHash>,
+    ) -> std::result::Result<PinnedTreeInfo, PinError> {
+        pinned::validate_tree_name(name)?;
+        let mut hashes: Vec<BlakeHash> = hashes.into_iter().collect();
+        hashes.sort_by_key(BlakeHash::to_hex);
+        hashes.dedup();
+        if let Some(store) = &self.0.trees {
+            store.save(name, &hashes).await?;
+        }
+        // Replacing a tree can drop members; unpin first so the evictions
+        // that frees are deleted, then pin the new membership.
+        let retention = self.0.cache.retention();
+        if self.0.tree_names.lock().unwrap().contains(name) {
+            log_evict_failure(retention.unpin_set(name).await);
+        }
+        retention.pin_set(name, hashes);
+        self.0.tree_names.lock().unwrap().insert(name.to_string());
+        Ok(self.tree_info(name).expect("tree was just declared"))
+    }
+
+    /// Remove the pinned tree `name`; its members rejoin the LRU and may be
+    /// evicted at once if the unpinned footprint is over budget.
+    pub async fn unpin_tree(&self, name: &str) -> std::result::Result<(), PinError> {
+        if !self.0.tree_names.lock().unwrap().remove(name) {
+            return Err(PinError::NotFound(name.to_string()));
+        }
+        if let Some(store) = &self.0.trees {
+            store.remove(name).await?;
+        }
+        log_evict_failure(self.0.cache.retention().unpin_set(name).await);
+        Ok(())
+    }
+
+    /// Every pinned tree on this class, by name.
+    pub fn pinned_trees(&self) -> Vec<PinnedTreeInfo> {
+        let names: Vec<String> = self.0.tree_names.lock().unwrap().iter().cloned().collect();
+        names.iter().filter_map(|n| self.tree_info(n)).collect()
+    }
+
+    /// The members of pinned tree `name`, or `None` if there is no such tree.
+    pub fn tree_members(&self, name: &str) -> Option<Vec<BlakeHash>> {
+        if !self.0.tree_names.lock().unwrap().contains(name) {
+            return None;
+        }
+        Some(self.0.cache.retention().pin_set_members(name))
+    }
+
+    fn tree_info(&self, name: &str) -> Option<PinnedTreeInfo> {
+        let u = self.0.cache.retention().pin_set_usage(name)?;
+        Some(PinnedTreeInfo {
+            name: name.to_string(),
+            members: u.members,
+            present: u.present,
+            present_bytes: u.present_bytes,
+            durable: self.0.trees.is_some(),
+        })
+    }
+
+    /// Put `bytes` into this class's cache under their own blake3 hash —
+    /// no network. Pin before ingesting if the blob must stay: an unpinned
+    /// blob competes for the LRU budget like any fetched one.
+    pub async fn ingest(&self, bytes: Bytes) -> Result<BlakeHash> {
+        let hash = BlakeHash::hash(&bytes);
+        self.0.cache.put(hash, bytes).await?;
+        Ok(hash)
+    }
+
+    /// Fill pinned tree `name` from local directories holding blobs at
+    /// `<dir>/<blake3-hex>` (a CAS checkout or a library store). Each file is
+    /// hashed before it is admitted; members already cached are not re-read.
+    /// No R2 or peer round-trip.
+    pub async fn seed_tree_from_dirs(
+        &self,
+        name: &str,
+        dirs: &[PathBuf],
+    ) -> std::result::Result<SeedReport, PinError> {
+        let members = self
+            .tree_members(name)
+            .ok_or_else(|| PinError::NotFound(name.to_string()))?;
+        let mut report = SeedReport::default();
+        'member: for hash in members {
+            if self.0.cache.contains(&hash).await {
+                report.already_cached += 1;
+                continue;
+            }
+            for dir in dirs {
+                let path = dir.join(hash.to_hex());
+                let data = match tokio::fs::read(&path).await {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if !hash.verify(&data) {
+                    report.mismatched.push(path);
+                    continue;
+                }
+                self.0.cache.put(hash, Bytes::from(data)).await?;
+                report.ingested += 1;
+                continue 'member;
+            }
+            report.missing.push(hash);
+        }
+        Ok(report)
+    }
+
+    /// Verified cached bytes for `hash`, if held. For the seeding side, which
+    /// republishes pinned trees to peers.
+    pub(crate) async fn cached(&self, hash: &BlakeHash) -> Option<Bytes> {
+        self.0.cache.get(hash).await
     }
 
     /// Add a fetch source to the chain (e.g. a transport adapter or mock peer).

@@ -21,6 +21,10 @@ pub struct NodeState {
     /// Sharing one instance is load-bearing — a second sink would count a
     /// different set of fetches from the one the classes actually emit to.
     pub metrics: Arc<crate::metrics_sink::MetricsSink>,
+    /// The node's iroh-blobs seeding side (R1003): pinned trees are published
+    /// here so LAN and swarm peers can fetch them. `None` when the endpoint
+    /// failed to bind; the node still caches and answers the socket.
+    pub transport: Option<Arc<xlb::transport::BlobTransport>>,
 }
 
 /// Config-derived class metadata stored alongside the live AssetClass.
@@ -158,6 +162,39 @@ async fn handle_conn(state: NodeState, mut stream: tokio::net::UnixStream) -> Re
                 download_kbps: _,
             } => {
                 write_frame(&mut writer, &Response::Ok).await?;
+            }
+
+            Command::PinTree {
+                class,
+                name,
+                hashes,
+                from_dirs,
+            } => {
+                let resp = pin_tree(&state, &class, &name, &hashes, &from_dirs).await;
+                write_frame(&mut writer, &resp).await?;
+            }
+
+            Command::ListTrees { class } => {
+                let resp = match state.classes.get(&class) {
+                    Some(ac) => Response::Trees {
+                        trees: ac.pinned_trees().into_iter().map(tree_info).collect(),
+                    },
+                    None => unknown_class(&class),
+                };
+                write_frame(&mut writer, &resp).await?;
+            }
+
+            Command::UnpinTree { class, name } => {
+                let resp = match state.classes.get(&class) {
+                    Some(ac) => match ac.unpin_tree(&name).await {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    None => unknown_class(&class),
+                };
+                write_frame(&mut writer, &resp).await?;
             }
         }
     }
@@ -313,5 +350,93 @@ async fn do_fetch(
                 message: e.to_string(),
             }
         }
+    }
+}
+
+fn unknown_class(class: &str) -> Response {
+    Response::Error {
+        message: format!("unknown class: {class}"),
+    }
+}
+
+fn tree_info(t: xlb::PinnedTreeInfo) -> TreeInfo {
+    TreeInfo {
+        name: t.name,
+        members: t.members,
+        present: t.present,
+        present_bytes: t.present_bytes,
+        durable: t.durable,
+    }
+}
+
+/// R1003: declare, seed and publish one pinned tree. The paths are read by
+/// this process, which is safe to accept from the socket only because the
+/// socket admits nobody but the daemon's own uid (see `handle_conn`).
+pub(crate) async fn pin_tree(
+    state: &NodeState,
+    class: &str,
+    name: &str,
+    hashes: &[String],
+    from_dirs: &[String],
+) -> Response {
+    let err = |message: String| Response::Error { message };
+    let Some(ac) = state.classes.get(class) else {
+        return unknown_class(class);
+    };
+    let dirs: Vec<std::path::PathBuf> = from_dirs
+        .iter()
+        .map(|d| crate::config::expand_tilde(d).into())
+        .collect();
+    let members: Vec<xlb::BlakeHash> = if hashes.is_empty() {
+        if dirs.is_empty() {
+            return err("pin_tree needs hashes, from_dirs, or both".into());
+        }
+        let mut all = Vec::new();
+        for d in &dirs {
+            match xlb::pinned::hashes_in_dir(d) {
+                Ok(hs) => all.extend(hs),
+                Err(e) => return err(format!("reading {}: {e}", d.display())),
+            }
+        }
+        all
+    } else {
+        match hashes.iter().map(|h| xlb::BlakeHash::from_hex(h.trim())).collect() {
+            Ok(v) => v,
+            Err(e) => return err(format!("bad hash: {e}")),
+        }
+    };
+    if let Err(e) = ac.pin_tree(name, members).await {
+        return err(e.to_string());
+    }
+    let report = match ac.seed_tree_from_dirs(name, &dirs).await {
+        Ok(r) => r,
+        Err(e) => return err(format!("tree pinned, seeding failed: {e}")),
+    };
+    let served = match &state.transport {
+        Some(t) => match t.serve_pinned_trees(ac).await {
+            Ok(n) => n,
+            Err(e) => return err(format!("tree pinned and seeded, publishing failed: {e}")),
+        },
+        None => 0,
+    };
+    let tree = ac
+        .pinned_trees()
+        .into_iter()
+        .find(|t| t.name == name)
+        .map(tree_info)
+        .expect("tree was just pinned");
+    Response::TreePinned {
+        tree,
+        seed: SeedSummary {
+            ingested: report.ingested,
+            already_cached: report.already_cached,
+            missing: report.missing.iter().map(|h| h.to_hex()).collect(),
+            mismatched: report
+                .mismatched
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            served,
+        },
     }
 }

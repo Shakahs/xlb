@@ -348,6 +348,28 @@ impl BlobTransport {
         Ok(xlb_hash)
     }
 
+    /// Publish every cached member of `class`'s pinned trees (R1003) so
+    /// remote peers can fetch them from this node. Returns how many blobs
+    /// were published. Idempotent: re-adding a blob the store holds is a
+    /// dedup. Call at boot and after a tree is declared or seeded.
+    ///
+    /// The serving store is iroh-blobs' in-memory one, so this copies the
+    /// tree's bytes into RAM; sized for project asset packs, not for
+    /// multi-GB trees. Unpinning a tree does not withdraw its blobs from
+    /// this store until the process restarts.
+    pub async fn serve_pinned_trees(&self, class: &AssetClass) -> anyhow::Result<u64> {
+        let mut served = 0;
+        for tree in class.pinned_trees() {
+            for hash in class.tree_members(&tree.name).unwrap_or_default() {
+                if let Some(bytes) = class.cached(&hash).await {
+                    self.add_blob(bytes).await?;
+                    served += 1;
+                }
+            }
+        }
+        Ok(served)
+    }
+
     /// The `NodeAddr` of this transport's endpoint.
     ///
     /// Give this to remote peers so they can resolve our address when fetching.
@@ -389,8 +411,10 @@ impl BlobTransport {
         report
     }
 
-    /// Shut down the Router accept loop and wait for it to drain.
-    pub async fn shutdown(self) {
+    /// Shut down the Router accept loop, wait for it to drain, and close the
+    /// endpoint. `&self` so a transport shared behind an `Arc` (xlb serve)
+    /// can close it; a second call is a no-op.
+    pub async fn shutdown(&self) {
         if let Err(e) = self.router.shutdown().await {
             tracing::warn!("BlobTransport::shutdown: {e}");
         }

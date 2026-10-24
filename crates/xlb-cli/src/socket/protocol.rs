@@ -23,6 +23,26 @@ pub enum Command {
         upload_kbps: Option<u32>,
         download_kbps: Option<u32>,
     },
+    /// Declare (or replace) pinned tree `name` on `class` (R1003). Members are
+    /// `hashes` (blake3 hex); when that is empty, every `<blake3-hex>` file in
+    /// `from_dirs`. Either way the members are then seeded from `from_dirs` —
+    /// paths on the NODE's filesystem, hash-verified, no R2 — and published to
+    /// peers. The tree persists under the class's `cache_dir`.
+    PinTree {
+        class: String,
+        name: String,
+        #[serde(default)]
+        hashes: Vec<String>,
+        #[serde(default)]
+        from_dirs: Vec<String>,
+    },
+    ListTrees {
+        class: String,
+    },
+    UnpinTree {
+        class: String,
+        name: String,
+    },
 }
 
 /// Responses and streamed events sent server → client.
@@ -33,8 +53,36 @@ pub enum Response {
     ClassStats(ClassStats),
     Event(NodeEvent),
     FetchResult(FetchResult),
+    Trees { trees: Vec<TreeInfo> },
+    TreePinned { tree: TreeInfo, seed: SeedSummary },
     Ok,
     Error { message: String },
+}
+
+/// One pinned tree on a class (R1003). Mirrors `xlb::PinnedTreeInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeInfo {
+    pub name: String,
+    pub members: u64,
+    /// Of `members`, blobs the node holds now. Fewer means some bytes were
+    /// never seeded and will arrive only by fetch.
+    pub present: u64,
+    pub present_bytes: u64,
+    /// `false` on an in-memory class: the tree is gone on restart.
+    pub durable: bool,
+}
+
+/// What seeding a just-pinned tree from `from_dirs` did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedSummary {
+    pub ingested: u64,
+    pub already_cached: u64,
+    /// Members no seed dir held (blake3 hex).
+    pub missing: Vec<String>,
+    /// Files whose bytes do not hash to their name; skipped.
+    pub mismatched: Vec<String>,
+    /// Blobs now published to peers; `0` when the node runs no transport.
+    pub served: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +302,46 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&resp).unwrap(),
             r#"{"type":"node_info","node_id":"abc","uptime_secs":1,"classes":[]}"#
+        );
+    }
+
+    // R1003: yah desktop's xlb_ctl pins these same literals from its side.
+    #[test]
+    fn the_tree_commands_are_on_the_wire_under_these_names() {
+        assert_eq!(
+            serde_json::to_string(&Command::ListTrees { class: "c".into() }).unwrap(),
+            r#"{"cmd":"list_trees","class":"c"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Command::UnpinTree {
+                class: "c".into(),
+                name: "t".into()
+            })
+            .unwrap(),
+            r#"{"cmd":"unpin_tree","class":"c","name":"t"}"#
+        );
+        let pin: Command = serde_json::from_str(
+            r#"{"cmd":"pin_tree","class":"c","name":"t","from_dirs":["/a"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(pin, Command::PinTree { hashes, from_dirs, .. }
+            if hashes.is_empty() && from_dirs == ["/a"]));
+    }
+
+    #[test]
+    fn a_trees_response_carries_each_tree_beside_its_type_tag() {
+        let resp = Response::Trees {
+            trees: vec![TreeInfo {
+                name: "t".into(),
+                members: 3,
+                present: 2,
+                present_bytes: 10,
+                durable: true,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            r#"{"type":"trees","trees":[{"name":"t","members":3,"present":2,"present_bytes":10,"durable":true}]}"#
         );
     }
 

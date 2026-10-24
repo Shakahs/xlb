@@ -5,6 +5,7 @@ mod fetch_cmd;
 mod gui;
 mod inspect;
 mod metrics_sink;
+mod pin_cmd;
 mod seed_cmd;
 mod serve;
 mod socket;
@@ -66,6 +67,41 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Pinned trees on a running node (R1003): named sets of blobs that
+    /// survive restart and are never evicted.
+    Pin {
+        #[command(subcommand)]
+        cmd: PinCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PinCmd {
+    /// Declare (or replace) a tree, seed it from local dirs, publish it.
+    ///
+    /// `--from DIR` alone pins every `<blake3-hex>` file in DIR (e.g. a
+    /// pack's `assets/`). `--manifest FILE` pins the hashes it lists, seeding
+    /// whichever of them the `--from` dirs hold.
+    Add {
+        class: String,
+        name: String,
+        /// Directory of `<blake3-hex>` files; repeatable.
+        #[arg(long = "from")]
+        from: Vec<String>,
+        /// Hash list: JSON array, `{"hashes": [...]}`, or one hex per line.
+        #[arg(long)]
+        manifest: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a class's pinned trees and how much of each the node holds.
+    List {
+        class: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a tree; its blobs rejoin the LRU.
+    Rm { class: String, name: String },
 }
 
 fn default_socket() -> String {
@@ -100,5 +136,16 @@ async fn main() -> anyhow::Result<()> {
             manifest,
             json,
         } => seed_cmd::run(&class, &file, &config, manifest.as_deref(), json).await,
+        Cmd::Pin { cmd } => match cmd {
+            PinCmd::Add {
+                class,
+                name,
+                from,
+                manifest,
+                json,
+            } => pin_cmd::add(&cli.socket, &class, &name, &from, manifest.as_deref(), json).await,
+            PinCmd::List { class, json } => pin_cmd::list(&cli.socket, &class, json).await,
+            PinCmd::Rm { class, name } => pin_cmd::rm(&cli.socket, &class, &name).await,
+        },
     }
 }

@@ -35,6 +35,14 @@ pub struct NodeSettings {
     /// and it commits this crate to no vendor.
     #[serde(default)]
     pub metrics_path: Option<String>,
+    /// Directory holding this node's mshr secret key (R1003). `null` = the
+    /// platform default that every mshr process on the machine shares — which
+    /// is wrong for a camp node beside a yah desktop on the same box: two
+    /// processes binding one `NodeId` cannot both be reachable. Give a
+    /// long-lived node its own dir so its `NodeId`, the value clients list in
+    /// `permanent_seeds`, is stable across restarts and unique to it.
+    #[serde(default)]
+    pub identity_dir: Option<String>,
 }
 
 fn default_socket() -> String {

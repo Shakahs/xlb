@@ -62,3 +62,17 @@ impl std::str::FromStr for BlakeHash {
         Self::from_hex(s)
     }
 }
+
+/// Serialised as its lowercase hex string, the form every manifest uses.
+impl serde::Serialize for BlakeHash {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BlakeHash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+        Self::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}

@@ -31,7 +31,7 @@ use std::{
 
 use crate::{
     hash::BlakeHash,
-    retention::{RetentionIndex, RetentionPolicy, RetentionUsage},
+    retention::{PinSetUsage, RetentionIndex, RetentionPolicy, RetentionUsage},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -234,6 +234,18 @@ impl<S: BlobStore> RetainingCache<S> {
 
     pub fn pin_set(&self, name: impl Into<String>, hashes: impl IntoIterator<Item = BlakeHash>) {
         self.index().pin_set(name, hashes);
+    }
+
+    /// Members of pin set `name` (empty if undefined).
+    pub fn pin_set_members(&self, name: &str) -> Vec<BlakeHash> {
+        self.index()
+            .pin_set_members(name)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn pin_set_usage(&self, name: &str) -> Option<PinSetUsage> {
+        self.index().pin_set_usage(name)
     }
 
     pub async fn unpin_set(&self, name: &str) -> Result<(), StoreError> {
