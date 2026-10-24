@@ -120,7 +120,7 @@ use std::{
 use bytes::Bytes;
 use xlb_core::{BlobStore, MemBlobStore, RetainingCache, StoreError};
 
-use crate::{retention::RetentionPolicy, BlakeHash};
+use crate::{retention::RetentionIndex, BlakeHash};
 
 /// Monotonic counter for temp-file scratch paths. Process-static so
 /// concurrent `put` calls (especially against the same hash) produce
@@ -167,18 +167,19 @@ impl Cache {
     /// Build a cache for one `AssetClass`.
     ///
     /// `cache_dir = None` → in-memory; `Some(path)` → disk-backed at `path`
-    /// with `policy`'s LRU eviction budget over unpinned entries. The directory
-    /// is created if it doesn't exist; existing entries on disk are picked up
-    /// into the LRU index (cache survives restart).
+    /// with `index`'s LRU eviction budget over unpinned entries. The directory
+    /// is created if it doesn't exist; existing entries on disk are replayed
+    /// into `index` (cache survives restart). Pins already declared on
+    /// `index` protect their entries during that replay (R1003).
     pub(crate) async fn new(
         cache_dir: Option<&Path>,
-        policy: RetentionPolicy,
+        index: RetentionIndex,
     ) -> std::io::Result<Self> {
         let (store, disk_backed) = match cache_dir {
             None => (NativeStore::Mem(MemBlobStore::new()), false),
             Some(dir) => (NativeStore::Disk(DiskBlobStore::create(dir)?), true),
         };
-        let inner = RetainingCache::open(store, policy)
+        let inner = RetainingCache::open(store, index)
             .await
             .map_err(std::io::Error::other)?;
         Ok(Self {
@@ -394,10 +395,11 @@ impl BlobStore for DiskBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retention::RetentionPolicy;
     use std::sync::Arc;
 
-    fn pol(budget: u64) -> RetentionPolicy {
-        RetentionPolicy::new(budget, 1)
+    fn pol(budget: u64) -> RetentionIndex {
+        RetentionIndex::new(RetentionPolicy::new(budget, 1))
     }
 
     fn tmpdir(name: &str) -> PathBuf {

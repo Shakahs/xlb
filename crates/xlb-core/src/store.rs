@@ -139,11 +139,11 @@ pub struct RetainingCache<S: BlobStore> {
 }
 
 impl<S: BlobStore> RetainingCache<S> {
-    /// Rebuild the index from whatever `store` already holds. Pins are
-    /// in-memory, so reopened entries start unpinned (re-declare them from the
-    /// manifest); anything over budget is evicted immediately.
-    pub async fn open(store: S, policy: RetentionPolicy) -> Result<Self, StoreError> {
-        let mut index = RetentionIndex::new(policy);
+    /// Replay whatever `store` already holds into `index`, evicting unpinned
+    /// entries over budget immediately. Declare persisted pins on `index`
+    /// *before* calling this: an entry pinned only after the replay may
+    /// already have been evicted by it (R1003).
+    pub async fn open(store: S, mut index: RetentionIndex) -> Result<Self, StoreError> {
         let mut evicted = Vec::new();
         for (hash, size) in store.list().await? {
             evicted.extend(index.insert(hash, size));
@@ -275,7 +275,10 @@ mod tests {
     }
 
     async fn cache(budget: u64, keep: usize) -> RetainingCache<MemBlobStore> {
-        RetainingCache::open(MemBlobStore::new(), RetentionPolicy::new(budget, keep))
+        RetainingCache::open(
+            MemBlobStore::new(),
+            RetentionIndex::new(RetentionPolicy::new(budget, keep)),
+        )
             .await
             .unwrap()
     }
@@ -362,11 +365,33 @@ mod tests {
                 let b = blob(n, 10);
                 store.put(&BlakeHash::hash(&b), &b).await.unwrap();
             }
-            let c = RetainingCache::open(store, RetentionPolicy::new(20, 1))
+            let c = RetainingCache::open(store, RetentionIndex::new(RetentionPolicy::new(20, 1)))
                 .await
                 .unwrap();
             assert_eq!(c.usage().entries, 2);
             assert_eq!(c.store().len(), 2);
+        });
+    }
+
+    #[test]
+    fn pins_declared_before_open_survive_an_over_budget_replay() {
+        // R1003: a reopened cache holding more pinned bytes than its budget
+        // must not evict them during the rebuild — which it did when pins
+        // could only be declared after `open` returned.
+        block_on(async {
+            let store = MemBlobStore::new();
+            let mut hs = Vec::new();
+            for n in 1..=3u8 {
+                let b = blob(n, 10);
+                hs.push(BlakeHash::hash(&b));
+                store.put(&hs[hs.len() - 1], &b).await.unwrap();
+            }
+            let mut index = RetentionIndex::new(RetentionPolicy::new(5, 1));
+            index.pin_set("tree", hs.iter().copied());
+            let c = RetainingCache::open(store, index).await.unwrap();
+            assert_eq!(c.usage().entries, 3);
+            assert_eq!(c.usage().pinned_bytes, 30);
+            assert_eq!(c.store().len(), 3);
         });
     }
 
@@ -410,7 +435,7 @@ mod tests {
             inner: MemBlobStore::new(),
             barrier: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
         };
-        let c = RetainingCache::open(store, RetentionPolicy::new(100, 1))
+        let c = RetainingCache::open(store, RetentionIndex::new(RetentionPolicy::new(100, 1)))
             .await
             .unwrap();
         let a = c.put(b"aaaa").await.unwrap();

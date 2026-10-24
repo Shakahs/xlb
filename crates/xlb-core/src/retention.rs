@@ -20,8 +20,11 @@
 //! Pinned entries are never evicted and do not count against the budget.
 //! `budget_bytes` bounds the *unpinned* footprint only.
 //!
-//! Pin state is in-memory. A restarted process re-declares its pins (the
-//! caller owns the manifests); until it does, reopened entries are unpinned.
+//! Pin state here is in-memory bookkeeping. Persistence is the caller's: a
+//! cache that reopens declares its pins on a fresh index *before* replaying
+//! the stored entries into it (see `RetainingCache::open`), so a pinned blob
+//! is never evicted by the rebuild itself. The native `xlb` crate persists
+//! named pin sets ("pinned trees", R1003) next to its disk cache that way.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -214,6 +217,27 @@ impl RetentionIndex {
         }
         self.recompute();
         self.enforce_budget(None)
+    }
+
+    /// The hashes of named pin set `name`, if defined.
+    pub fn pin_set_members(&self, name: &str) -> Option<&HashSet<BlakeHash>> {
+        self.sets.get(name)
+    }
+
+    /// How much of pin set `name` is actually held, if the set is defined.
+    pub fn pin_set_usage(&self, name: &str) -> Option<PinSetUsage> {
+        let set = self.sets.get(name)?;
+        let mut u = PinSetUsage {
+            members: set.len() as u64,
+            ..Default::default()
+        };
+        for h in set {
+            if let Some(size) = self.entries.get(h) {
+                u.present += 1;
+                u.present_bytes += size;
+            }
+        }
+        Some(u)
     }
 
     /// Names of the retained releases, oldest first (current last).

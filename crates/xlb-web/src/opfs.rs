@@ -5,7 +5,7 @@ use web_sys::{
     File, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions,
     FileSystemGetFileOptions, FileSystemWritableFileStream, Navigator, StorageManager,
 };
-use xlb_core::{BlakeHash, BlobStore, RetainingCache, RetentionPolicy, StoreError};
+use xlb_core::{BlakeHash, BlobStore, RetainingCache, RetentionIndex, RetentionPolicy, StoreError};
 
 /// Top-level OPFS directory holding every class's subdirectory.
 const ROOT: &str = "xlb";
@@ -170,5 +170,5 @@ pub async fn open_cache(
     class: &str,
     policy: RetentionPolicy,
 ) -> Result<RetainingCache<OpfsBlobStore>, StoreError> {
-    RetainingCache::open(OpfsBlobStore::open(class).await?, policy).await
+    RetainingCache::open(OpfsBlobStore::open(class).await?, RetentionIndex::new(policy)).await
 }
