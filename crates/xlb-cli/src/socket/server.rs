@@ -387,23 +387,9 @@ pub(crate) async fn pin_tree(
         .iter()
         .map(|d| crate::config::expand_tilde(d).into())
         .collect();
-    let members: Vec<xlb::BlakeHash> = if hashes.is_empty() {
-        if dirs.is_empty() {
-            return err("pin_tree needs hashes, from_dirs, or both".into());
-        }
-        let mut all = Vec::new();
-        for d in &dirs {
-            match xlb::pinned::hashes_in_dir(d) {
-                Ok(hs) => all.extend(hs),
-                Err(e) => return err(format!("reading {}: {e}", d.display())),
-            }
-        }
-        all
-    } else {
-        match hashes.iter().map(|h| xlb::BlakeHash::from_hex(h.trim())).collect() {
-            Ok(v) => v,
-            Err(e) => return err(format!("bad hash: {e}")),
-        }
+    let members = match xlb::pinned::resolve_members(hashes, &dirs) {
+        Ok(v) => v,
+        Err(e) => return err(e),
     };
     if let Err(e) = ac.pin_tree(name, members).await {
         return err(e.to_string());

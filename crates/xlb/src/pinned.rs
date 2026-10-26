@@ -193,6 +193,27 @@ pub fn hashes_in_dir(dir: &Path) -> io::Result<Vec<BlakeHash>> {
     Ok(out)
 }
 
+/// The members a pin request names: the explicit `hashes` (hex) when given,
+/// else every hash-named file across `dirs`. Shared by every pin surface
+/// (`xlb serve`'s socket, yah desktop's embedded node) so they agree.
+pub fn resolve_members(hashes: &[String], dirs: &[PathBuf]) -> Result<Vec<BlakeHash>, String> {
+    if !hashes.is_empty() {
+        return hashes
+            .iter()
+            .map(|h| BlakeHash::from_hex(h.trim()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("bad hash: {e}"));
+    }
+    if dirs.is_empty() {
+        return Err("pin_tree needs hashes, from_dirs, or both".into());
+    }
+    let mut all = Vec::new();
+    for d in dirs {
+        all.extend(hashes_in_dir(d).map_err(|e| format!("reading {}: {e}", d.display()))?);
+    }
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
