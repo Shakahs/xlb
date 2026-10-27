@@ -9,8 +9,12 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSettings {
-    #[serde(default = "default_socket")]
-    pub socket: String,
+    /// Control socket for `xlb serve`. `null` = the CLI default
+    /// (`$XDG_RUNTIME_DIR/xlb-node.sock`, else `/tmp/xlb-node.sock`); an
+    /// explicit `--socket` beats both. A relative path resolves against the
+    /// node's cwd (a camp node runs with cwd = the camp root).
+    #[serde(default)]
+    pub socket: Option<String>,
     #[serde(default = "default_log")]
     pub log: String,
     /// Which COHORT of seed this node belongs to (R423-T7).
@@ -45,9 +49,6 @@ pub struct NodeSettings {
     pub identity_dir: Option<String>,
 }
 
-fn default_socket() -> String {
-    "/tmp/xlb-node.sock".into()
-}
 fn default_log() -> String {
     "info".into()
 }
@@ -161,7 +162,7 @@ mod tests {
         // Every deployed xlb-node.json was written before R423-T7. None of them
         // may need editing to keep booting.
         let cfg = parse(MINIMAL);
-        assert_eq!(cfg.node.socket, "/tmp/s.sock");
+        assert_eq!(cfg.node.socket.as_deref(), Some("/tmp/s.sock"));
         assert!(cfg.node.metrics_path.is_none(), "file sink off by default");
     }
 
@@ -204,6 +205,6 @@ mod tests {
               "classes": []
             }"#,
         );
-        assert_eq!(cfg.node.socket, "/tmp/s.sock");
+        assert_eq!(cfg.node.socket.as_deref(), Some("/tmp/s.sock"));
     }
 }

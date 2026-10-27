@@ -11,17 +11,16 @@ use crate::{
     socket::server::{ClassMeta, NodeState},
 };
 
-pub async fn run(config_path: &str, socket_path: &str) -> Result<()> {
+pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     let cfg = NodeConfig::load(config_path)?;
 
-    // Override socket path from config if not overridden by CLI flag.
-    // (CLI --socket takes precedence; we just use socket_path as passed.)
-    let effective_socket =
-        if socket_path == "/tmp/xlb-node.sock" && cfg.node.socket != "/tmp/xlb-node.sock" {
-            cfg.node.socket.as_str()
-        } else {
-            socket_path
-        };
+    // `--socket` beats `node.socket` beats the CLI default. This used to
+    // compare the flag against "/tmp/xlb-node.sock" to guess whether it was
+    // defaulted, so under `$XDG_RUNTIME_DIR` the config's socket was ignored
+    // and a reader resolving the config (the desktop's camp card) dialled a
+    // socket nobody listened on.
+    let effective_socket = effective_socket(socket_flag, cfg.node.socket.as_deref());
+    let effective_socket = effective_socket.as_str();
 
     let kp = match cfg.node.identity_dir.as_deref() {
         Some(dir) => Keypair::load_or_create_at(std::path::Path::new(&expand_tilde(dir))),
@@ -166,4 +165,25 @@ async fn shutdown_signal() -> Result<()> {
         _ = term.recv() => {}
     }
     Ok(())
+}
+
+/// The socket `serve` binds: `--socket`, else the config's `node.socket`,
+/// else the CLI default.
+fn effective_socket(flag: Option<&str>, configured: Option<&str>) -> String {
+    flag.or(configured)
+        .map(str::to_string)
+        .unwrap_or_else(crate::default_socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_socket;
+
+    #[test]
+    fn flag_beats_config_beats_default() {
+        assert_eq!(effective_socket(Some("/f.sock"), Some("c.sock")), "/f.sock");
+        // The old guess ignored this whenever $XDG_RUNTIME_DIR was set.
+        assert_eq!(effective_socket(None, Some("c.sock")), "c.sock");
+        assert_eq!(effective_socket(None, None), crate::default_socket());
+    }
 }

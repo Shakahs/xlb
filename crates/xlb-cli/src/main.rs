@@ -16,9 +16,12 @@ mod socket;
     about = "xlb — serve a node, inspect state, fetch blobs, view live TUI"
 )]
 struct Cli {
-    /// Path to the Unix domain socket used by the running node.
-    #[arg(short, long, global = true, default_value_t = default_socket())]
-    socket: String,
+    /// Path to the Unix domain socket used by the running node. Default:
+    /// `serve` takes `node.socket` from its config, else
+    /// `$XDG_RUNTIME_DIR/xlb-node.sock`, else `/tmp/xlb-node.sock`; every
+    /// other verb takes the latter two.
+    #[arg(short, long, global = true)]
+    socket: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -121,14 +124,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Cmd::Serve { config } = &cli.cmd {
+        return serve::run(config, cli.socket.as_deref()).await;
+    }
+    let socket = cli.socket.unwrap_or_else(default_socket);
 
     match cli.cmd {
-        Cmd::Serve { config } => serve::run(&config, &cli.socket).await,
-        Cmd::Inspect => inspect::run(&cli.socket).await,
+        Cmd::Serve { .. } => unreachable!("handled above"),
+        Cmd::Inspect => inspect::run(&socket).await,
         Cmd::Fetch { class, hash, out } => {
-            fetch_cmd::run(&class, &hash, out.as_deref(), &cli.socket).await
+            fetch_cmd::run(&class, &hash, out.as_deref(), &socket).await
         }
-        Cmd::Gui => gui::run(&cli.socket).await,
+        Cmd::Gui => gui::run(&socket).await,
         Cmd::Seed {
             class,
             file,
@@ -143,9 +150,9 @@ async fn main() -> anyhow::Result<()> {
                 from,
                 manifest,
                 json,
-            } => pin_cmd::add(&cli.socket, &class, &name, &from, manifest.as_deref(), json).await,
-            PinCmd::List { class, json } => pin_cmd::list(&cli.socket, &class, json).await,
-            PinCmd::Rm { class, name } => pin_cmd::rm(&cli.socket, &class, &name).await,
+            } => pin_cmd::add(&socket, &class, &name, &from, manifest.as_deref(), json).await,
+            PinCmd::List { class, json } => pin_cmd::list(&socket, &class, json).await,
+            PinCmd::Rm { class, name } => pin_cmd::rm(&socket, &class, &name).await,
         },
     }
 }
