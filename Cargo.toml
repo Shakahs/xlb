@@ -6,7 +6,7 @@ members = ["crates/xlb", "crates/xlb-cli", "crates/xlb-core", "crates/xlb-web"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.49"
+version = "0.8.50"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

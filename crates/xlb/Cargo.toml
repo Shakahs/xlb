@@ -15,7 +15,7 @@ name = "xlb"
 path = "src/lib.rs"
 
 [dependencies]
-xlb-core = { path = "../xlb-core", version = "0.8.49" }
+xlb-core = { path = "../xlb-core", version = "0.8.50" }
 anyhow = "1.0"
 async-trait = "0.1"
 blake3 = "1"
@@ -32,7 +32,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
 tracing = "0.1"
-mshr = { path = "../../../mshr/crates/mshr", version = "0.8.49" }
+mshr = { path = "../../../mshr/crates/mshr", version = "0.8.50" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
