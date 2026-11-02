@@ -8,7 +8,7 @@ repository.workspace = true
 description = "xlb browser storage tier: an Origin Private File System BlobStore under xlb-core's retention policy. wasm32-only in practice."
 
 [dependencies]
-xlb-core = { path = "../xlb-core", version = "0.8.50" }
+xlb-core = { path = "../xlb-core", version = "0.8.51" }
 
 # Everything browser-facing is wasm32-only so `cargo build` at the workspace
 # root stays green on native hosts (this crate is then just a re-export).
