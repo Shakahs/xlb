@@ -1,270 +1,147 @@
-//! # xlb — chunked, Bao-verified blob distribution
+//! # xlb — BLAKE3-verified blob distribution to plain files
 //!
-//! Reads as **peer-eXchange + LAN + Bao-tree**. Mnemonic: each blob is a
-//! xiaolongbao — content sealed in a verified wrapper, served from a kitchen,
-//! shareable across tables.
+//! An [`AssetClass`] is a namespace of content-addressed blobs with one cache
+//! directory. [`Asset::fetch_to_file`] returns the path of a plain file
+//! `<cache_dir>/<blake3-hex>` holding the verified blob. A blob already in
+//! the local cache is returned at once ([`FetchTier::Cache`]). Otherwise the
+//! blob is cut into segments and each segment is read from the peers that
+//! hold it ([`FetchTier::Peer`]) or, when no peer does, from the HTTP origin
+//! ([`FetchTier::Origin`]); nodes fetching the same blob divide the origin
+//! reads between them (see [`swarm`]).
 //!
-//! Multi-source concurrent fetch (local cache → LAN peer → swarm peer →
-//! permanent seed → CDN edge), with per-chunk BLAKE3 Bao-tree verification so
-//! chunks pulled from different sources are independently verifiable.
+//! No path holds a blob in memory. Peer and origin data alike are verified
+//! chunk group by chunk group against the BLAKE3 tree as they arrive and
+//! stored at once, so a blob is served to the admitted peers while it is
+//! still downloading, and from its plain file once it is complete.
 //!
-//! **Status: xlb-4.** Core types + iroh-blobs transport (xlb-2) + HTTP CDN
-//! fallback + Bao verifier glue (xlb-3) + BandwidthGovernor with
-//! battery/metered auto-detection (xlb-4). Full five-tier fetch chain wired
-//! per `.yah/docs/architecture/xlb.md`.
-//!
-//! @yah:ticket(R002-F2, "Ref resolution: Hash, Version(name, semver req), Latest(name, channel) via per-class manifest")
-//! @yah:status(review)
-//! @yah:at(2026-10-18T18:14:46Z)
-//! @yah:assignee(agent:bundle-anthropic-miravel)
-//! @yah:parent(R002)
-//! @yah:next("Tier: Warrior")
-//! @yah:next("Ref::{Hash, Version(name, semver req), Latest(name, channel)} resolved through a per-class manifest.")
-//! @yah:next("Hash refs are immutable; Version/Latest re-resolve on a TTL.")
-//! @yah:depends_on(R002-F1)
-//! @yah:handoff("Added crates/xlb/src/refs.rs (platform-neutral: no fs/tokio/clock): Ref::{Hash, Version(String, VersionReq), Latest(String, String)}, Manifest JSON (schema=1; release{id,hashes}; pinned_sets; entries{name,version,channels,hash,size}), ParsedManifest (validates versions/hashes up front; resolve picks highest semver; Latest filters by channel), Resolution{hash,fetched_at_ms}, is_expired(fetched_at, now, ttl) with now as a parameter.")
-//! @yah:handoff("Added crates/xlb/src/resolver.rs (native): ManifestSource async trait, HttpManifestSource (reqwest, no redirects), ResolverState (manifest + fetched_at, Ref memo, applied pin-set names). lib.rs: AssetClassConfig.manifest_url + resolve_ttl (default 300s); AssetClass::{resolve, resolve_asset, refresh_manifest, set_manifest_source}. Hash refs return immediately and never fetch. Version/Latest memoised; past TTL the manifest is refetched and the memo cleared. If the refetch fails and a manifest is cached, the stale resolution is served (stays expired, retries next call); cold failure errors.")
-//! @yah:handoff("Pin re-derivation: each manifest refresh feeds release -> record_release, pinned_sets -> pin_set, and sets the previous manifest had but the new one dropped -> unpin_set. This resolves R002-F1's 'pin state is in-memory only' gotcha; struck it from R002-F1 via board.update.")
-//! @yah:handoff("Deps added to crates/xlb/Cargo.toml: semver 1, serde 1 (derive), serde_json 1 (all already in Cargo.lock; lock unchanged by me). Updated examples/register_class.rs for the new config fields. Did not edit noisetable's required_manifest.rs (used only as format reference: release + per-asset blake3/size).")
-//! @yah:handoff("Git policy defer, no commit. Suggested: git add crates/xlb/src/refs.rs crates/xlb/src/resolver.rs crates/xlb/src/lib.rs crates/xlb/Cargo.toml crates/xlb/examples/register_class.rs && git commit -m 'xlb: Ref resolution via per-class manifest (R002-F2)'")
-//! @yah:verify("cargo test --workspace in oss/xlb: EXIT=0; xlb lib 72 -> 82 (5 refs tests + 5 resolver tests: Hash no-fetch, Version/Latest TTL re-resolve, stale-on-failure, no source, pin re-derivation + dropped-set unpin); full workspace 126 passed vs baseline 116 (log /tmp/r002f2-5.log).")
-//! @yah:gotcha("The manifest is a mutable, non-content-addressed pointer; its integrity is only the transport's (TLS). Blobs it names are still BLAKE3-verified at fetch. No signature over the manifest yet.")
-//! @yah:gotcha("Wasm-neutrality of refs.rs not compiled against wasm32 (deps: semver, serde, serde_json, thiserror, crate::BlakeHash which lives in the native lib.rs) — R002-F4 extraction must move BlakeHash too.")
-//!
-//! @yah:ticket(R002-S3, "Spike: does xlb (iroh/iroh-blobs deps) build for wasm32?")
-//! @yah:status(review)
-//! @yah:at(2026-10-18T18:06:17Z)
-//! @yah:kind(spike)
-//! @yah:assignee(agent:bundle-anthropic-miravel)
-//! @yah:parent(R002)
-//! @yah:next("Tier: Warrior")
-//! @yah:next("Decides whether the browser runs xlb itself or a thin client sharing xlb's policy types (retention and ref types).")
-//! @yah:handoff("VERDICT: browser can run iroh/iroh-blobs themselves, but NOT xlb as-is; recommend a split crate (xlb-core: policy/Ref/verify types, no iroh) shared by a thin wasm client, with OPFS cache (R002-F4) implemented behind a cache trait. Do not try to compile the current xlb crate for wasm32.")
-//! @yah:handoff("EVIDENCE: `cargo check -p xlb --target wasm32-unknown-unknown` fails first in mio 1.2.0 (36 errors, mio has no wasm32-unknown-unknown backend). mio reaches xlb via (a) mshr 0.8.47 -> mdns-sd 0.21.4 (mshr/Cargo.toml non-apple dep, unconditional) and (b) tokio 1.52.3 with net-capable features pulled by iroh deps/hyper (iroh-metrics 1.0.2 -> hyper-util). xlb itself also requests tokio `rt-multi-thread`, which tokio rejects on wasm.")
-//! @yah:handoff("POSITIVE PROBE: scratch crate with iroh 1.3.0 + iroh-blobs 0.103.1 (default-features=false, no `tls-ring`) + blake3 + bytes passes `cargo check --target wasm32-unknown-unknown` (EXIT=0). Registry source confirms deliberate browser support: iroh-1.3.0/Cargo.toml has target cfg(all(target_family=wasm,target_os=unknown)) deps getrandom(wasm_js), time(wasm-bindgen), wasm-bindgen-futures, and gates noq/portmapper/tokio to non-wasm (~256 wasm cfg hits in iroh/src); iroh-blobs-0.103.1 adds chrono wasmbind + getrandom wasm_js. Browser iroh is relay-only (no UDP/mDNS/portmapper), so LAN tier is unavailable in-browser.")
-//! @yah:handoff("xlb modules NOT neutral: cache.rs (std::fs, tokio Mutex/RwLock), bandwidth.rs (std::fs /proc reads), transport/blobs.rs (iroh + mshr Endpoint), transport/http.rs (reqwest rustls-tls), seed.rs (R2 upload), testing.rs. Likely neutral: verify.rs (blake3/hmac/sha2), metrics.rs, source.rs trait/progress types, retention/Ref types -- not individually verified by compile.")
-//! @yah:handoff("RECOMMENDED SPLIT: (1) extract policy/Ref/verify/metrics/progress types into a dependency-light crate (or `default = [\"native\"]` feature on xlb where `native` gates cache/bandwidth/seed/testing/transport, iroh, mshr, reqwest-rustls, tokio rt-multi-thread, tls-ring); (2) wasm client enables iroh+iroh-blobs without tls-ring (relay/HTTP-edge tiers) and implements the cache trait over OPFS. No gate landed: lib.rs/cache.rs are being edited by R002-F1 and gating needs cfg on cache.rs's module; Cargo.toml/lib.rs untouched, so native tests unaffected.")
-//! @yah:handoff("UNVERIFIED: whether `tls-ring` (ring 0.17.14) builds for wasm32-unknown-unknown (needs clang; not tried) and whether iroh with a real Endpoint works end-to-end in a browser; reqwest rustls-tls on wasm not checked (reqwest uses its wasm backend, TLS features are ignored/unsupported there).")
-//! @yah:verify("cargo check -p xlb --target wasm32-unknown-unknown  (fails in mio; log /tmp/r002s3-1.log)")
-//! @yah:verify("cargo tree -p xlb --target wasm32-unknown-unknown -i mio")
-//! @yah:verify("scratch crate /tmp/r002s3-probe: iroh 1.3 + iroh-blobs 0.103 default-features=false, cargo check --target wasm32-unknown-unknown (EXIT=0; log /tmp/r002s3-2.log)")
-//! @yah:verify("grep wasm in ~/.cargo/registry iroh-1.3.0/Cargo.toml and iroh-blobs-0.103.1/Cargo.toml")
+//! This is a fork of `yah-ai/xlb` 0.8.51. It drops the in-memory store, the
+//! `Bytes` fetch API, manifest resolution, the bandwidth governor and the
+//! `mshr` endpoint wrapper.
 
-pub mod bandwidth;
 pub(crate) mod cache;
 pub mod metrics;
+pub mod origin;
+pub mod peer;
 pub mod pinned;
-pub(crate) mod resolver;
-pub mod seed;
+pub mod sigv4;
 pub(crate) mod source;
-pub mod testing;
-pub mod transport;
-pub(crate) mod verify;
+pub(crate) mod store;
+pub(crate) mod swarm;
 
-pub use bandwidth::BandwidthGovernor;
 pub use cache::CacheStats;
 pub use metrics::{FetchObserver, FetchReport};
+pub use origin::{OriginConfig, OriginSource};
+pub use peer::{NodeId, PeerAddr, PeerConfig, RelaySetting, RelayUrl};
 pub use pinned::{PinError, PinnedTreeInfo, SeedReport};
-pub use resolver::ManifestSource;
-pub use seed::{derive_key, seed_blob, R2Target, SeedOutcome};
-pub(crate) use source::BlobSource;
+pub use sigv4::Credentials;
 pub use source::{FetchProgress, FetchTier, ProgressSink};
-pub use xlb_core::{refs, retention};
-pub use xlb_core::{BlakeHash, InvalidHash, Ref, Resolution, ResolveError};
-pub use xlb_core::{RetentionIndex, RetentionPolicy};
+pub use xlb_core::retention;
+pub use xlb_core::{BlakeHash, InvalidHash, RetentionIndex, RetentionPolicy};
 
-use bytes::Bytes;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use crate::cache::Cache;
+use tokio::sync::watch;
+
+use crate::{
+    cache::Cache,
+    origin::Origin,
+    peer::PeerTransport,
+    store::BlobStore,
+    swarm::{SwarmFailure, SwarmProgress, SwarmSources},
+};
+
+/// Subdirectory of a class's `cache_dir` for files that are not verified yet.
+const INCOMING_DIR: &str = ".incoming";
+
+/// Default interval of the blob store's garbage collection.
+pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(5);
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     #[error("invalid hash: {0}")]
     InvalidHash(#[from] InvalidHash),
 
-    #[error("all sources exhausted for {0}")]
-    FetchFailed(BlakeHash),
+    /// No tier produced the blob. `detail` says what each tier answered.
+    #[error("all sources exhausted for {hash}: {detail}")]
+    FetchFailed { hash: BlakeHash, detail: String },
 
+    /// A file's content has a different BLAKE3 root than its name.
     #[error("hash mismatch: expected {expected}, got {actual}")]
     HashMismatch {
         expected: BlakeHash,
         actual: BlakeHash,
     },
 
+    /// The origin served a range or an outboard that does not verify
+    /// against the blob's hash, or the store could not take the range.
+    #[error("origin content for {hash} was not accepted: {detail}")]
+    OriginRejected { hash: BlakeHash, detail: String },
+
+    /// The blob is larger than the class's whole cache budget.
+    #[error("{hash} is {size} bytes, larger than the cache budget of {budget_bytes} bytes")]
+    ExceedsBudget {
+        hash: BlakeHash,
+        size: u64,
+        budget_bytes: u64,
+    },
+
+    #[error("configuration: {0}")]
+    Config(String),
+
+    #[error("blob store: {0}")]
+    Store(String),
+
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(Arc<std::io::Error>),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(Arc::new(e))
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// ─── Policy types ─────────────────────────────────────────────────────────────
-
-/// The role this process plays for an `AssetClass`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeedRole {
-    /// Fetch only; never serve bytes to remote peers.
-    Passive,
-    /// Fetch + seed under the class's per-tier bandwidth cap.
-    Participant,
-    /// Fetch + seed without caps; always-on. Used by yah-cloud permanent seeds.
-    Permanent,
-}
-
-/// Coarse label used by `BandwidthPolicy` to bucket peers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PeerTier {
-    Cloud,
-    Camp,
-    Workstation,
-    Mobile,
-}
-
-/// Upload/download bandwidth caps for one tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BwCaps {
-    pub up_mbit: u32,
-    pub down_mbit: u32,
-}
-
-impl BwCaps {
-    /// Passive peers fetch but never upload.
-    pub fn passive() -> Self {
-        Self {
-            up_mbit: 0,
-            down_mbit: 50,
-        }
-    }
-}
-
-/// Per-class bandwidth policy: caps keyed by `PeerTier`.
-///
-/// ```
-/// use xlb::{BandwidthPolicy, BwCaps, PeerTier};
-///
-/// let policy = BandwidthPolicy::default()
-///     .role(PeerTier::Cloud,       BwCaps { up_mbit: 1000, down_mbit: 10_000 })
-///     .role(PeerTier::Camp,         BwCaps { up_mbit: 10,   down_mbit: 100 })
-///     .role(PeerTier::Workstation, BwCaps { up_mbit: 5,    down_mbit: 50 })
-///     .role(PeerTier::Mobile,      BwCaps::passive());
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct BandwidthPolicy {
-    roles: HashMap<PeerTier, BwCaps>,
-}
-
-impl BandwidthPolicy {
-    pub fn role(mut self, tier: PeerTier, caps: BwCaps) -> Self {
-        self.roles.insert(tier, caps);
-        self
-    }
-
-    pub fn caps_for(&self, tier: PeerTier) -> BwCaps {
-        self.roles
-            .get(&tier)
-            .copied()
-            .unwrap_or_else(BwCaps::passive)
-    }
-}
-
-// ─── Discovery ────────────────────────────────────────────────────────────────
-
-/// Which discovery mechanisms to enable for an `AssetClass`.
-///
-/// xlb-2 wires in mDNS and iroh-relay discovery; xlb-1 only has Static
-/// (permanent seeds resolved via the class config).
-#[derive(Debug, Clone)]
-pub struct Discovery {
-    /// Announce and discover peers via mDNS on the local subnet.
-    pub lan: bool,
-    /// Announce and discover peers through iroh relay servers.
-    pub swarm: bool,
-    pub relays: Vec<String>,
-}
-
-impl Default for Discovery {
-    fn default() -> Self {
-        Self {
-            lan: true,
-            swarm: true,
-            relays: vec![],
-        }
-    }
-}
-
-impl Discovery {
-    pub fn with_relays(mut self, relays: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.relays = relays.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn lan_only() -> Self {
-        Self {
-            lan: true,
-            swarm: false,
-            relays: vec![],
-        }
-    }
-
-    pub fn none() -> Self {
-        Self {
-            lan: false,
-            swarm: false,
-            relays: vec![],
-        }
-    }
-}
-
 // ─── AssetClassConfig ─────────────────────────────────────────────────────────
 
-/// Configuration for an `AssetClass`.
+/// Configuration for an [`AssetClass`].
 pub struct AssetClassConfig {
-    /// Stable name for this class. Used as the swarm topic and log identifier.
+    /// Stable name for this class; a log and metric identifier.
     pub name: &'static str,
-    /// Pinned `NodeId`s of always-on seed servers (string form; resolved in xlb-2).
-    pub permanent_seeds: Vec<String>,
-    /// URL template for the CDN fallback; `{blake3}` is substituted per-asset.
-    pub cdn_fallback: Option<String>,
-    pub discovery: Discovery,
-    pub bandwidth: BandwidthPolicy,
-    /// Base directory for the local asset cache. `None` = in-memory only.
-    pub cache_dir: Option<PathBuf>,
-    /// LRU eviction budget for cached assets, in bytes.
+    /// Directory holding one plain file per complete blob, named by its
+    /// BLAKE3 hex, and the blob store under `.store`.
+    pub cache_dir: PathBuf,
+    /// LRU eviction budget for unpinned blobs, in bytes.
     pub cache_budget_bytes: u64,
-    /// Releases before the current one whose manifest blobs stay pinned
-    /// (see [`AssetClass::record_release`]). `1` = current + previous.
-    pub keep_releases: usize,
-    /// HTTPS URL of this class's JSON manifest (see [`refs`]). `None` = no
-    /// manifest; supply one with [`AssetClass::set_manifest_source`] or use
-    /// only `Ref::Hash`.
-    pub manifest_url: Option<String>,
-    /// How long a manifest fetch (and the `Version`/`Latest` resolutions
-    /// derived from it) stays fresh before [`AssetClass::resolve`] refetches.
-    pub resolve_ttl: std::time::Duration,
-    /// Called once per completed fetch with a [`FetchReport`] (R423-T7).
-    ///
-    /// `None` — the default — means no instrumentation and no cost. Set it to
-    /// measure which tier is actually serving traffic; W160's 50%-swarm-hit
-    /// cost envelope is unverified until something does.
+    /// The peer tier. `None` = this class neither serves nor reads peers.
+    pub peer: Option<PeerConfig>,
+    /// The origin tier. `None` = no origin.
+    pub origin: Option<OriginConfig>,
+    /// How often the blob store drops entries the cache no longer holds.
+    pub gc_interval: Duration,
+    /// Called once per completed fetch with a [`FetchReport`].
     pub observer: Option<FetchObserver>,
 }
 
-impl Default for AssetClassConfig {
-    fn default() -> Self {
+impl AssetClassConfig {
+    /// A class with a 1 GiB budget and neither peers nor an origin.
+    pub fn new(name: &'static str, cache_dir: impl Into<PathBuf>) -> Self {
         Self {
-            name: "default",
-            permanent_seeds: vec![],
-            cdn_fallback: None,
-            discovery: Discovery::default(),
-            bandwidth: BandwidthPolicy::default(),
-            cache_dir: None,
+            name,
+            cache_dir: cache_dir.into(),
             cache_budget_bytes: 1024 * 1024 * 1024,
-            keep_releases: 1,
-            manifest_url: None,
-            resolve_ttl: std::time::Duration::from_secs(300),
+            peer: None,
+            origin: None,
+            gc_interval: DEFAULT_GC_INTERVAL,
             observer: None,
         }
     }
@@ -272,127 +149,126 @@ impl Default for AssetClassConfig {
 
 // ─── AssetClass ───────────────────────────────────────────────────────────────
 
-struct ClassInner {
-    config: AssetClassConfig,
-    /// `FetchTier::Cache` — in-memory when `config.cache_dir` is `None`,
-    /// disk-backed with LRU eviction (gated on `config.cache_budget_bytes`)
-    /// otherwise. Disk-backed entries survive process restart.
-    cache: Cache,
-    /// Where pinned trees persist (`<cache_dir>/pins`); `None` on an
-    /// in-memory class, whose trees live only in the retention index.
-    trees: Option<pinned::TreeStore>,
-    /// Names of the declared pinned trees. The retention index's set
-    /// namespace also holds manifest-derived sets, so this is what tells a
-    /// tree from one of those when listing.
-    tree_names: std::sync::Mutex<std::collections::BTreeSet<String>>,
-    /// Fetch sources. Rebuilt into a `FetchChain` at first fetch; subsequent
-    /// sources added via `add_source` are appended and the chain rebuilt.
-    sources: RwLock<Vec<Arc<dyn BlobSource>>>,
-    role: RwLock<(SeedRole, PeerTier)>,
-    /// Bandwidth governor — enforces per-tier caps and auto-governors
-    /// (battery/metered). Updated via `set_governor_*` and `probe_os`.
-    governor: BandwidthGovernor,
-    /// Manifest, resolution memo and applied pin-set names (R002-F2).
-    resolver: tokio::sync::Mutex<resolver::ResolverState>,
+/// What a finished transfer produced.
+#[derive(Debug, Clone)]
+struct Fetched {
+    path: PathBuf,
+    size: u64,
+    tier: FetchTier,
+    peer_bytes: u64,
+    origin_bytes: u64,
 }
 
-/// A registered asset class — a per-app namespace for content-addressed blobs.
-///
-/// `AssetClass` is `Clone + Send + Sync`; clone it freely to share across tasks.
-/// Drop the last clone to stop seeding gracefully (xlb-2+).
-#[derive(Clone)]
-pub struct AssetClass(Arc<ClassInner>);
-
-/// Eviction deletes are best-effort; the index has already dropped the entries.
-fn log_evict_failure(r: Result<(), xlb_core::StoreError>) {
-    if let Err(e) = r {
-        tracing::warn!("cache eviction delete failed: {e}");
+impl Fetched {
+    fn cached(path: PathBuf, size: u64) -> Self {
+        Self {
+            path,
+            size,
+            tier: FetchTier::Cache,
+            peer_bytes: 0,
+            origin_bytes: 0,
+        }
     }
 }
 
+/// The shared view of one transfer in flight.
+#[derive(Debug, Clone, Default)]
+struct FlightState {
+    progress: Option<FetchProgress>,
+    outcome: Option<Result<Fetched>>,
+}
+
+type FlightSender = Arc<watch::Sender<FlightState>>;
+
+struct ClassInner {
+    name: &'static str,
+    observer: Option<FetchObserver>,
+    cache: Arc<Cache>,
+    store: BlobStore,
+    peers: Option<PeerTransport>,
+    origin: Option<Origin>,
+    trees: pinned::TreeStore,
+    /// Names of the declared pinned trees.
+    tree_names: Mutex<std::collections::BTreeSet<String>>,
+    /// Transfers in flight by hash, so concurrent fetches share one.
+    flights: Mutex<HashMap<BlakeHash, watch::Receiver<FlightState>>>,
+}
+
+/// A registered asset class — a namespace for content-addressed blobs.
+///
+/// `AssetClass` is `Clone + Send + Sync`; clone it freely to share across
+/// tasks. Call [`AssetClass::shutdown`] before dropping the last clone.
+#[derive(Clone)]
+pub struct AssetClass(Arc<ClassInner>);
+
 impl AssetClass {
-    /// Register a new asset class.
+    /// Register a class: open its blob store, reconcile the plain files
+    /// already in the cache directory, and bind the peer endpoint if
+    /// configured.
     ///
-    /// When `config.cdn_fallback` is `Some`, an [`HttpFetcher`] is
-    /// automatically wired in as the `FetchTier::Cdn` source. The iroh-blobs
-    /// transport (tiers 2–4) is attached separately via
-    /// [`BlobTransport::attach_fetcher`].
-    ///
-    /// A [`BandwidthGovernor`] is built from `config.bandwidth` and probed
-    /// against the OS power source at startup (xlb-4).
+    /// A plain file the store does not know is re-imported in place and
+    /// kept only when its content hashes to its name.
     pub async fn register(config: AssetClassConfig) -> Result<Self> {
-        // Pre-build CDN source before moving config into ClassInner.
-        let cdn: Option<Arc<dyn BlobSource>> = if let Some(url) = &config.cdn_fallback {
-            match transport::http::HttpFetcher::new(url.as_str()) {
-                Ok(f) => Some(Arc::new(f)),
-                Err(e) => {
-                    tracing::warn!(url = %url, "HttpFetcher init failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let initial_sources: Vec<Arc<dyn BlobSource>> = cdn.into_iter().collect();
-
-        // Build and probe the bandwidth governor.
-        let governor = BandwidthGovernor::new(config.bandwidth.clone());
-        governor.probe_os();
-
-        // Build the cache layer. `cache_dir = None` → in-memory; `Some` →
-        // disk-backed at the given path with LRU eviction gated on
-        // `cache_budget_bytes`. The latter survives process restart, which
-        // is the whole reason this layer exists (see W160 F3).
-        //
-        // Pinned trees (R1003) are loaded and declared on the index first, so
-        // the cache's replay of what is already on disk cannot evict them.
-        let trees = config.cache_dir.as_deref().map(pinned::TreeStore::under);
-        let mut index = RetentionIndex::new(RetentionPolicy::new(
-            config.cache_budget_bytes,
-            config.keep_releases,
-        ));
-        let mut tree_names = std::collections::BTreeSet::new();
-        if let Some(store) = &trees {
-            for (name, hashes) in store.load_all().map_err(std::io::Error::other)? {
-                tree_names.insert(name.clone());
-                index.pin_set(name, hashes);
-            }
+        let cache_dir = std::path::absolute(&config.cache_dir)?;
+        tokio::fs::create_dir_all(&cache_dir).await?;
+        let incoming = cache_dir.join(INCOMING_DIR);
+        match tokio::fs::remove_dir_all(&incoming).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-        let cache = Cache::new(config.cache_dir.as_deref(), index).await?;
+        tokio::fs::create_dir_all(&incoming).await?;
 
-        let manifest_source: Option<Arc<dyn ManifestSource>> = match config
-            .manifest_url
-            .as_deref()
-            .map(resolver::HttpManifestSource::new)
-        {
-            Some(Ok(s)) => Some(Arc::new(s)),
-            Some(Err(e)) => {
-                tracing::warn!("manifest source init failed: {e}");
-                None
-            }
+        // Pinned trees are declared on the index first, so replaying what is
+        // already on disk cannot evict them.
+        let trees = pinned::TreeStore::under(&cache_dir);
+        let mut index = RetentionIndex::new(RetentionPolicy::new(config.cache_budget_bytes, 0));
+        let mut tree_names = std::collections::BTreeSet::new();
+        for (name, hashes) in trees.load_all().map_err(std::io::Error::other)? {
+            tree_names.insert(name.clone());
+            index.pin_set(name, hashes);
+        }
+        let cache = Arc::new(Cache::new(&cache_dir, index));
+
+        let store = BlobStore::open(&cache_dir, cache.clone(), config.gc_interval)
+            .await
+            .map_err(Error::Store)?;
+        reconcile(&cache, &store).await?;
+        store.mark_ready();
+
+        let peers = match config.peer {
+            Some(peer) => Some(
+                PeerTransport::bind(peer, store.api())
+                    .await
+                    .map_err(Error::Config)?,
+            ),
+            None => None,
+        };
+        let origin = match config.origin {
+            Some(origin) => Some(Origin::new(origin).map_err(|e| Error::Config(e.to_string()))?),
             None => None,
         };
 
         Ok(Self(Arc::new(ClassInner {
-            config,
-            trees,
-            tree_names: std::sync::Mutex::new(tree_names),
-            resolver: tokio::sync::Mutex::new(resolver::ResolverState {
-                source: manifest_source,
-                ..Default::default()
-            }),
+            name: config.name,
+            observer: config.observer,
             cache,
-            sources: RwLock::new(initial_sources),
-            role: RwLock::new((SeedRole::Participant, PeerTier::Workstation)),
-            governor,
+            store,
+            peers,
+            origin,
+            trees,
+            tree_names: Mutex::new(tree_names),
+            flights: Mutex::new(HashMap::new()),
         })))
     }
 
-    /// Update this peer's role and tier for the class.
-    pub async fn set_role(&self, role: SeedRole, tier: PeerTier) -> Result<()> {
-        *self.0.role.write().await = (role, tier);
-        Ok(())
+    /// Stop serving peers, close the endpoint and shut the blob store down.
+    pub async fn shutdown(&self) {
+        match &self.0.peers {
+            // The router shuts the protocol handler down, which shuts the store.
+            Some(peers) => peers.shutdown().await,
+            None => self.0.store.shutdown().await,
+        }
     }
 
     /// Return a handle to a specific asset within this class.
@@ -405,98 +281,96 @@ impl AssetClass {
 
     /// The configured name of this class.
     pub fn name(&self) -> &str {
-        self.0.config.name
+        self.0.name
     }
 
-    /// Borrow the configured permanent-seed list.
-    ///
-    /// Each entry is a hex-encoded `NodeId`; parse with
-    /// [`transport::blobs::parse_seed_node_id`]. Used by
-    /// [`transport::BlobTransport::attach_permanent_seeds`] to wire
-    /// `FetchTier::Seed` sources at boot.
-    pub(crate) fn permanent_seeds(&self) -> &[String] {
-        &self.0.config.permanent_seeds
+    /// The absolute cache directory; a complete blob is the plain file
+    /// `<cache_dir>/<blake3-hex>`.
+    pub fn cache_dir(&self) -> &Path {
+        self.0.cache.dir()
     }
 
-    /// Borrow the bandwidth governor for this class.
-    ///
-    /// Use [`BandwidthGovernor::effective_caps`] to query per-tier caps
-    /// (already adjusted for battery/metered state).
-    pub fn governor(&self) -> &BandwidthGovernor {
-        &self.0.governor
+    /// Current cache occupancy. Reads an in-memory index.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.0.cache.stats()
     }
 
-    /// Notify the governor that battery state changed.
-    ///
-    /// Call from OS power-event hooks (e.g. `NSWorkspaceDidChangeNotification`
-    /// on macOS) to keep caps updated in real time.
-    pub fn set_battery(&self, on_battery: bool) {
-        self.0.governor.set_battery(on_battery);
+    // ─── Peers ─────────────────────────────────────────────────────────────
+
+    /// This node's ID on the peer tier, if the class has one.
+    pub fn node_id(&self) -> Option<NodeId> {
+        self.0.peers.as_ref().map(PeerTransport::node_id)
     }
 
-    /// Notify the governor that metered-connection state changed.
-    pub fn set_metered(&self, metered: bool) {
-        self.0.governor.set_metered(metered);
+    /// The UDP addresses the peer endpoint is bound to.
+    pub fn bound_addrs(&self) -> Vec<SocketAddr> {
+        self.0
+            .peers
+            .as_ref()
+            .map(PeerTransport::bound_addrs)
+            .unwrap_or_default()
     }
 
-    /// Current cache occupancy for this class (R423-T6).
-    ///
-    /// Reads an in-memory index; no filesystem access, so it is safe to poll
-    /// from an operator surface on a timer. See [`CacheStats::disk_backed`]
-    /// before drawing a used-vs-budget ratio.
-    pub async fn cache_stats(&self) -> CacheStats {
-        self.0.cache.stats().await
+    /// Replace the peer set. Later fetches read only from these peers and
+    /// only these peers are served. A no-op on a class without a peer tier.
+    pub fn set_peers(&self, peers: Vec<PeerAddr>) {
+        let admit = peers.iter().map(|peer| peer.node_id).collect();
+        self.set_peer_sets(peers, admit);
     }
+
+    /// Replace the peer set and, separately, the nodes this node serves.
+    /// Later fetches dial, observe and read only `peers`; get and observe
+    /// requests are answered only for the node IDs in `admit`, which need
+    /// not be in `peers`. A no-op on a class without a peer tier.
+    // [impl -> dsn~xlb-peer-reach~1]
+    pub fn set_peer_sets(&self, peers: Vec<PeerAddr>, admit: Vec<NodeId>) {
+        if let Some(transport) = &self.0.peers {
+            transport.set_peer_sets(peers, admit);
+        }
+    }
+
+    /// The relay the peer endpoint is reachable through, once it has
+    /// connected to one.
+    pub fn relay_url(&self) -> Option<RelayUrl> {
+        self.0.peers.as_ref().and_then(PeerTransport::relay_url)
+    }
+
+    /// The current peer set.
+    pub fn peers(&self) -> Vec<PeerAddr> {
+        self.0
+            .peers
+            .as_ref()
+            .map(PeerTransport::peers)
+            .unwrap_or_default()
+    }
+
+    // ─── Pins ──────────────────────────────────────────────────────────────
 
     /// Pin one blob: never evicted, outside the byte budget. May be called
     /// before the blob has been fetched.
-    pub async fn pin(&self, hash: BlakeHash) {
-        self.0.cache.retention().pin(hash);
+    pub fn pin(&self, hash: BlakeHash) {
+        self.0.cache.pin(hash);
     }
 
     /// Drop a hash pin; the blob rejoins the LRU (and may be evicted at once
     /// if the unpinned footprint is over budget).
-    pub async fn unpin(&self, hash: &BlakeHash) {
-        let r = self.0.cache.retention().unpin(hash).await;
-        log_evict_failure(r);
-    }
-
-    /// Define or replace a named pin set (e.g. a consumer's required-asset
-    /// list).
-    pub async fn pin_set(&self, name: &str, hashes: impl IntoIterator<Item = BlakeHash>) {
-        self.0.cache.retention().pin_set(name, hashes);
-    }
-
-    /// Remove a named pin set.
-    pub async fn unpin_set(&self, name: &str) {
-        let r = self.0.cache.retention().unpin_set(name).await;
-        log_evict_failure(r);
-    }
-
-    /// Record `release` as current with the blobs its manifest lists; releases
-    /// more than `keep_releases` back lose their protection.
-    pub async fn record_release(&self, release: &str, hashes: impl IntoIterator<Item = BlakeHash>) {
-        let r = self
-            .0
-            .cache
-            .retention()
-            .record_release(release, hashes)
-            .await;
-        log_evict_failure(r);
+    pub fn unpin(&self, hash: &BlakeHash) {
+        self.0.cache.unpin(hash);
     }
 
     /// Whether `hash` is currently protected from eviction.
-    pub async fn is_pinned(&self, hash: &BlakeHash) -> bool {
-        self.0.cache.retention().is_pinned(hash)
+    pub fn is_pinned(&self, hash: &BlakeHash) -> bool {
+        self.0.cache.is_pinned(hash)
     }
 
-    // ─── Pinned trees (R1003) ──────────────────────────────────────────────
+    fn tree_names(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<String>> {
+        self.0.tree_names.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-    /// Declare (or replace) the pinned tree `name` covering `hashes`. On a
-    /// disk-backed class it is persisted first, then pinned, so it survives a
-    /// restart and its members are never evicted. The bytes need not be
-    /// present: seed them with [`Self::seed_tree_from_dirs`] or let fetches
-    /// fill them in.
+    /// Declare (or replace) the pinned tree `name` covering `hashes`. It is
+    /// persisted first, then pinned, so it survives a restart and its members
+    /// are never evicted. The bytes need not be present: seed them with
+    /// [`Self::seed_tree_from_dirs`] or let fetches fill them in.
     pub async fn pin_tree(
         &self,
         name: &str,
@@ -506,71 +380,58 @@ impl AssetClass {
         let mut hashes: Vec<BlakeHash> = hashes.into_iter().collect();
         hashes.sort_by_key(BlakeHash::to_hex);
         hashes.dedup();
-        if let Some(store) = &self.0.trees {
-            store.save(name, &hashes).await?;
-        }
+        self.0.trees.save(name, &hashes).await?;
         // Replacing a tree can drop members; unpin first so the evictions
         // that frees are deleted, then pin the new membership.
-        let retention = self.0.cache.retention();
-        if self.0.tree_names.lock().unwrap().contains(name) {
-            log_evict_failure(retention.unpin_set(name).await);
+        if self.tree_names().contains(name) {
+            self.0.cache.unpin_set(name);
         }
-        retention.pin_set(name, hashes);
-        self.0.tree_names.lock().unwrap().insert(name.to_string());
-        Ok(self.tree_info(name).expect("tree was just declared"))
+        self.0.cache.pin_set(name, hashes);
+        self.tree_names().insert(name.to_string());
+        self.tree_info(name)
+            .ok_or_else(|| PinError::NotFound(name.to_string()))
     }
 
     /// Remove the pinned tree `name`; its members rejoin the LRU and may be
     /// evicted at once if the unpinned footprint is over budget.
     pub async fn unpin_tree(&self, name: &str) -> std::result::Result<(), PinError> {
-        if !self.0.tree_names.lock().unwrap().remove(name) {
+        if !self.tree_names().remove(name) {
             return Err(PinError::NotFound(name.to_string()));
         }
-        if let Some(store) = &self.0.trees {
-            store.remove(name).await?;
-        }
-        log_evict_failure(self.0.cache.retention().unpin_set(name).await);
+        self.0.trees.remove(name).await?;
+        self.0.cache.unpin_set(name);
         Ok(())
     }
 
     /// Every pinned tree on this class, by name.
     pub fn pinned_trees(&self) -> Vec<PinnedTreeInfo> {
-        let names: Vec<String> = self.0.tree_names.lock().unwrap().iter().cloned().collect();
+        let names: Vec<String> = self.tree_names().iter().cloned().collect();
         names.iter().filter_map(|n| self.tree_info(n)).collect()
     }
 
     /// The members of pinned tree `name`, or `None` if there is no such tree.
     pub fn tree_members(&self, name: &str) -> Option<Vec<BlakeHash>> {
-        if !self.0.tree_names.lock().unwrap().contains(name) {
+        if !self.tree_names().contains(name) {
             return None;
         }
-        Some(self.0.cache.retention().pin_set_members(name))
+        Some(self.0.cache.pin_set_members(name))
     }
 
     fn tree_info(&self, name: &str) -> Option<PinnedTreeInfo> {
-        let u = self.0.cache.retention().pin_set_usage(name)?;
+        let usage = self.0.cache.pin_set_usage(name)?;
         Some(PinnedTreeInfo {
             name: name.to_string(),
-            members: u.members,
-            present: u.present,
-            present_bytes: u.present_bytes,
-            durable: self.0.trees.is_some(),
+            members: usage.members,
+            present: usage.present,
+            present_bytes: usage.present_bytes,
+            durable: true,
         })
     }
 
-    /// Put `bytes` into this class's cache under their own blake3 hash —
-    /// no network. Pin before ingesting if the blob must stay: an unpinned
-    /// blob competes for the LRU budget like any fetched one.
-    pub async fn ingest(&self, bytes: Bytes) -> Result<BlakeHash> {
-        let hash = BlakeHash::hash(&bytes);
-        self.0.cache.put(hash, bytes).await?;
-        Ok(hash)
-    }
-
     /// Fill pinned tree `name` from local directories holding blobs at
-    /// `<dir>/<blake3-hex>` (a CAS checkout or a library store). Each file is
-    /// hashed before it is admitted; members already cached are not re-read.
-    /// No R2 or peer round-trip.
+    /// `<dir>/<blake3-hex>`. Each file is copied into the cache directory and
+    /// admitted only when its content hashes to its name; members already
+    /// cached are not re-read. No network.
     pub async fn seed_tree_from_dirs(
         &self,
         name: &str,
@@ -581,251 +442,322 @@ impl AssetClass {
             .ok_or_else(|| PinError::NotFound(name.to_string()))?;
         let mut report = SeedReport::default();
         'member: for hash in members {
-            if self.0.cache.contains(&hash).await {
+            if self.0.cache.contains(&hash) {
                 report.already_cached += 1;
                 continue;
             }
             for dir in dirs {
-                let path = dir.join(hash.to_hex());
-                let data = match tokio::fs::read(&path).await {
-                    Ok(d) => d,
+                let source = dir.join(hash.to_hex());
+                let staged = self.staging_path(&hash);
+                match tokio::fs::copy(&source, &staged).await {
+                    Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e.into()),
-                };
-                if !hash.verify(&data) {
-                    report.mismatched.push(path);
-                    continue;
                 }
-                self.0.cache.put(hash, Bytes::from(data)).await?;
-                report.ingested += 1;
-                continue 'member;
+                match self.adopt(hash, &staged).await {
+                    Ok(_) => {
+                        report.ingested += 1;
+                        continue 'member;
+                    }
+                    Err(Error::HashMismatch { .. }) => report.mismatched.push(source),
+                    Err(e) => return Err(std::io::Error::other(e).into()),
+                }
             }
             report.missing.push(hash);
         }
         Ok(report)
     }
 
-    /// Verified cached bytes for `hash`, if held. For the seeding side, which
-    /// republishes pinned trees to peers.
-    pub(crate) async fn cached(&self, hash: &BlakeHash) -> Option<Bytes> {
-        self.0.cache.get(hash).await
+    // ─── Fetch ─────────────────────────────────────────────────────────────
+
+    fn staging_path(&self, hash: &BlakeHash) -> PathBuf {
+        self.0.cache.dir().join(INCOMING_DIR).join(hash.to_hex())
     }
 
-    /// Add a fetch source to the chain (e.g. a transport adapter or mock peer).
-    ///
-    /// Sources are tried in `FetchTier` priority order regardless of insertion
-    /// order. Safe to call after the class is registered.
-    /// Replace where this class's manifest comes from (default: HTTP GET of
-    /// `config.manifest_url`). Drops any cached manifest and resolutions.
-    pub async fn set_manifest_source(&self, source: Arc<dyn ManifestSource>) {
-        let mut st = self.0.resolver.lock().await;
-        st.source = Some(source);
-        st.manifest = None;
-        st.memo.clear();
-    }
-
-    /// Resolve `r` to a content hash through the class manifest.
-    ///
-    /// `Hash` refs return immediately and never touch the manifest.
-    /// `Version`/`Latest` are memoised and re-resolved once
-    /// `config.resolve_ttl` has elapsed; if the refetch fails and a manifest
-    /// is already cached, the stale resolution is served (and stays expired,
-    /// so the next call retries) rather than failing an offline client.
-    pub async fn resolve(&self, r: &Ref) -> std::result::Result<BlakeHash, ResolveError> {
-        self.resolve_at(r, resolver::now_ms()).await
-    }
-
-    /// Resolve `r` and return the [`Asset`] handle for the result.
-    pub async fn resolve_asset(&self, r: &Ref) -> std::result::Result<Asset, ResolveError> {
-        Ok(self.asset(self.resolve(r).await?))
-    }
-
-    /// Refetch the manifest now regardless of TTL, then re-derive pins.
-    pub async fn refresh_manifest(&self) -> std::result::Result<(), ResolveError> {
-        let mut st = self.0.resolver.lock().await;
-        self.refresh_locked(&mut st, resolver::now_ms()).await
-    }
-
-    pub(crate) async fn resolve_at(
-        &self,
-        r: &Ref,
-        now_ms: u64,
-    ) -> std::result::Result<BlakeHash, ResolveError> {
-        if let Ref::Hash(h) = r {
-            return Ok(*h);
+    /// The plain file of `hash` if it is complete locally.
+    fn local(&self, hash: &BlakeHash) -> Option<(PathBuf, u64)> {
+        let (path, size) = self.0.cache.lookup(hash)?;
+        if path.is_file() {
+            Some((path, size))
+        } else {
+            tracing::warn!(%hash, "cached file vanished from {}", path.display());
+            self.0.cache.forget(hash);
+            None
         }
-        let ttl_ms = self.0.config.resolve_ttl.as_millis() as u64;
-        let mut st = self.0.resolver.lock().await;
-        if let Some(hit) = st.memo.get(r) {
-            if !hit.is_expired(now_ms, ttl_ms) {
-                return Ok(hit.hash);
+    }
+
+    /// Move the staged file to `<cache_dir>/<hex>`, have the store adopt it
+    /// in place, and admit it only when its content hashes to `hash`.
+    /// Returns its size. The file is gone again on any error.
+    async fn adopt(&self, hash: BlakeHash, staged: &Path) -> Result<u64> {
+        let path = self.0.cache.path_for(&hash);
+        let adopted: Result<u64> = async {
+            tokio::fs::rename(staged, &path).await?;
+            let size = tokio::fs::metadata(&path).await?.len();
+            let (actual, tag) = self
+                .0
+                .store
+                .import_reference(path.clone())
+                .await
+                .map_err(Error::Store)?;
+            if actual != hash {
+                return Err(Error::HashMismatch {
+                    expected: hash,
+                    actual,
+                });
             }
+            // The index entry keeps the blob alive from here; the import's
+            // temporary tag is dropped after it.
+            self.0.cache.insert(hash, size);
+            drop(tag);
+            Ok(size)
         }
-        if st.manifest_stale(now_ms, ttl_ms) {
-            if let Err(e) = self.refresh_locked(&mut st, now_ms).await {
-                if st.manifest.is_none() {
-                    return Err(e);
+        .await;
+        if adopted.is_err() {
+            for leftover in [staged, path.as_path()] {
+                if let Err(e) = tokio::fs::remove_file(leftover).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%hash, "removing {}: {e}", leftover.display());
+                    }
                 }
-                tracing::warn!(
-                    class = self.name(),
-                    "manifest refresh failed, using stale: {e}"
-                );
             }
         }
-        let (manifest, fetched_at_ms) = st.manifest.clone().ok_or(ResolveError::NoManifest)?;
-        let hash = manifest.resolve(r)?;
-        st.memo.insert(
-            r.clone(),
-            Resolution {
-                hash,
-                fetched_at_ms,
-            },
-        );
-        Ok(hash)
+        adopted
     }
 
-    /// Fetch + install a manifest. Pins are re-derived from it so they
-    /// survive a process restart: the current release feeds
-    /// [`record_release`](Self::record_release), each pinned set feeds
-    /// [`pin_set`](Self::pin_set), and a set the previous manifest declared
-    /// but this one dropped is unpinned.
-    async fn refresh_locked(
-        &self,
-        st: &mut resolver::ResolverState,
-        now_ms: u64,
-    ) -> std::result::Result<(), ResolveError> {
-        let manifest = st.fetch_manifest().await?;
-        if let Some((id, hashes)) = manifest.release() {
-            self.record_release(id, hashes.iter().copied()).await;
+    /// Join the transfer in flight for `hash`, or start one.
+    fn join_flight(&self, hash: BlakeHash) -> watch::Receiver<FlightState> {
+        let mut flights = self.0.flights.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(flight) = flights.get(&hash) {
+            // A closed channel is a transfer task that died; replace it.
+            if flight.has_changed().is_ok() {
+                return flight.clone();
+            }
         }
-        let mut applied = std::collections::HashSet::new();
-        for (name, hashes) in manifest.pinned_sets() {
-            self.pin_set(name, hashes.iter().copied()).await;
-            applied.insert(name.to_string());
+        let (tx, rx) = watch::channel(FlightState::default());
+        flights.insert(hash, rx.clone());
+        let class = self.clone();
+        tokio::spawn(async move {
+            let tx: FlightSender = Arc::new(tx);
+            let outcome = class.transfer(hash, &tx).await;
+            // Unregister before publishing, so a fetch that arrives after the
+            // outcome starts from the cache rather than from this flight.
+            class
+                .0
+                .flights
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&hash);
+            tx.send_modify(|state| state.outcome = Some(outcome));
+        });
+        rx
+    }
+
+    /// Obtain `hash` from the local cache, or else from the peers and the
+    /// origin together.
+    // [impl -> dsn~xlb-fork~1]
+    // [impl -> dsn~xlb-swarm-fetch~1]
+    async fn transfer(&self, hash: BlakeHash, flight: &FlightSender) -> Result<Fetched> {
+        if let Some((path, size)) = self.local(&hash) {
+            return Ok(Fetched::cached(path, size));
         }
-        for gone in st.applied_sets.difference(&applied) {
-            self.unpin_set(gone).await;
+        let inner = &self.0;
+
+        // The store can still hold a complete entry for a blob the cache
+        // evicted. The fetch would see it as done, so wait for the store to
+        // collect it first. This must precede the in-flight guard, which
+        // would keep the entry alive.
+        if inner.store.complete_size(&hash).await.map_err(Error::Store)?.is_some()
+            && !inner.store.wait_forgotten(&hash).await
+        {
+            return Err(Error::FetchFailed {
+                hash,
+                detail: "the store still holds an evicted entry".into(),
+            });
         }
-        st.applied_sets = applied;
-        st.manifest = Some((Arc::new(manifest), now_ms));
-        st.memo.clear();
+        let _in_flight = inner.store.in_flight(hash);
+
+        let incoming_dir = inner.cache.dir().join(INCOMING_DIR);
+        let sources = SwarmSources {
+            hash,
+            store: inner.store.api(),
+            peers: inner.peers.as_ref(),
+            origin: inner.origin.as_ref(),
+            incoming_dir: &incoming_dir,
+        };
+        let admit = |size: u64| self.reserve(&hash, size);
+        let report = flight.clone();
+        let progress = move |received: SwarmProgress| {
+            report.send_modify(|state| {
+                state.progress = Some(FetchProgress {
+                    bytes_so_far: (received.peer_bytes + received.origin_bytes).min(received.size),
+                    total: Some(received.size),
+                    tier: if received.peer_bytes >= received.origin_bytes {
+                        FetchTier::Peer
+                    } else {
+                        FetchTier::Origin
+                    },
+                })
+            });
+        };
+        let received = match swarm::fetch(sources, admit, progress).await {
+            Ok(received) => received,
+            Err(SwarmFailure::Fatal(e)) => return Err(e),
+            Err(SwarmFailure::Miss(detail)) => {
+                tracing::debug!(%hash, "fetch missed: {detail}");
+                return Err(Error::FetchFailed { hash, detail });
+            }
+        };
+
+        // The complete blob leaves the store for its plain file and is
+        // served from there.
+        let path = inner.cache.path_for(&hash);
+        inner
+            .store
+            .export_reference(&hash, path.clone())
+            .await
+            .map_err(Error::Store)?;
+        inner.cache.insert(hash, received.size);
+        let tier = match (received.peer_bytes, received.origin_bytes) {
+            (0, 0) => FetchTier::Cache,
+            (peer, origin) if peer > origin => FetchTier::Peer,
+            _ => FetchTier::Origin,
+        };
+        Ok(Fetched {
+            path,
+            size: received.size,
+            tier,
+            peer_bytes: received.peer_bytes,
+            origin_bytes: received.origin_bytes,
+        })
+    }
+
+    /// Refuse a blob larger than the whole budget, else evict ahead of it.
+    fn reserve(&self, hash: &BlakeHash, size: u64) -> Result<()> {
+        self.0
+            .cache
+            .admits(hash, size)
+            .map_err(|budget_bytes| Error::ExceedsBudget {
+                hash: *hash,
+                size,
+                budget_bytes,
+            })?;
+        self.0.cache.make_room(hash, size);
         Ok(())
     }
 
-    pub(crate) fn add_source(&self, source: Arc<dyn BlobSource>) {
-        if let Ok(mut sources) = self.0.sources.try_write() {
-            sources.push(source);
-        } else {
-            tracing::warn!(
-                class = self.name(),
-                "add_source: lock contended, source dropped"
-            );
-        }
-    }
-
-    /// Internal: run the fetch chain for `hash`.
-    pub(crate) async fn fetch_bytes(&self, hash: BlakeHash) -> Result<Bytes> {
-        self.fetch_bytes_with_progress(hash, None).await
-    }
-
-    /// Internal: run the fetch chain and hand back the metric alongside the
-    /// bytes (R423-T7). The observer, if any, has already been called.
-    pub(crate) async fn fetch_bytes_reported(
+    /// Fetch `hash` to its plain file and report which tier served it. The
+    /// class observer, if any, has been called when this returns.
+    pub(crate) async fn fetch_reported(
         &self,
         hash: BlakeHash,
         sink: Option<ProgressSink>,
-    ) -> (Result<Bytes>, FetchReport) {
+    ) -> (Result<PathBuf>, FetchReport) {
         let started = std::time::Instant::now();
+        // Held until this call returns, so the blob it is about to hand out
+        // cannot be evicted by a concurrent fetch.
+        let _hold = self.0.cache.hold(hash);
 
-        // 1. Local cache — fast path. Disk-backed cache re-verifies BLAKE3
-        //    on read; mem-backed is a HashMap lookup.
-        if let Some(bytes) = self.0.cache.get(&hash).await {
-            tracing::trace!(%hash, "cache hit");
-            let report = self.report(
-                hash,
-                Some(FetchTier::Cache),
-                None,
-                bytes.len() as u64,
-                started,
-            );
-            return (Ok(bytes), report);
-        }
-
-        // 2. Clone source handles so we can release the lock before awaiting.
-        let sources: Vec<Arc<dyn BlobSource>> = self.0.sources.read().await.clone();
-
-        let chain = source::FetchChain::new(sources);
-        match chain.fetch_with_progress(&hash, sink.as_ref()).await {
-            Some(hit) => {
-                // Cache write failures are non-fatal: the fetched bytes are
-                // verified, so we can still return them. A disk-full error
-                // means future restarts won't have this entry, but the current
-                // request succeeds.
-                if let Err(e) = self.0.cache.put(hash, hit.bytes.clone()).await {
-                    tracing::warn!(%hash, "cache write failed: {e}");
-                }
-                let report = self.report(
-                    hash,
-                    Some(hit.tier),
-                    hit.peer_id,
-                    hit.bytes.len() as u64,
-                    started,
-                );
-                (Ok(hit.bytes), report)
-            }
-            // A MISS IS REPORTED, not swallowed. A hit rate computed only over
-            // successful fetches has no denominator.
+        let outcome = match self.local(&hash) {
+            Some((path, size)) => Ok(Fetched::cached(path, size)),
             None => {
-                let report = self.report(hash, None, None, 0, started);
-                (Err(Error::FetchFailed(hash)), report)
+                let mut flight = self.join_flight(hash);
+                loop {
+                    let (progress, outcome) = {
+                        let state = flight.borrow_and_update();
+                        (state.progress, state.outcome.clone())
+                    };
+                    if let Some(outcome) = outcome {
+                        break outcome;
+                    }
+                    if let (Some(progress), Some(sink)) = (progress, &sink) {
+                        sink(progress);
+                    }
+                    if flight.changed().await.is_err() {
+                        break Err(Error::FetchFailed {
+                            hash,
+                            detail: "the transfer task ended without an outcome".into(),
+                        });
+                    }
+                }
             }
-        }
-    }
+        };
 
-    /// Build a [`FetchReport`] and hand it to the class observer.
-    fn report(
-        &self,
-        hash: BlakeHash,
-        tier: Option<FetchTier>,
-        peer_id: Option<String>,
-        bytes_served: u64,
-        started: std::time::Instant,
-    ) -> FetchReport {
+        let (tier, bytes_served, peer_bytes, origin_bytes) = match &outcome {
+            Ok(fetched) => (
+                Some(fetched.tier),
+                fetched.size,
+                fetched.peer_bytes,
+                fetched.origin_bytes,
+            ),
+            Err(_) => (None, 0, 0, 0),
+        };
         let report = FetchReport {
-            class: self.0.config.name,
+            class: self.0.name,
             hash,
             tier,
-            peer_id,
+            peer_id: None,
             bytes_served,
+            peer_bytes,
+            origin_bytes,
             duration_ms: started.elapsed().as_millis() as u64,
         };
-        if let Some(observer) = &self.0.config.observer {
+        if let Some(observer) = &self.0.observer {
             observer(&report);
         }
-        report
+        (outcome.map(|fetched| fetched.path), report)
     }
+}
 
-    /// Internal: run the fetch chain for `hash`, reporting byte progress.
-    ///
-    /// Identical to [`fetch_bytes`](Self::fetch_bytes) but threads `sink`
-    /// down to the serving source. A cache hit returns without ever invoking
-    /// `sink` (instant, no transfer to surface).
-    pub(crate) async fn fetch_bytes_with_progress(
-        &self,
-        hash: BlakeHash,
-        sink: Option<ProgressSink>,
-    ) -> Result<Bytes> {
-        // Delegates rather than duplicating the chain walk: one code path means
-        // the observer cannot be live on some entry points and dead on others,
-        // which is exactly how instrumentation ends up reporting a partial
-        // hit rate that nobody knows is partial.
-        self.fetch_bytes_reported(hash, sink).await.0
+/// Rebuild the cache index from the plain files in the cache directory,
+/// oldest first so the LRU order survives a restart.
+async fn reconcile(cache: &Arc<Cache>, store: &BlobStore) -> Result<()> {
+    let mut found: Vec<(std::time::SystemTime, BlakeHash, PathBuf, u64)> = Vec::new();
+    let mut entries = tokio::fs::read_dir(cache.dir()).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let Some(hash) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| BlakeHash::from_hex(name).ok())
+        else {
+            continue;
+        };
+        let metadata = entry.metadata().await?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        found.push((modified, hash, entry.path(), metadata.len()));
     }
+    found.sort_by_key(|(modified, hash, _, _)| (*modified, hash.to_hex()));
+
+    for (_, hash, path, len) in found {
+        if store.complete_size(&hash).await.map_err(Error::Store)? == Some(len) {
+            cache.insert(hash, len);
+            continue;
+        }
+        // Unknown to the store: verify by importing it in place.
+        match store.import_reference(path.clone()).await {
+            Ok((actual, tag)) if actual == hash => {
+                cache.insert(hash, len);
+                drop(tag);
+            }
+            Ok((actual, _)) => {
+                tracing::warn!(%hash, %actual, "removing cache file whose content does not match its name");
+                tokio::fs::remove_file(&path).await?;
+            }
+            Err(e) => {
+                tracing::warn!(%hash, "removing cache file the store cannot import: {e}");
+                tokio::fs::remove_file(&path).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─── Asset ────────────────────────────────────────────────────────────────────
 
-/// A handle to a specific content-addressed blob within an `AssetClass`.
+/// A handle to a specific content-addressed blob within an [`AssetClass`].
 #[derive(Clone)]
 pub struct Asset {
     class: AssetClass,
@@ -833,44 +765,35 @@ pub struct Asset {
 }
 
 impl Asset {
-    /// Fetch the blob, trying all sources in priority order and verifying BLAKE3.
+    /// Fetch the blob and return the path of its plain file,
+    /// `<cache_dir>/<blake3-hex>`, trying the local cache, then the peer
+    /// set, then the origin. The content is BLAKE3-verified.
     ///
-    /// Subsequent calls return the cached copy without hitting any source.
-    pub async fn fetch(&self) -> Result<Bytes> {
-        self.class.fetch_bytes(self.hash).await
+    /// Concurrent calls for the same hash share one transfer.
+    // [impl -> dsn~xlb-fork~1]
+    pub async fn fetch_to_file(&self) -> Result<PathBuf> {
+        self.class.fetch_reported(self.hash, None).await.0
     }
 
-    /// Fetch the blob, reporting incremental byte progress to `sink`.
-    ///
-    /// Identical to [`fetch`](Self::fetch) but the CDN tier emits per-chunk
-    /// [`FetchProgress`] against `Content-Length`. Instant tiers (cache)
-    /// return without ever invoking `sink`.
-    pub async fn fetch_with_progress(&self, sink: ProgressSink) -> Result<Bytes> {
-        self.class
-            .fetch_bytes_with_progress(self.hash, Some(sink))
-            .await
+    /// As [`fetch_to_file`](Self::fetch_to_file), reporting cumulative bytes
+    /// and the serving tier to `sink`. A cache hit never invokes `sink`.
+    pub async fn fetch_to_file_with_progress(&self, sink: ProgressSink) -> Result<PathBuf> {
+        self.class.fetch_reported(self.hash, Some(sink)).await.0
     }
 
-    /// Fetch the blob and return the [`FetchReport`] alongside it (R423-T7).
-    ///
-    /// Identical work to [`fetch`](Self::fetch); the difference is that the
-    /// caller gets to see which tier served it, from which peer, and how long
-    /// the whole chain walk took. A caller that just wants bytes should keep
-    /// using `fetch`.
-    ///
-    /// The report is produced — and the class observer called — on a miss too,
-    /// with `tier: None`; the `Result` is the failure and the report is the
-    /// record of it.
-    pub async fn fetch_reported(&self) -> (Result<Bytes>, FetchReport) {
-        self.class.fetch_bytes_reported(self.hash, None).await
+    /// As [`fetch_to_file`](Self::fetch_to_file), returning the
+    /// [`FetchReport`] alongside. The report is produced on a miss too, with
+    /// `tier: None`.
+    pub async fn fetch_to_file_reported(
+        &self,
+        sink: Option<ProgressSink>,
+    ) -> (Result<PathBuf>, FetchReport) {
+        self.class.fetch_reported(self.hash, sink).await
     }
 
-    /// Returns `true` if this blob is in the local cache (in-memory or
-    /// disk-backed). Disk-backed `is_cached` is a presence check against the
-    /// LRU index — it does *not* re-verify BLAKE3. Use [`Asset::fetch`] when
-    /// you need verified bytes.
-    pub async fn is_cached(&self) -> bool {
-        self.class.0.cache.contains(&self.hash).await
+    /// Whether this blob is complete in the local cache.
+    pub fn is_cached(&self) -> bool {
+        self.class.0.cache.contains(&self.hash)
     }
 
     pub fn hash(&self) -> BlakeHash {

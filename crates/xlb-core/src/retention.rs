@@ -1,11 +1,15 @@
 //! Platform-neutral cache retention: pinning, release rotation, and an LRU
 //! byte budget that applies only to unpinned entries.
 //!
-//! This module is pure bookkeeping — no filesystem, no tokio, no clocks — so
-//! the on-disk and in-memory caches share it and an OPFS browser cache
-//! (R002-F4) can reuse it unchanged on wasm32. A cache owns a
-//! [`RetentionIndex`], reports sizes into it, and performs whatever physical
-//! deletion the returned eviction lists ask for.
+//! This module is pure bookkeeping — no filesystem, no tokio, no clocks. A
+//! cache owns a [`RetentionIndex`], reports sizes into it, and performs
+//! whatever physical deletion the returned eviction lists ask for.
+//!
+//! ## Holds
+//!
+//! A fetch in flight *holds* the blob it is returning
+//! ([`RetentionIndex::hold`]). A held blob still counts against the budget
+//! but is never chosen as an eviction victim until it is released.
 //!
 //! ## What is protected
 //!
@@ -22,8 +26,8 @@
 //!
 //! Pin state here is in-memory bookkeeping. Persistence is the caller's: a
 //! cache that reopens declares its pins on a fresh index *before* replaying
-//! the stored entries into it (see `RetainingCache::open`), so a pinned blob
-//! is never evicted by the rebuild itself. The native `xlb` crate persists
+//! the stored entries into it, so a pinned blob is never evicted by the
+//! rebuild itself. The native `xlb` crate persists
 //! named pin sets ("pinned trees", R1003) next to its disk cache that way.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -85,9 +89,44 @@ pub struct RetentionIndex {
     releases: VecDeque<(String, HashSet<BlakeHash>)>,
     /// Union of pins, sets and retained releases. Recomputed on change.
     protected: HashSet<BlakeHash>,
+    /// Blobs a fetch in flight is using, with the number of holders.
+    held: HashMap<BlakeHash, u32>,
 }
 
 impl RetentionIndex {
+    /// Keep `hash` out of eviction until a matching [`release`](Self::release).
+    pub fn hold(&mut self, hash: BlakeHash) {
+        *self.held.entry(hash).or_insert(0) += 1;
+    }
+
+    /// Drop one hold on `hash`. Returns blobs evicted because the budget is
+    /// now enforceable against it.
+    pub fn release(&mut self, hash: &BlakeHash) -> Vec<BlakeHash> {
+        if let Some(count) = self.held.get_mut(hash) {
+            *count -= 1;
+            if *count == 0 {
+                self.held.remove(hash);
+            }
+        }
+        self.enforce_budget(None, 0)
+    }
+
+    /// Evict unpinned, unheld LRU entries until `incoming` more bytes fit the
+    /// budget. Returns the evicted hashes; the caller deletes their bytes.
+    pub fn make_room(&mut self, incoming: u64) -> Vec<BlakeHash> {
+        self.enforce_budget(None, incoming)
+    }
+
+    /// Every entry, least recently used first.
+    pub fn hashes(&self) -> impl Iterator<Item = &BlakeHash> {
+        self.lru.iter()
+    }
+
+    /// The recorded size of `hash`, if present.
+    pub fn size_of(&self, hash: &BlakeHash) -> Option<u64> {
+        self.entries.get(hash).copied()
+    }
+
     pub fn new(policy: RetentionPolicy) -> Self {
         Self {
             policy,
@@ -100,6 +139,7 @@ impl RetentionIndex {
             sets: HashMap::new(),
             releases: VecDeque::new(),
             protected: HashSet::new(),
+            held: HashMap::new(),
         }
     }
 
@@ -168,7 +208,7 @@ impl RetentionIndex {
             self.pinned_bytes += size;
             self.pinned_entries += 1;
         }
-        self.enforce_budget(Some(&hash))
+        self.enforce_budget(Some(&hash), 0)
     }
 
     /// Pin one blob by hash.
@@ -184,7 +224,7 @@ impl RetentionIndex {
         if self.pins.remove(hash) {
             self.recompute();
         }
-        self.enforce_budget(None)
+        self.enforce_budget(None, 0)
     }
 
     /// Define (or replace) a named pin set.
@@ -202,7 +242,7 @@ impl RetentionIndex {
         if self.sets.remove(name).is_some() {
             self.recompute();
         }
-        self.enforce_budget(None)
+        self.enforce_budget(None, 0)
     }
 
     /// Register `release` as the current release with the blobs its manifest
@@ -225,7 +265,7 @@ impl RetentionIndex {
             }
         }
         self.recompute();
-        self.enforce_budget(None)
+        self.enforce_budget(None, 0)
     }
 
     /// The hashes of named pin set `name`, if defined.
@@ -273,15 +313,13 @@ impl RetentionIndex {
         }
     }
 
-    fn enforce_budget(&mut self, keep: Option<&BlakeHash>) -> Vec<BlakeHash> {
+    fn enforce_budget(&mut self, keep: Option<&BlakeHash>, incoming: u64) -> Vec<BlakeHash> {
         let mut evicted = Vec::new();
-        let budget = self.policy.budget_bytes;
+        let budget = self.policy.budget_bytes.saturating_sub(incoming);
         while self.total_bytes - self.pinned_bytes > budget {
-            let Some(pos) = self
-                .lru
-                .iter()
-                .position(|h| !self.protected.contains(h) && Some(h) != keep)
-            else {
+            let Some(pos) = self.lru.iter().position(|h| {
+                !self.protected.contains(h) && !self.held.contains_key(h) && Some(h) != keep
+            }) else {
                 break;
             };
             let victim = self.lru.remove(pos).expect("position is in range");
@@ -412,6 +450,26 @@ mod tests {
         // Over budget with only the new entry evictable: it stays.
         assert!(i.insert(h(2), 10).is_empty());
         assert!(i.contains(&h(2)));
+    }
+
+    #[test]
+    fn a_held_entry_is_skipped_until_released() {
+        let mut i = idx(10, 0);
+        i.insert(h(1), 6);
+        i.hold(h(1));
+        // h(1) is the LRU victim but held, so nothing can be evicted.
+        assert!(i.insert(h(2), 6).is_empty());
+        assert_eq!(i.release(&h(1)), vec![h(1)]);
+        assert!(i.contains(&h(2)));
+    }
+
+    #[test]
+    fn make_room_evicts_ahead_of_an_incoming_blob() {
+        let mut i = idx(10, 0);
+        i.insert(h(1), 4);
+        i.insert(h(2), 4);
+        assert_eq!(i.make_room(5), vec![h(1)]);
+        assert!(i.make_room(5).is_empty());
     }
 
     #[test]

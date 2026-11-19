@@ -1,110 +1,64 @@
-use clap::{Parser, Subcommand};
+//! `xlb` — run a node daemon, or talk to one over its control socket.
 
 mod config;
 mod fetch_cmd;
-mod gui;
 mod inspect;
 mod metrics_sink;
 mod pin_cmd;
-mod seed_cmd;
 mod serve;
-mod socket;
+mod server;
 
-#[derive(Parser)]
-#[command(
-    name = "xlb",
-    about = "xlb — serve a node, inspect state, fetch blobs, view live TUI"
-)]
-struct Cli {
-    /// Path to the Unix domain socket used by the running node. Default:
-    /// `serve` takes `node.socket` from its config, else
-    /// `$XDG_RUNTIME_DIR/xlb-node.sock`, else `/tmp/xlb-node.sock`; every
-    /// other verb takes the latter two.
-    #[arg(short, long, global = true)]
+use anyhow::{bail, Context, Result};
+
+const USAGE: &str = "\
+xlb — serve a node, inspect it, fetch blobs, manage peers and pinned trees
+
+usage: xlb [--socket PATH] <command>
+
+commands:
+  serve [--config FILE]                 run the node daemon (default xlb-node.json)
+  inspect                               node ID, UDP addresses, cache directory
+  fetch CLASS HASH                      fetch a blob; prints the cached file path
+  set-peers [--class CLASS] [PEER...]   replace the peer set; PEER is NODE_ID@ADDR[,ADDR...]
+  pin add CLASS NAME [--from DIR]... [--manifest FILE] [--json]
+  pin list CLASS [--json]
+  pin rm CLASS NAME
+";
+
+/// The command line after the program name, with flags pulled out.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Args {
+    positional: Vec<String>,
     socket: Option<String>,
-
-    #[command(subcommand)]
-    cmd: Cmd,
+    config: Option<String>,
+    class: Option<String>,
+    manifest: Option<String>,
+    from: Vec<String>,
+    json: bool,
+    help: bool,
 }
 
-#[derive(Subcommand)]
-enum Cmd {
-    /// Run a long-lived xlb node daemon (reads xlb-node.json).
-    Serve {
-        /// Path to the node config file.
-        #[arg(short, long, default_value = "xlb-node.json")]
-        config: String,
-    },
-    /// Print current node identity, classes, and governor state (one-shot).
-    Inspect,
-    /// Fetch a single blob by class name and BLAKE3 hash (one-shot).
-    Fetch {
-        /// Asset class name (must be registered in the running node).
-        class: String,
-        /// BLAKE3 hash of the blob to fetch (hex).
-        hash: String,
-        /// Save fetched bytes to this file path (optional).
-        #[arg(short, long)]
-        out: Option<String>,
-    },
-    /// Open the live TUI dashboard (connects to a running node).
-    Gui,
-    /// Publish a local file to a class's CDN origin (R2) at its
-    /// content-addressed key. Standalone — does not need a running node.
-    ///
-    /// Credentials come from the environment (XLB_R2_* / AWS_* / CF_R2_*);
-    /// see `xlb::R2Target::from_env`.
-    Seed {
-        /// Asset class name (must exist in the node config, with a cdn_fallback).
-        #[arg(short, long)]
-        class: String,
-        /// Path to the file to seed.
-        file: String,
-        /// Path to the node config file (for the class's cdn_fallback template).
-        #[arg(long, default_value = "xlb-node.json")]
-        config: String,
-        /// Append a JSONL record of the seed to this manifest file.
-        #[arg(long)]
-        manifest: Option<String>,
-        /// Emit a single machine-readable JSON line instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Pinned trees on a running node (R1003): named sets of blobs that
-    /// survive restart and are never evicted.
-    Pin {
-        #[command(subcommand)]
-        cmd: PinCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum PinCmd {
-    /// Declare (or replace) a tree, seed it from local dirs, publish it.
-    ///
-    /// `--from DIR` alone pins every `<blake3-hex>` file in DIR (e.g. a
-    /// pack's `assets/`). `--manifest FILE` pins the hashes it lists, seeding
-    /// whichever of them the `--from` dirs hold.
-    Add {
-        class: String,
-        name: String,
-        /// Directory of `<blake3-hex>` files; repeatable.
-        #[arg(long = "from")]
-        from: Vec<String>,
-        /// Hash list: JSON array, `{"hashes": [...]}`, or one hex per line.
-        #[arg(long)]
-        manifest: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List a class's pinned trees and how much of each the node holds.
-    List {
-        class: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a tree; its blobs rejoin the LRU.
-    Rm { class: String, name: String },
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
+    let mut parsed = Args::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let mut value = |flag: &str| {
+            args.next()
+                .with_context(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "-s" | "--socket" => parsed.socket = Some(value("--socket")?),
+            "-c" | "--config" => parsed.config = Some(value("--config")?),
+            "--class" => parsed.class = Some(value("--class")?),
+            "--manifest" => parsed.manifest = Some(value("--manifest")?),
+            "--from" => parsed.from.push(value("--from")?),
+            "--json" => parsed.json = true,
+            "-h" | "--help" => parsed.help = true,
+            flag if flag.starts_with('-') => bail!("unknown flag {flag}\n\n{USAGE}"),
+            _ => parsed.positional.push(arg),
+        }
+    }
+    Ok(parsed)
 }
 
 fn default_socket() -> String {
@@ -114,45 +68,70 @@ fn default_socket() -> String {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("warn".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
-    if let Cmd::Serve { config } = &cli.cmd {
-        return serve::run(config, cli.socket.as_deref()).await;
+    let args = parse_args(std::env::args().skip(1))?;
+    let words: Vec<&str> = args.positional.iter().map(String::as_str).collect();
+    if args.help || words.is_empty() {
+        print!("{USAGE}");
+        return Ok(());
     }
-    let socket = cli.socket.unwrap_or_else(default_socket);
+    if words == ["serve"] {
+        let config = args.config.as_deref().unwrap_or("xlb-node.json");
+        return serve::run(config, args.socket.as_deref()).await;
+    }
+    let socket = args.socket.clone().unwrap_or_else(default_socket);
 
-    match cli.cmd {
-        Cmd::Serve { .. } => unreachable!("handled above"),
-        Cmd::Inspect => inspect::run(&socket).await,
-        Cmd::Fetch { class, hash, out } => {
-            fetch_cmd::run(&class, &hash, out.as_deref(), &socket).await
+    match words.as_slice() {
+        ["inspect"] => inspect::run(&socket).await,
+        ["fetch", class, hash] => fetch_cmd::run(class, hash, &socket).await,
+        ["set-peers", peers @ ..] => {
+            inspect::set_peers(&socket, args.class.as_deref(), peers).await
         }
-        Cmd::Gui => gui::run(&socket).await,
-        Cmd::Seed {
-            class,
-            file,
-            config,
-            manifest,
-            json,
-        } => seed_cmd::run(&class, &file, &config, manifest.as_deref(), json).await,
-        Cmd::Pin { cmd } => match cmd {
-            PinCmd::Add {
+        ["pin", "add", class, name] => {
+            pin_cmd::add(
+                &socket,
                 class,
                 name,
-                from,
-                manifest,
-                json,
-            } => pin_cmd::add(&socket, &class, &name, &from, manifest.as_deref(), json).await,
-            PinCmd::List { class, json } => pin_cmd::list(&socket, &class, json).await,
-            PinCmd::Rm { class, name } => pin_cmd::rm(&socket, &class, &name).await,
-        },
+                &args.from,
+                args.manifest.as_deref(),
+                args.json,
+            )
+            .await
+        }
+        ["pin", "list", class] => pin_cmd::list(&socket, class, args.json).await,
+        ["pin", "rm", class, name] => pin_cmd::rm(&socket, class, name).await,
+        _ => bail!("unrecognised command: {}\n\n{USAGE}", words.join(" ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> Args {
+        parse_args(line.split_whitespace().map(String::from)).unwrap()
+    }
+
+    #[test]
+    fn flags_are_accepted_before_and_after_the_command() {
+        let args = parse("--socket /s.sock pin add models keys --from /a --from /b --json");
+        assert_eq!(args.positional, ["pin", "add", "models", "keys"]);
+        assert_eq!(args.socket.as_deref(), Some("/s.sock"));
+        assert_eq!(args.from, ["/a", "/b"]);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn a_flag_without_its_value_and_an_unknown_flag_are_errors() {
+        assert!(parse_args(["serve".to_string(), "--config".to_string()]).is_err());
+        assert!(parse_args(["--bogus".to_string()]).is_err());
     }
 }

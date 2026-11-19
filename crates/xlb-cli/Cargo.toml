@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "xlb CLI — serve a node, inspect state, trigger fetches, live TUI dashboard"
+description = "xlb CLI — serve a node, inspect state, trigger fetches, manage peers and pinned trees"
 publish = false
 
 [[bin]]
@@ -14,19 +14,14 @@ path = "src/main.rs"
 
 [dependencies]
 xlb     = { path = "../xlb" }
-mshr    = { path = "../../../mshr/crates/mshr" }
+xlb-client = { path = "../xlb-client" }
 tokio   = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
 serde   = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap    = { version = "4", features = ["derive"] }
-ratatui   = "0.29"
-crossterm = "0.28"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow  = "1"
 libc    = "0.2"
 
 [dev-dependencies]
-# R423-T7: the metrics file sink is tested against real files, not a mock —
-# append-across-restart and one-row-per-fetch are filesystem behaviours.
 tempfile = "3"

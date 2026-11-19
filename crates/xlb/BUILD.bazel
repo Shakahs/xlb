@@ -1,0 +1,85 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "xlb",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "xlb",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//vendor/xlb/crates/xlb-core:xlb_core",
+        "@scheduler_crates//:bao-tree",
+        "@scheduler_crates//:bytes",
+        "@scheduler_crates//:futures",
+        "@scheduler_crates//:hex",
+        "@scheduler_crates//:iroh",
+        "@scheduler_crates//:iroh-blobs",
+        "@scheduler_crates//:libc",
+        "@scheduler_crates//:reqwest",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:serde_json",
+        "@scheduler_crates//:sha2",
+        "@scheduler_crates//:thiserror",
+        "@scheduler_crates//:tokio",
+        "@scheduler_crates//:tracing",
+    ],
+)
+
+rust_test(
+    name = "xlb_tests",
+    crate = ":xlb",
+    edition = "2021",
+    deps = ["@scheduler_crates//:tempfile"],
+)
+
+# Two in-process nodes on loopback UDP: peer fetch into a plain file and
+# refusal of a node outside the peer set.
+rust_test(
+    name = "peer_fetch_tests",
+    srcs = ["tests/peer_fetch.rs"],
+    edition = "2021",
+    deps = [
+        ":xlb",
+        "@scheduler_crates//:tempfile",
+        "@scheduler_crates//:tokio",
+    ],
+)
+
+# Origin fetch against an in-process HTTP server that checks the SigV4
+# signature of every ranged request.
+rust_test(
+    name = "origin_fetch_tests",
+    srcs = [
+        "tests/origin_fetch.rs",
+        "tests/origin_server/mod.rs",
+    ],
+    crate_root = "tests/origin_fetch.rs",
+    edition = "2021",
+    deps = [
+        ":xlb",
+        "@scheduler_crates//:bao-tree",
+        "@scheduler_crates//:tempfile",
+        "@scheduler_crates//:tokio",
+    ],
+)
+
+# Swarm fetch: nodes with a peer tier and an in-process origin each share
+# partial blobs, divide the origin reads and take over stalled segments.
+rust_test(
+    name = "swarm_fetch_tests",
+    srcs = [
+        "tests/origin_server/mod.rs",
+        "tests/swarm_fetch.rs",
+    ],
+    crate_root = "tests/swarm_fetch.rs",
+    edition = "2021",
+    deps = [
+        ":xlb",
+        "@scheduler_crates//:bao-tree",
+        "@scheduler_crates//:tempfile",
+        "@scheduler_crates//:tokio",
+    ],
+)
+
+filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])

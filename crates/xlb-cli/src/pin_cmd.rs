@@ -2,10 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::socket::{
-    client::Client,
-    protocol::{Command, Response, TreeInfo},
-};
+use xlb_client::{Client, Command, Response, TreeInfo};
 
 /// Read a manifest of blake3 hashes: a JSON array of hex strings, a JSON
 /// object with a `hashes` array, or plain text with one or more hex hashes
@@ -77,12 +74,11 @@ pub async fn add(
             } else {
                 print_tree(&tree);
                 println!(
-                    "  seeded {} · already cached {} · missing {} · mismatched {} · published {}",
+                    "  seeded {} · already cached {} · missing {} · mismatched {}",
                     seed.ingested,
                     seed.already_cached,
                     seed.missing.len(),
-                    seed.mismatched.len(),
-                    seed.served
+                    seed.mismatched.len()
                 );
                 for p in &seed.mismatched {
                     println!("  MISMATCH {p}");
@@ -134,7 +130,7 @@ fn print_tree(t: &TreeInfo) {
         t.present,
         t.members,
         t.present_bytes,
-        if t.durable { "" } else { " · NOT durable (in-memory class)" }
+        if t.durable { "" } else { " · NOT durable" }
     );
 }
 

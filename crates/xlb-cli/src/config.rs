@@ -1,6 +1,43 @@
-use serde::{Deserialize, Serialize};
+//! The daemon's JSON configuration.
+//!
+//! ```json
+//! {
+//!   "node": { "socket": "/run/xlb/xlb.sock", "socket_mode": "0666" },
+//!   "classes": [{
+//!     "name": "models",
+//!     "cache_dir": "/var/lib/xlb/models",
+//!     "cache_budget_bytes": 200000000000,
+//!     "udp_bind": "0.0.0.0:4433",
+//!     "origin": {
+//!       "endpoint": "https://fly.storage.tigris.dev",
+//!       "bucket": "artifacts",
+//!       "region": "auto",
+//!       "key_template": "models/blake3/{blake3}",
+//!       "access_key_id_env": "AWS_ACCESS_KEY_ID",
+//!       "secret_access_key_env": "AWS_SECRET_ACCESS_KEY"
+//!     }
+//!   }]
+//! }
+//! ```
+//!
+//! Unknown keys are ignored, so a config may carry `_comment` prose.
 
-/// Top-level structure matching `xlb-node.json`.
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
+
+use anyhow::{bail, Context};
+use serde::{Deserialize, Serialize};
+use xlb::{
+    origin::{
+        DEFAULT_KEY_TEMPLATE, DEFAULT_ORIGIN_CONCURRENCY, DEFAULT_RANGE_BYTES,
+        DEFAULT_RANGE_RETRIES,
+    },
+    peer::{
+        DEFAULT_PEER_CONCURRENCY, DEFAULT_PEER_CONNECT_TIMEOUT, DEFAULT_PEER_PORT,
+        DEFAULT_PEER_SEGMENT_BYTES, DEFAULT_PEER_STALL_TIMEOUT,
+    },
+    Credentials, OriginConfig, OriginSource, PeerConfig, RelaySetting,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node: NodeSettings,
@@ -9,132 +46,289 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSettings {
-    /// Control socket for `xlb serve`. `null` = the CLI default
-    /// (`$XDG_RUNTIME_DIR/xlb-node.sock`, else `/tmp/xlb-node.sock`); an
-    /// explicit `--socket` beats both. A relative path resolves against the
-    /// node's cwd (a camp node runs with cwd = the camp root).
+    /// Path of the Unix control socket.
     #[serde(default)]
     pub socket: Option<String>,
-    #[serde(default = "default_log")]
-    pub log: String,
-    /// Which COHORT of seed this node belongs to (R423-T7).
-    ///
-    /// R489-F3 makes every desktop install an in-process seed, so the seed
-    /// population stops being "two stable boxes" and becomes two stable boxes
-    /// plus a volatile desktop fleet. Without this dimension a dashboard cannot
-    /// separate the two, and W160's hit-rate model cannot be validated per
-    /// cohort — a swarm hit rate that mixes an always-on Hetzner node with
-    /// laptops that are shut half the day describes neither.
-    ///
-    /// Free-form on purpose: this is a reporting label, not a protocol value,
-    /// and a closed enum here would need a release to add a cohort. Convention
-    /// so far: `yah-castle`, `home-server`, `desktop`.
+    /// Permission bits of the socket file, octal. The default lets any local
+    /// user connect, because the client is a different container on the same
+    /// node. A mode without group and other bits also restricts the socket
+    /// to the daemon's own user ID.
+    #[serde(default = "default_socket_mode")]
+    pub socket_mode: String,
+    /// Deployment cohort recorded on every fetch metric.
     #[serde(default = "default_peer_class")]
     pub peer_class: String,
-    /// Where to append newline-delimited [`xlb::FetchReport`] JSON.
-    ///
-    /// `null` — the default — means no file sink; reports still reach live
-    /// `SubscribeEvents` subscribers over the control socket. NDJSON to a path
-    /// is deliberately the dumbest possible sink: every collector can tail it,
-    /// and it commits this crate to no vendor.
+    /// NDJSON file that receives one row per fetch. Absent = no file.
     #[serde(default)]
     pub metrics_path: Option<String>,
-    /// Directory holding this node's mshr secret key (R1003). `null` = the
-    /// platform default that every mshr process on the machine shares — which
-    /// is wrong for a camp node beside a yah desktop on the same box: two
-    /// processes binding one `NodeId` cannot both be reachable. Give a
-    /// long-lived node its own dir so its `NodeId`, the value clients list in
-    /// `permanent_seeds`, is stable across restarts and unique to it.
-    #[serde(default)]
-    pub identity_dir: Option<String>,
 }
 
-fn default_log() -> String {
-    "info".into()
+fn default_socket_mode() -> String {
+    "0666".into()
 }
-/// Deliberately NOT "desktop" or any real cohort: a node whose config forgot to
-/// say what it is must show up as unlabelled in the dashboard rather than
-/// quietly inflating a cohort it was never part of.
 fn default_peer_class() -> String {
     "unknown".into()
+}
+
+impl NodeSettings {
+    pub fn socket_mode(&self) -> anyhow::Result<u32> {
+        let mode = u32::from_str_radix(self.socket_mode.trim_start_matches("0o"), 8)
+            .with_context(|| format!("socket_mode {:?} is not octal", self.socket_mode))?;
+        if mode > 0o777 {
+            bail!("socket_mode {:?} has bits beyond 0777", self.socket_mode);
+        }
+        Ok(mode)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassConfig {
     pub name: String,
-    #[serde(default)]
-    pub permanent_seeds: Vec<String>,
-    pub cdn_fallback: Option<String>,
-    /// Local cache directory. `null` = in-memory only.
-    #[serde(default)]
-    pub cache_dir: Option<String>,
+    /// Directory of the plain files, one per complete blob.
+    pub cache_dir: String,
+    /// LRU budget for unpinned blobs.
     #[serde(default = "default_cache_budget")]
     pub cache_budget_bytes: u64,
-    /// "seed" | "participant" | "passive" — defaults to "participant".
-    #[serde(default = "default_role")]
-    pub role: String,
+    /// Whether the class serves and reads the peer set.
+    #[serde(default = "yes")]
+    pub peers: bool,
+    /// UDP address of the peer endpoint.
+    #[serde(default = "default_udp_bind")]
+    pub udp_bind: String,
+    #[serde(default = "default_peer_segment")]
+    pub peer_segment_bytes: u64,
+    #[serde(default = "default_peer_concurrency")]
+    pub peer_concurrency: usize,
+    #[serde(default = "default_peer_connect_timeout_ms")]
+    pub peer_connect_timeout_ms: u64,
+    /// How long a segment no peer holds may see no progress on any peer
+    /// before this node reads it from the origin in place of its assigned
+    /// reader.
+    #[serde(default = "default_peer_stall_timeout_ms")]
+    pub peer_stall_timeout_ms: u64,
+    /// The relay servers of the peer endpoint: `"default"` for iroh's
+    /// default relay map, `"disabled"` for none, or a list of relay URLs.
+    /// Relays serve address discovery and hole punching only; blob requests
+    /// are sent and served on direct paths.
     #[serde(default)]
-    pub bandwidth: BandwidthConfig,
+    pub relay_mode: RelayModeSetting,
     #[serde(default)]
-    pub discovery: DiscoveryConfig,
+    pub origin: Option<OriginSettings>,
+}
+
+/// `relay_mode` as it is written in the configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RelayModeSetting {
+    /// `"default"` or `"disabled"`.
+    Named(String),
+    /// Relay URLs.
+    Urls(Vec<String>),
+}
+
+impl Default for RelayModeSetting {
+    fn default() -> Self {
+        RelayModeSetting::Named("default".into())
+    }
+}
+
+impl RelayModeSetting {
+    fn resolve(&self) -> anyhow::Result<RelaySetting> {
+        match self {
+            RelayModeSetting::Named(name) if name == "default" => Ok(RelaySetting::Default),
+            RelayModeSetting::Named(name) if name == "disabled" => Ok(RelaySetting::Disabled),
+            RelayModeSetting::Named(name) => {
+                bail!("relay_mode {name:?} is not \"default\", \"disabled\" or a list of URLs")
+            }
+            RelayModeSetting::Urls(urls) => Ok(RelaySetting::Custom(urls.clone())),
+        }
+    }
 }
 
 fn default_cache_budget() -> u64 {
     5 * 1024 * 1024 * 1024
 }
-fn default_role() -> String {
-    "participant".into()
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BandwidthConfig {
-    pub max_upload_kbps: Option<u32>,
-    pub max_download_kbps: Option<u32>,
-    #[serde(default = "default_auto")]
-    pub battery_mode: String,
-    #[serde(default = "default_auto")]
-    pub metered_mode: String,
-}
-
-fn default_auto() -> String {
-    "auto".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveryConfig {
-    #[serde(default = "yes")]
-    pub lan: bool,
-    #[serde(default = "yes")]
-    pub swarm: bool,
-    #[serde(default)]
-    pub relays: Vec<String>,
-}
-
 fn yes() -> bool {
     true
 }
+fn default_udp_bind() -> String {
+    format!("0.0.0.0:{DEFAULT_PEER_PORT}")
+}
+fn default_peer_segment() -> u64 {
+    DEFAULT_PEER_SEGMENT_BYTES
+}
+fn default_peer_concurrency() -> usize {
+    DEFAULT_PEER_CONCURRENCY
+}
+fn default_peer_connect_timeout_ms() -> u64 {
+    DEFAULT_PEER_CONNECT_TIMEOUT.as_millis() as u64
+}
+fn default_peer_stall_timeout_ms() -> u64 {
+    DEFAULT_PEER_STALL_TIMEOUT.as_millis() as u64
+}
 
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            lan: true,
-            swarm: true,
-            relays: vec![],
+impl ClassConfig {
+    pub fn cache_dir(&self) -> PathBuf {
+        PathBuf::from(expand_tilde(&self.cache_dir))
+    }
+
+    pub fn peer_config(&self) -> anyhow::Result<Option<PeerConfig>> {
+        if !self.peers {
+            return Ok(None);
         }
+        let bind_addr: SocketAddr = self
+            .udp_bind
+            .parse()
+            .with_context(|| format!("class {}: udp_bind {:?}", self.name, self.udp_bind))?;
+        let relay = self
+            .relay_mode
+            .resolve()
+            .with_context(|| format!("class {}", self.name))?;
+        Ok(Some(PeerConfig {
+            bind_addr,
+            relay,
+            segment_bytes: self.peer_segment_bytes,
+            concurrency: self.peer_concurrency,
+            connect_timeout: Duration::from_millis(self.peer_connect_timeout_ms),
+            stall_timeout: Duration::from_millis(self.peer_stall_timeout_ms),
+        }))
+    }
+
+    pub fn origin_config(&self) -> anyhow::Result<Option<OriginConfig>> {
+        self.origin
+            .as_ref()
+            .map(|origin| {
+                origin
+                    .resolve(|name| std::env::var(name).ok())
+                    .with_context(|| format!("class {}: origin", self.name))
+            })
+            .transpose()
+    }
+}
+
+/// The origin of one class: either an S3-compatible bucket (`endpoint` and
+/// `bucket`) read with signed requests, or an unauthenticated `url_template`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OriginSettings {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// SigV4 region; Tigris uses `auto`.
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Object key with a `{blake3}` token.
+    #[serde(default = "default_key_template")]
+    pub key_template: String,
+    #[serde(default = "default_range_bytes")]
+    pub range_bytes: u64,
+    #[serde(default = "default_origin_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_range_retries")]
+    pub range_retries: u32,
+    #[serde(default, skip_serializing)]
+    pub access_key_id: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub secret_access_key: Option<String>,
+    /// Environment variable holding the access key ID, when it is not inline.
+    #[serde(default)]
+    pub access_key_id_env: Option<String>,
+    /// Environment variable holding the secret, when it is not inline.
+    #[serde(default)]
+    pub secret_access_key_env: Option<String>,
+    /// Full URL with a `{blake3}` token, read without credentials.
+    #[serde(default)]
+    pub url_template: Option<String>,
+}
+
+impl std::fmt::Debug for OriginSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginSettings")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("key_template", &self.key_template)
+            .field("url_template", &self.url_template)
+            .finish_non_exhaustive()
+    }
+}
+
+fn default_region() -> String {
+    "auto".into()
+}
+fn default_key_template() -> String {
+    DEFAULT_KEY_TEMPLATE.into()
+}
+fn default_range_bytes() -> u64 {
+    DEFAULT_RANGE_BYTES
+}
+fn default_origin_concurrency() -> usize {
+    DEFAULT_ORIGIN_CONCURRENCY
+}
+fn default_range_retries() -> u32 {
+    DEFAULT_RANGE_RETRIES
+}
+
+impl OriginSettings {
+    /// Build the origin configuration, reading named credentials through
+    /// `env`.
+    pub fn resolve(&self, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<OriginConfig> {
+        let secret = |inline: &Option<String>,
+                      variable: &Option<String>,
+                      what: &str|
+         -> anyhow::Result<String> {
+            if let Some(value) = inline.as_ref().filter(|v| !v.is_empty()) {
+                return Ok(value.clone());
+            }
+            let Some(variable) = variable else {
+                bail!("no {what}: set {what} or {what}_env");
+            };
+            env(variable)
+                .filter(|v| !v.is_empty())
+                .with_context(|| format!("{what}_env names {variable}, which is not set"))
+        };
+        let source = match (&self.url_template, &self.endpoint, &self.bucket) {
+            (Some(template), None, None) => OriginSource::Url {
+                template: template.clone(),
+            },
+            (None, Some(endpoint), Some(bucket)) => OriginSource::S3 {
+                endpoint: endpoint.clone(),
+                bucket: bucket.clone(),
+                region: self.region.clone(),
+                key_template: self.key_template.clone(),
+                credentials: Credentials {
+                    access_key_id: secret(
+                        &self.access_key_id,
+                        &self.access_key_id_env,
+                        "access_key_id",
+                    )?,
+                    secret_access_key: secret(
+                        &self.secret_access_key,
+                        &self.secret_access_key_env,
+                        "secret_access_key",
+                    )?,
+                },
+            },
+            _ => bail!("give either url_template, or endpoint and bucket"),
+        };
+        Ok(OriginConfig {
+            source,
+            range_bytes: self.range_bytes,
+            concurrency: self.concurrency,
+            range_retries: self.range_retries,
+        })
     }
 }
 
 impl NodeConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let cfg: Self =
-            serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
-        Ok(cfg)
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
+        serde_json::from_str(&content).with_context(|| path.to_string())
     }
 }
 
-/// Expand a leading `~/` to the home directory.
+/// Expand a leading `~/` using `$HOME`. Returns the input unchanged otherwise.
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -153,58 +347,115 @@ mod tests {
     }
 
     const MINIMAL: &str = r#"{
-      "node": { "socket": "/tmp/s.sock", "log": "info" },
-      "classes": []
+      "_comment": "prose",
+      "node": { "socket": "/tmp/s.sock" },
+      "classes": [{ "name": "models", "cache_dir": "/var/lib/xlb/models" }]
     }"#;
 
     #[test]
-    fn a_config_predating_the_metrics_fields_still_loads() {
-        // Every deployed xlb-node.json was written before R423-T7. None of them
-        // may need editing to keep booting.
+    fn a_minimal_class_gets_the_documented_defaults() {
         let cfg = parse(MINIMAL);
         assert_eq!(cfg.node.socket.as_deref(), Some("/tmp/s.sock"));
-        assert!(cfg.node.metrics_path.is_none(), "file sink off by default");
+        assert_eq!(cfg.node.socket_mode().unwrap(), 0o666);
+        assert_eq!(cfg.node.peer_class, "unknown");
+        assert!(cfg.node.metrics_path.is_none());
+
+        let class = &cfg.classes[0];
+        let peer = class.peer_config().unwrap().expect("peer tier on by default");
+        assert_eq!(peer.bind_addr, "0.0.0.0:4433".parse().unwrap());
+        assert_eq!(peer.relay, RelaySetting::Default);
+        assert_eq!(peer.stall_timeout, Duration::from_secs(10));
+        assert!(class.origin_config().unwrap().is_none());
     }
 
     #[test]
-    fn an_unlabelled_node_reports_as_unknown_not_as_a_real_cohort() {
-        // Defaulting to "desktop" (or any real cohort) would silently inflate
-        // that cohort's readings with every misconfigured node.
-        assert_eq!(parse(MINIMAL).node.peer_class, "unknown");
-    }
-
-    #[test]
-    fn the_metrics_fields_round_trip_when_present() {
-        let cfg = parse(
-            r#"{
-              "node": {
-                "socket": "/var/lib/xlb/xlb.sock",
-                "log": "info",
-                "peer_class": "yah-castle",
-                "metrics_path": "/var/lib/xlb/metrics/fetches.ndjson"
-              },
-              "classes": []
-            }"#,
-        );
-        assert_eq!(cfg.node.peer_class, "yah-castle");
+    fn relay_mode_is_a_name_or_a_list_of_urls() {
+        let mut cfg = parse(MINIMAL);
+        let relay = |cfg: &NodeConfig| cfg.classes[0].peer_config().map(|peer| peer.unwrap().relay);
+        cfg.classes[0].relay_mode = serde_json::from_str(r#""disabled""#).unwrap();
+        assert_eq!(relay(&cfg).unwrap(), RelaySetting::Disabled);
+        cfg.classes[0].relay_mode = serde_json::from_str(r#"["https://relay.example"]"#).unwrap();
         assert_eq!(
-            cfg.node.metrics_path.as_deref(),
-            Some("/var/lib/xlb/metrics/fetches.ndjson")
+            relay(&cfg).unwrap(),
+            RelaySetting::Custom(vec!["https://relay.example".into()])
         );
+        cfg.classes[0].relay_mode = serde_json::from_str(r#""sometimes""#).unwrap();
+        assert!(relay(&cfg).is_err());
     }
 
     #[test]
-    fn underscore_comment_keys_are_ignored() {
-        // The reference config carries `_comment` / `_comment_metrics` prose.
-        // Rejecting unknown keys would make the documentation break the daemon.
-        let cfg = parse(
+    fn socket_mode_is_octal_and_bounded() {
+        let mut cfg = parse(MINIMAL);
+        cfg.node.socket_mode = "0600".into();
+        assert_eq!(cfg.node.socket_mode().unwrap(), 0o600);
+        for bad in ["rw", "888", "7777"] {
+            cfg.node.socket_mode = bad.into();
+            assert!(cfg.node.socket_mode().is_err(), "{bad} accepted");
+        }
+    }
+
+    fn origin(json: &str) -> OriginSettings {
+        serde_json::from_str(json).expect("origin parses")
+    }
+
+    #[test]
+    fn an_s3_origin_reads_credentials_from_the_named_variables() {
+        let settings = origin(
             r#"{
-              "_comment": "prose",
-              "_comment_metrics": "more prose",
-              "node": { "socket": "/tmp/s.sock", "log": "info" },
-              "classes": []
+              "endpoint": "https://fly.storage.tigris.dev",
+              "bucket": "artifacts",
+              "access_key_id_env": "KEY_ID",
+              "secret_access_key_env": "KEY_SECRET"
             }"#,
         );
-        assert_eq!(cfg.node.socket.as_deref(), Some("/tmp/s.sock"));
+        let env = |name: &str| match name {
+            "KEY_ID" => Some("id".to_string()),
+            "KEY_SECRET" => Some("secret".to_string()),
+            _ => None,
+        };
+        let config = settings.resolve(env).unwrap();
+        assert_eq!(config.range_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.concurrency, 32);
+        match config.source {
+            OriginSource::S3 {
+                region,
+                key_template,
+                credentials,
+                ..
+            } => {
+                assert_eq!(region, "auto");
+                assert_eq!(key_template, "models/blake3/{blake3}");
+                assert_eq!(credentials.access_key_id, "id");
+                assert_eq!(credentials.secret_access_key, "secret");
+            }
+            other => panic!("expected an S3 origin, got {other:?}"),
+        }
+        assert!(settings.resolve(|_| None).is_err(), "unset variable");
+    }
+
+    #[test]
+    fn inline_credentials_win_and_are_not_written_back_out() {
+        let settings = origin(
+            r#"{
+              "endpoint": "http://127.0.0.1:9000",
+              "bucket": "b",
+              "access_key_id": "inline-id",
+              "secret_access_key": "inline-secret"
+            }"#,
+        );
+        assert!(settings.resolve(|_| None).is_ok());
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("inline-secret"), "{json}");
+        assert!(!format!("{settings:?}").contains("inline-secret"));
+    }
+
+    #[test]
+    fn a_url_template_origin_needs_no_credentials() {
+        let settings = origin(r#"{ "url_template": "https://cdn.example/{blake3}" }"#);
+        assert!(matches!(
+            settings.resolve(|_| None).unwrap().source,
+            OriginSource::Url { .. }
+        ));
+        assert!(origin("{}").resolve(|_| None).is_err());
     }
 }

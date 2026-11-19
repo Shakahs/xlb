@@ -1,0 +1,31 @@
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+# The node daemon and its command-line client.
+rust_binary(
+    name = "xlb",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "xlb_cli",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//vendor/xlb/crates/xlb",
+        "//vendor/xlb/crates/xlb-client:xlb_client",
+        "@scheduler_crates//:anyhow",
+        "@scheduler_crates//:libc",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:serde_json",
+        "@scheduler_crates//:tokio",
+        "@scheduler_crates//:tracing",
+        "@scheduler_crates//:tracing-subscriber",
+    ],
+)
+
+rust_test(
+    name = "xlb_cli_tests",
+    crate = ":xlb",
+    edition = "2021",
+    deps = ["@scheduler_crates//:tempfile"],
+)
+
+filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])

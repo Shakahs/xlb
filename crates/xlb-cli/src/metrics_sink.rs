@@ -37,7 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use xlb::{FetchObserver, FetchReport};
 
-use crate::socket::protocol::{ClassTotals, FetchMetric, NodeEvent};
+use xlb_client::{ClassTotals, FetchMetric, NodeEvent};
 
 /// How many recent fetch rows the node keeps per process, across all classes.
 ///
@@ -49,7 +49,8 @@ const RECENT_CAP: usize = 256;
 /// reporting, and where to put it.
 #[derive(Clone)]
 pub struct MetricsSink {
-    node_id: String,
+    /// Set once the first class has bound its peer endpoint.
+    node_id: Arc<Mutex<String>>,
     peer_class: String,
     event_tx: broadcast::Sender<NodeEvent>,
     /// `None` when no `metrics_path` is configured. The `Mutex` serialises
@@ -107,7 +108,7 @@ impl MetricsSink {
             }
         };
         Ok(Self {
-            node_id,
+            node_id: Arc::new(Mutex::new(node_id)),
             peer_class,
             event_tx,
             file,
@@ -118,6 +119,12 @@ impl MetricsSink {
     /// Cumulative counters for `class` since node start. A class that has
     /// served nothing yet reports all zeros — which is a true statement about
     /// it, unlike the hard-coded zeros this replaced.
+    /// Name the reporting node. The node ID exists only after a class has
+    /// bound its peer endpoint, which is after the sink is handed to it.
+    pub fn set_node_id(&self, node_id: String) {
+        *self.node_id.lock().unwrap_or_else(|e| e.into_inner()) = node_id;
+    }
+
     pub fn totals_for(&self, class: &str) -> ClassTotals {
         self.with_recent(|r| r.totals.get(class).copied().unwrap_or_default())
     }
@@ -149,20 +156,25 @@ impl MetricsSink {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            node_id: self.node_id.clone(),
+            node_id: self.node_id.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             peer_class: self.peer_class.clone(),
             class: report.class.to_string(),
             blake3: report.hash.to_hex(),
             tier_source: report.tier_label().to_string(),
             bytes_served: report.bytes_served,
+            peer_bytes: report.peer_bytes,
+            origin_bytes: report.origin_bytes,
             peer_id: report.peer_id.clone(),
             duration_ms: report.duration_ms,
         }
     }
 
     /// Emit one report to both transports.
+    // [impl -> dsn~xlb-swarm-fetch~1]
     pub fn emit(&self, report: &FetchReport) {
         let metric = self.to_metric(report);
+        tracing::info!(class = %metric.class, blake3 = %metric.blake3, tier = %metric.tier_source, bytes = metric.bytes_served,
+            peer_bytes = metric.peer_bytes, origin_bytes = metric.origin_bytes, duration_ms = metric.duration_ms, "fetch finished");
 
         // R423-T6: record BEFORE the transports. The in-process tail is what
         // `xlb inspect` and the desktop card read, and it is the only one that
@@ -231,6 +243,8 @@ mod tests {
             tier,
             peer_id: peer.map(String::from),
             bytes_served: bytes,
+            peer_bytes: 0,
+            origin_bytes: 0,
             duration_ms: 42,
         }
     }
@@ -238,10 +252,10 @@ mod tests {
     #[test]
     fn a_seed_hit_carries_the_whole_r423_t7_tuple() {
         let (s, _rx) = sink(None);
-        let m = s.to_metric(&report(Some(FetchTier::Seed), Some("peer-xyz"), 4096));
+        let m = s.to_metric(&report(Some(FetchTier::Peer), Some("peer-xyz"), 4096));
         assert_eq!(m.class, "yah-cli");
         assert_eq!(m.blake3, BlakeHash::hash(b"payload").to_hex());
-        assert_eq!(m.tier_source, "seed");
+        assert_eq!(m.tier_source, "peer");
         assert_eq!(m.bytes_served, 4096);
         assert_eq!(m.peer_id.as_deref(), Some("peer-xyz"));
         assert_eq!(m.duration_ms, 42);
@@ -264,18 +278,18 @@ mod tests {
     fn a_cdn_hit_reports_no_peer_id() {
         // Attribution must not invent a peer for a tier that has none.
         let (s, _rx) = sink(None);
-        let m = s.to_metric(&report(Some(FetchTier::Cdn), None, 10));
-        assert_eq!(m.tier_source, "cdn");
+        let m = s.to_metric(&report(Some(FetchTier::Origin), None, 10));
+        assert_eq!(m.tier_source, "origin");
         assert!(m.peer_id.is_none());
     }
 
     #[test]
     fn emitting_reaches_the_broadcast_channel() {
         let (s, mut rx) = sink(None);
-        s.emit(&report(Some(FetchTier::Lan), Some("p"), 7));
+        s.emit(&report(Some(FetchTier::Peer), Some("p"), 7));
         match rx.try_recv().expect("an event") {
             NodeEvent::FetchMetric(m) => {
-                assert_eq!(m.tier_source, "lan");
+                assert_eq!(m.tier_source, "peer");
                 assert_eq!(m.bytes_served, 7);
             }
             other => panic!("wrong event: {other:?}"),
@@ -289,7 +303,7 @@ mod tests {
         let path = dir.path().join("nested/metrics.ndjson");
         let (s, _rx) = sink(Some(path.to_str().unwrap()));
 
-        s.emit(&report(Some(FetchTier::Swarm), Some("p1"), 1));
+        s.emit(&report(Some(FetchTier::Peer), Some("p1"), 1));
         s.emit(&report(None, None, 0));
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -297,7 +311,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "one row per fetch: {body}");
         let first: FetchMetric = serde_json::from_str(lines[0]).unwrap();
         let second: FetchMetric = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(first.tier_source, "swarm");
+        assert_eq!(first.tier_source, "peer");
         assert_eq!(second.tier_source, "miss");
     }
 
@@ -310,11 +324,11 @@ mod tests {
         let p = path.to_str().unwrap();
 
         let (s1, _r1) = sink(Some(p));
-        s1.emit(&report(Some(FetchTier::Seed), Some("p"), 1));
+        s1.emit(&report(Some(FetchTier::Peer), Some("p"), 1));
         drop(s1);
 
         let (s2, _r2) = sink(Some(p));
-        s2.emit(&report(Some(FetchTier::Cdn), None, 2));
+        s2.emit(&report(Some(FetchTier::Origin), None, 2));
 
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
     }
@@ -348,7 +362,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metrics.ndjson");
         let (s, mut rx) = sink(Some(path.to_str().unwrap()));
-        s.emit(&report(Some(FetchTier::Seed), Some("p9"), 128));
+        s.emit(&report(Some(FetchTier::Peer), Some("p9"), 128));
 
         let from_socket = match rx.try_recv().unwrap() {
             NodeEvent::FetchMetric(m) => m,
@@ -366,7 +380,7 @@ mod tests {
         // The hit RATE is the point: counting only hits gives a numerator with
         // no denominator, which is what ClassStats used to report.
         let (s, _rx) = sink(None);
-        s.emit(&report(Some(FetchTier::Seed), Some("p1"), 100));
+        s.emit(&report(Some(FetchTier::Peer), Some("p1"), 100));
         s.emit(&report(Some(FetchTier::Cache), None, 50));
         s.emit(&report(None, None, 0)); // miss
 
@@ -379,7 +393,7 @@ mod tests {
     #[test]
     fn totals_are_per_class_and_unknown_classes_read_zero() {
         let (s, _rx) = sink(None);
-        s.emit(&report(Some(FetchTier::Cdn), None, 7));
+        s.emit(&report(Some(FetchTier::Origin), None, 7));
         assert_eq!(s.totals_for("yah-cli").fetches, 1);
         // Not "no data" dressed up as activity — a class nobody has fetched
         // from reports zeros, and that is a true statement about it.
@@ -390,7 +404,7 @@ mod tests {
     fn the_recent_tail_keeps_the_newest_rows_and_stays_bounded() {
         let (s, _rx) = sink(None);
         for i in 0..(RECENT_CAP + 10) {
-            s.emit(&report(Some(FetchTier::Lan), Some("p"), i as u64));
+            s.emit(&report(Some(FetchTier::Peer), Some("p"), i as u64));
         }
         // Cumulative counters are NOT capped by the tail.
         assert_eq!(s.totals_for("yah-cli").fetches, (RECENT_CAP + 10) as u64);
@@ -414,12 +428,12 @@ mod tests {
         // Limiting first and filtering second would let a busy class starve a
         // quiet one out of its own card.
         let (s, _rx) = sink(None);
-        let mut other = report(Some(FetchTier::Swarm), Some("p"), 1);
+        let mut other = report(Some(FetchTier::Peer), Some("p"), 1);
         other.class = "whisper-ggml";
         for _ in 0..50 {
             s.emit(&other);
         }
-        s.emit(&report(Some(FetchTier::Seed), Some("p9"), 999));
+        s.emit(&report(Some(FetchTier::Peer), Some("p9"), 999));
 
         let tail = s.recent_for("yah-cli", 20);
         assert_eq!(tail.len(), 1);

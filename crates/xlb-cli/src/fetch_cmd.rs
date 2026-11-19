@@ -1,38 +1,23 @@
+//! `xlb fetch` — ask the daemon for a blob and print where its file is.
+
 use anyhow::Result;
+use xlb_client::Client;
 
-use crate::socket::{
-    client::Client,
-    protocol::{Command, Response},
-};
-
-pub async fn run(class: &str, hash: &str, out: Option<&str>, socket_path: &str) -> Result<()> {
+pub async fn run(class: &str, hash: &str, socket_path: &str) -> Result<()> {
     let mut client = Client::connect(socket_path).await?;
-    let cmd = Command::Fetch {
-        class: class.to_string(),
-        hash: hash.to_string(),
-        out: out.map(str::to_string),
-    };
-    let resp = client.roundtrip(&cmd).await?;
-
-    match resp {
-        Response::FetchResult(r) => {
-            println!(
-                "fetched {} bytes via {} in {}ms",
-                r.bytes, r.tier, r.elapsed_ms
-            );
-            if let Some(path) = &r.saved_to {
-                println!("saved to: {path}");
-            }
-        }
-        Response::Error { message } => {
-            eprintln!("fetch failed: {message}");
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("unexpected response");
-            std::process::exit(1);
-        }
-    }
-
+    let result = client
+        .fetch(class, hash, |progress| match progress.total {
+            Some(total) => eprintln!(
+                "{:?}: {} / {total} bytes",
+                progress.tier, progress.bytes_so_far
+            ),
+            None => eprintln!("{:?}: {} bytes", progress.tier, progress.bytes_so_far),
+        })
+        .await?;
+    eprintln!(
+        "fetched {} bytes via {:?} in {}ms",
+        result.bytes, result.tier, result.elapsed_ms
+    );
+    println!("{}", result.path);
     Ok(())
 }

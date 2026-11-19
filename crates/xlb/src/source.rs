@@ -1,156 +1,43 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-
-use crate::BlakeHash;
-
-/// Position in the five-tier fetch-chain priority order.
-///
-/// Sources with lower numeric values are tried first. A verified hit at any
-/// tier short-circuits the rest. A BLAKE3 mismatch at any tier logs a warning
-/// and falls through to the next tier.
+/// Where a fetch got a blob from. A blob that is not in the local cache is
+/// read from the peers and the origin together; the fetch is then attributed
+/// to whichever of the two delivered more bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FetchTier {
-    /// Local on-disk LRU cache. Free, µs latency. Always tried first.
+    /// The blob is already complete in the local cache directory.
     Cache = 0,
-    /// mDNS-discovered peers on the same LAN subnet. Free, <1 ms.
-    Lan = 1,
-    /// iroh-relay-mediated swarm peers. Peer's bandwidth, 10–100 ms.
-    Swarm = 2,
-    /// Permanently-pinned seeds (NodeIds in the app binary). 50–200 ms.
-    Seed = 3,
-    /// HTTP/HTTPS CDN fallback. App's egress cost. Reachable behind firewalls
-    /// that block QUIC/UDP — the real reason it exists.
-    Cdn = 4,
+    /// Peers of the runtime peer set, read concurrently over iroh-blobs.
+    Peer = 1,
+    /// The HTTP origin, read with concurrent ranged GETs.
+    Origin = 2,
 }
 
 impl FetchTier {
     pub fn label(self) -> &'static str {
         match self {
             FetchTier::Cache => "cache",
-            FetchTier::Lan => "lan",
-            FetchTier::Swarm => "swarm",
-            FetchTier::Seed => "seed",
-            FetchTier::Cdn => "cdn",
+            FetchTier::Peer => "peer",
+            FetchTier::Origin => "origin",
         }
     }
 }
 
 /// Cumulative download progress for a single in-flight fetch.
 ///
-/// Emitted once per received chunk by progress-aware sources (today only the
-/// CDN HTTP fetcher). Instant tiers (cache) and length-less streams never
-/// emit, so a consumer that sees the bytes return without any callback should
-/// treat the transfer as instantaneous / indeterminate.
+/// A cache hit never emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FetchProgress {
-    /// Bytes received so far, cumulative across the fetch.
+    /// Bytes received so far from the peers and the origin, cumulative.
     pub bytes_so_far: u64,
-    /// Total expected bytes when the source knows it (CDN `Content-Length`);
-    /// `None` when the length is indeterminate.
+    /// Total size of the blob.
     pub total: Option<u64>,
-    /// The tier currently serving the bytes.
+    /// The tier that has delivered more of the bytes so far.
     pub tier: FetchTier,
 }
 
 /// Callback sink for incremental [`FetchProgress`] during a fetch.
 ///
-/// Cheap to clone (`Arc`); invoked on the fetch task, so the closure must be
-/// `Send + Sync`. Pass one to [`crate::Asset::fetch_with_progress`].
+/// Invoked on the caller's task, never on the transfer itself, so a slow sink
+/// delays only its own caller's view of the progress.
 pub type ProgressSink = Arc<dyn Fn(FetchProgress) + Send + Sync>;
-
-/// Any source that can serve bytes for a [`BlakeHash`].
-///
-/// The fetch chain calls sources in [`FetchTier`] order; each result is
-/// BLAKE3-verified in [`FetchChain::fetch`] before being returned.
-/// A mismatch causes the chain to skip to the next source (a poisoned peer
-/// cannot corrupt a download).
-#[async_trait]
-pub(crate) trait BlobSource: Send + Sync {
-    /// Try to serve bytes for `hash`. Returns `None` on a miss.
-    ///
-    /// BLAKE3 verification happens in the caller — do not verify here.
-    async fn fetch_raw(&self, hash: &BlakeHash) -> Option<Bytes>;
-
-    /// Like [`fetch_raw`](Self::fetch_raw) but reports incremental byte
-    /// progress to `sink`.
-    ///
-    /// The default impl ignores `sink` and delegates to `fetch_raw`, so
-    /// sources that can't (or needn't) report progress — cache, seed, mock —
-    /// inherit a no-progress fetch unchanged. The CDN HTTP fetcher overrides
-    /// this to stream the body and emit per-chunk progress against
-    /// `Content-Length`.
-    ///
-    /// BLAKE3 verification still happens in the caller — do not verify here.
-    async fn fetch_raw_with_progress(
-        &self,
-        hash: &BlakeHash,
-        _sink: Option<&ProgressSink>,
-    ) -> Option<Bytes> {
-        self.fetch_raw(hash).await
-    }
-
-    fn tier(&self) -> FetchTier;
-
-    /// Hex `NodeId` of the peer this source pulls from, when it *is* a peer.
-    ///
-    /// Default `None`, which is the correct and permanent answer for the cache
-    /// and CDN sources: neither has a NodeId. R423-T7 needs per-peer
-    /// attribution, and a synthesized identifier for a non-peer tier would be
-    /// worse than a missing one — it would look like real attribution.
-    fn peer_id(&self) -> Option<String> {
-        None
-    }
-}
-
-/// Which source served a blob, and what it cost to get there.
-pub(crate) struct ChainHit {
-    pub tier: FetchTier,
-    pub peer_id: Option<String>,
-    pub bytes: Bytes,
-}
-
-/// Ordered list of [`BlobSource`]s. Tries each in [`FetchTier`] order.
-pub(crate) struct FetchChain {
-    sources: Vec<Arc<dyn BlobSource>>,
-}
-
-impl FetchChain {
-    pub fn new(mut sources: Vec<Arc<dyn BlobSource>>) -> Self {
-        sources.sort_by_key(|s| s.tier());
-        FetchChain { sources }
-    }
-
-    /// Try each source in tier order; verify BLAKE3 on receipt.
-    ///
-    /// Returns a [`ChainHit`] on the first verified hit. Returns `None`
-    /// if no source has the blob or all sources returned mismatching bytes.
-    /// Threads a [`ProgressSink`] to each source so the serving tier can
-    /// report byte progress as it streams; pass `None` for no reporting.
-    pub async fn fetch_with_progress(
-        &self,
-        hash: &BlakeHash,
-        sink: Option<&ProgressSink>,
-    ) -> Option<ChainHit> {
-        for source in &self.sources {
-            let Some(bytes) = source.fetch_raw_with_progress(hash, sink).await else {
-                continue;
-            };
-            if hash.verify(&bytes) {
-                tracing::debug!(tier = source.tier().label(), hash = %hash, "fetch hit");
-                return Some(ChainHit {
-                    tier: source.tier(),
-                    peer_id: source.peer_id(),
-                    bytes,
-                });
-            }
-            tracing::warn!(
-                tier = source.tier().label(),
-                hash = %hash,
-                "BLAKE3 mismatch — dropping source"
-            );
-        }
-        None
-    }
-}

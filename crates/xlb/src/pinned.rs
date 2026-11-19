@@ -7,17 +7,8 @@
 //! entries, so the rebuild after a restart can never evict a pinned blob. Its
 //! members are never evicted and sit outside the byte budget, like any pin.
 //!
-//! This is distinct from the manifest-derived pin sets of R002-F2, which are
-//! re-derived on every manifest refresh and deliberately not persisted. The
-//! two share the retention index's one set namespace; a tree name that
-//! collides with a manifest `pinned_sets` key would be replaced by the next
-//! refresh, so name trees for what they hold (`keys-pack`), not generically.
-//!
-//! In-memory classes (`cache_dir = None`) accept trees too, but nothing
-//! persists — [`PinnedTreeInfo::durable`] says which one you have.
-//!
-//! The `pins/` subdirectory is invisible to the blob store: `DiskBlobStore`
-//! only admits regular files named by a 64-char hex hash.
+//! The `pins/` subdirectory is invisible to the cache: only regular files
+//! named by a 64-char hex hash are blobs.
 
 use std::{
     io,

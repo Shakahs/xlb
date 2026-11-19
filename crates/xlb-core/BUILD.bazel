@@ -1,0 +1,24 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "xlb_core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "xlb_core",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@scheduler_crates//:blake3",
+        "@scheduler_crates//:hex",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:thiserror",
+    ],
+)
+
+rust_test(
+    name = "xlb_core_tests",
+    crate = ":xlb_core",
+    edition = "2021",
+)
+
+filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])

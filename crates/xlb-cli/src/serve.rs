@@ -1,163 +1,91 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+//! `xlb serve` — register the configured classes and answer the socket.
 
-use anyhow::Result;
-use mshr::{Endpoint, Keypair};
+use std::{sync::Arc, time::Instant};
+
+use anyhow::{Context, Result};
 use tokio::sync::broadcast;
-use xlb::{transport::BlobTransport, AssetClass, AssetClassConfig, Discovery};
+use xlb::{AssetClass, AssetClassConfig};
 
 use crate::{
-    config::{expand_tilde, NodeConfig},
+    config::NodeConfig,
     metrics_sink::MetricsSink,
-    socket::server::{ClassMeta, NodeState},
+    server::{ClassEntry, NodeState},
 };
 
 pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     let cfg = NodeConfig::load(config_path)?;
+    let socket = effective_socket(socket_flag, cfg.node.socket.as_deref());
+    let socket_mode = cfg.node.socket_mode()?;
 
-    // `--socket` beats `node.socket` beats the CLI default. This used to
-    // compare the flag against "/tmp/xlb-node.sock" to guess whether it was
-    // defaulted, so under `$XDG_RUNTIME_DIR` the config's socket was ignored
-    // and a reader resolving the config (the desktop's camp card) dialled a
-    // socket nobody listened on.
-    let effective_socket = effective_socket(socket_flag, cfg.node.socket.as_deref());
-    let effective_socket = effective_socket.as_str();
-
-    let kp = match cfg.node.identity_dir.as_deref() {
-        Some(dir) => Keypair::load_or_create_at(std::path::Path::new(&expand_tilde(dir))),
-        None => Keypair::load_or_create(),
-    }
-    .map_err(|e| anyhow::anyhow!("keypair: {e}"))?;
-    let node_id = kp.node_id().to_string();
-
-    let mut classes: HashMap<String, AssetClass> = HashMap::new();
-    let mut class_meta: HashMap<String, ClassMeta> = HashMap::new();
-
-    // R423-T7. Built BEFORE the classes because every class's observer is a
-    // handle to it — an AssetClass registered without one reports nothing, for
-    // the whole life of the process, silently.
+    // Built before the classes because every class's observer is a handle to
+    // it; the node ID is filled in once a class has bound its endpoint.
     let (event_tx, _) = broadcast::channel(256);
-    // R423-T6: one sink, shared by the classes (as their observer) and by the
-    // socket server (as the source for ClassStats counters). Two sinks would
-    // each see half the picture.
     let metrics = Arc::new(MetricsSink::new(
-        node_id.clone(),
+        String::new(),
         cfg.node.peer_class.clone(),
         event_tx.clone(),
         cfg.node.metrics_path.as_deref(),
     )?);
 
+    let mut classes = Vec::new();
     for cc in &cfg.classes {
         // AssetClassConfig.name is &'static str; leak each name once at startup.
-        let static_name: &'static str = Box::leak(cc.name.clone().into_boxed_str());
-
-        let cache_dir = cc.cache_dir.as_deref().map(expand_tilde).map(PathBuf::from);
-
-        let discovery = if !cc.discovery.lan && !cc.discovery.swarm {
-            Discovery::none()
-        } else if cc.discovery.swarm {
-            Discovery::default().with_relays(cc.discovery.relays.clone())
-        } else {
-            Discovery::lan_only()
-        };
-
-        let ac = AssetClass::register(AssetClassConfig {
-            name: static_name,
-            permanent_seeds: cc.permanent_seeds.clone(),
-            cdn_fallback: cc.cdn_fallback.clone(),
-            discovery,
-            cache_dir,
-            cache_budget_bytes: cc.cache_budget_bytes,
-            observer: Some(metrics.observer()),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("register class {}: {e}", cc.name))?;
-
-        class_meta.insert(
-            cc.name.clone(),
-            ClassMeta {
-                role: cc.role.clone(),
-                cdn_fallback: cc.cdn_fallback.clone(),
-                permanent_seeds: cc.permanent_seeds.clone(),
-                cache_budget_bytes: cc.cache_budget_bytes,
-            },
-        );
-        classes.insert(cc.name.clone(), ac);
-    }
-
-    // R1003: the seeding side. One endpoint for the node; LAN (mDNS) when any
-    // class asks for it, so LAN clients resolve this node's bare NodeId and
-    // can name it in `permanent_seeds`. A bind failure leaves a node that
-    // still caches and answers the socket, but serves nobody — said loudly.
-    let lan = cfg.classes.iter().any(|c| c.discovery.lan);
-    let transport = match bind_transport(kp.clone(), lan).await {
-        Ok(t) => Some(Arc::new(t)),
-        Err(e) => {
-            tracing::error!("xlb serve: transport bind failed, not seeding: {e}");
-            None
-        }
-    };
-    if let Some(t) = &transport {
-        for (name, ac) in &classes {
-            t.attach_permanent_seeds(ac);
-            match t.serve_pinned_trees(ac).await {
-                Ok(n) => tracing::info!(class = %name, blobs = n, "publishing pinned trees"),
-                Err(e) => tracing::error!(class = %name, "publishing pinned trees: {e}"),
-            }
-        }
+        let name: &'static str = Box::leak(cc.name.clone().into_boxed_str());
+        let mut config = AssetClassConfig::new(name, cc.cache_dir());
+        config.cache_budget_bytes = cc.cache_budget_bytes;
+        config.peer = cc.peer_config()?;
+        config.origin = cc.origin_config()?;
+        config.observer = Some(metrics.observer());
+        let has_origin = config.origin.is_some();
+        let class = AssetClass::register(config)
+            .await
+            .with_context(|| format!("register class {}", cc.name))?;
+        classes.push(ClassEntry {
+            name: cc.name.clone(),
+            class,
+            has_origin,
+        });
     }
 
     let state = NodeState {
-        node_id: node_id.clone(),
         started_at: Instant::now(),
         classes: Arc::new(classes),
-        class_meta: Arc::new(class_meta),
         event_tx,
-        metrics,
-        transport: transport.clone(),
+        metrics: metrics.clone(),
     };
+    let info = state.node_info();
+    if let Some(node_id) = &info.node_id {
+        metrics.set_node_id(node_id.clone());
+    }
 
-    let state_clone = state.clone();
-    let socket_owned = effective_socket.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = crate::socket::server::listen(state_clone, &socket_owned).await {
-            tracing::error!("socket error: {e}");
-        }
+    let listener_state = state.clone();
+    let listener_socket = socket.clone();
+    let listener = tokio::spawn(async move {
+        crate::server::listen(listener_state, &listener_socket, socket_mode).await
     });
 
-    // The full NodeId, not a prefix: it is what a client pastes into
-    // `permanent_seeds` to name this node.
+    // The full node ID and the bound addresses are what a peer needs.
     println!(
-        "xlb node · {} · {} class(es) · lan: {} · seeding: {} · socket: {}",
-        node_id,
-        cfg.classes.len(),
-        lan,
-        transport.is_some(),
-        effective_socket
+        "xlb node · {} · udp {} · {} class(es) · socket {}",
+        info.node_id.as_deref().unwrap_or("no peer tier"),
+        info.udp_addrs.join(","),
+        info.classes.len(),
+        socket
     );
-    println!("Ctrl+C to stop");
 
-    shutdown_signal().await?;
-    println!("\nshutting down");
-    // Close the endpoint before it drops, so peers see a clean close rather
-    // than a timeout, and iroh does not abort it ungracefully.
-    if let Some(t) = &transport {
-        t.shutdown().await;
+    tokio::select! {
+        signal = shutdown_signal() => signal?,
+        // The listener only returns when it could not bind.
+        listener = listener => listener.context("socket task")??,
+    }
+    println!("shutting down");
+    // Close the endpoints before they drop, so peers see a clean close.
+    for entry in state.classes.iter() {
+        entry.class.shutdown().await;
     }
     Ok(())
 }
 
-async fn bind_transport(kp: Keypair, lan: bool) -> Result<BlobTransport> {
-    let endpoint = Endpoint::builder()
-        .keypair(kp)
-        .discovery(mshr::Discovery::new().with_lan_if(lan))
-        .bind()
-        .await
-        .map_err(|e| anyhow::anyhow!("endpoint bind: {e}"))?;
-    BlobTransport::new(endpoint).await
-}
-
-/// Ctrl+C, or SIGTERM from a supervisor (a camp service is stopped that way).
 async fn shutdown_signal() -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -167,8 +95,7 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-/// The socket `serve` binds: `--socket`, else the config's `node.socket`,
-/// else the CLI default.
+/// `--socket` beats `node.socket` beats the CLI default.
 fn effective_socket(flag: Option<&str>, configured: Option<&str>) -> String {
     flag.or(configured)
         .map(str::to_string)
@@ -182,7 +109,6 @@ mod tests {
     #[test]
     fn flag_beats_config_beats_default() {
         assert_eq!(effective_socket(Some("/f.sock"), Some("c.sock")), "/f.sock");
-        // The old guess ignored this whenever $XDG_RUNTIME_DIR was set.
         assert_eq!(effective_socket(None, Some("c.sock")), "c.sock");
         assert_eq!(effective_socket(None, None), crate::default_socket());
     }
