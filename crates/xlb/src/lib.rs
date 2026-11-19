@@ -295,6 +295,26 @@ impl AssetClass {
         self.0.cache.stats()
     }
 
+    /// Read one small whole object from the class's origin: `location` is a
+    /// key of an S3 origin's bucket or the URL of a URL origin. `None` when
+    /// the origin has no such object.
+    // [impl -> dsn~xlb-image-mirror~1]
+    pub async fn read_origin_object(
+        &self,
+        location: &str,
+        limit_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let origin = self
+            .0
+            .origin
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("class {} has no origin", self.0.name)))?;
+        origin
+            .read_object(location, limit_bytes)
+            .await
+            .map_err(|e| Error::Config(format!("origin object {location}: {e}")))
+    }
+
     // ─── Peers ─────────────────────────────────────────────────────────────
 
     /// This node's ID on the peer tier, if the class has one.

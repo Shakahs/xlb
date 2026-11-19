@@ -412,6 +412,43 @@ impl Origin {
             .ok_or_else(|| OriginError::Protocol("HEAD carried no Content-Length".into()))
     }
 
+    /// The whole object at `location`, a key of an S3 source's bucket or the
+    /// URL of a URL source, or `None` when the origin has none. An object
+    /// longer than `limit_bytes` is refused.
+    // [impl -> dsn~xlb-image-mirror~1]
+    pub(crate) async fn read_object(
+        &self,
+        location: &str,
+        limit_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, OriginError> {
+        let target = self.0.object_target(location)?;
+        let mut response = self
+            .0
+            .target_request(reqwest::Method::GET, "GET", target, None)?
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status != reqwest::StatusCode::OK {
+            return Err(OriginError::Status {
+                method: "GET",
+                status: status.as_u16(),
+            });
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > limit_bytes {
+                return Err(OriginError::Protocol(format!(
+                    "{location} is longer than {limit_bytes} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Some(body))
+    }
+
     /// Fetch the outboard of the `size`-byte blob `hash` into a new file at
     /// `path`. The file is removed when the outboard is dropped.
     // [impl -> dsn~xlb-swarm-fetch~1]
@@ -501,16 +538,26 @@ impl OriginInner {
     /// The request target of the object for `hash`, or with
     /// [`OUTBOARD_KEY_SUFFIX`] as `suffix` of its outboard.
     fn target(&self, hash: &BlakeHash, suffix: &str) -> Result<Target, OriginError> {
+        let template = match &self.config.source {
+            OriginSource::Url { template } => template,
+            OriginSource::S3 { key_template, .. } => key_template,
+        };
+        self.object_target(&format!(
+            "{}{suffix}",
+            template.replace(HASH_TOKEN, &hash.to_hex())
+        ))
+    }
+
+    /// The request target of the object at `location`: a key of an S3
+    /// source's bucket, or the whole URL of a URL source.
+    fn object_target(&self, location: &str) -> Result<Target, OriginError> {
         match &self.config.source {
-            OriginSource::Url { template } => Ok(Target {
-                url: format!("{}{suffix}", template.replace(HASH_TOKEN, &hash.to_hex())),
+            OriginSource::Url { .. } => Ok(Target {
+                url: location.to_string(),
                 signing: None,
             }),
             OriginSource::S3 {
-                endpoint,
-                bucket,
-                key_template,
-                ..
+                endpoint, bucket, ..
             } => {
                 let endpoint = endpoint.trim_end_matches('/');
                 let (scheme, rest) = endpoint.split_once("://").ok_or_else(|| {
@@ -520,10 +567,9 @@ impl OriginInner {
                     Some((host, path)) => (host, format!("/{path}")),
                     None => (rest, String::new()),
                 };
-                let key = key_template.replace(HASH_TOKEN, &hash.to_hex());
                 let path = format!(
-                    "{base_path}/{bucket}/{}{suffix}",
-                    key.trim_start_matches('/')
+                    "{base_path}/{bucket}/{}",
+                    location.trim_start_matches('/')
                 );
                 Ok(Target {
                     url: format!("{scheme}://{host}{}", sigv4::canonical_uri(&path)),
@@ -544,7 +590,17 @@ impl OriginInner {
         suffix: &str,
         range: Option<(u64, u64)>,
     ) -> Result<reqwest::RequestBuilder, OriginError> {
-        let target = self.target(hash, suffix)?;
+        self.target_request(method, method_name, self.target(hash, suffix)?, range)
+    }
+
+    /// Build one request to `target`, signed when the source has credentials.
+    fn target_request(
+        &self,
+        method: reqwest::Method,
+        method_name: &'static str,
+        target: Target,
+        range: Option<(u64, u64)>,
+    ) -> Result<reqwest::RequestBuilder, OriginError> {
         let range_value = range.map(|(start, end)| format!("bytes={start}-{}", end - 1));
         let mut request = self.client.request(method, &target.url);
         if let Some(value) = &range_value {
