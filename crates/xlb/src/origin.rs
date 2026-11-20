@@ -415,7 +415,7 @@ impl Origin {
     /// The whole object at `location`, a key of an S3 source's bucket or the
     /// URL of a URL source, or `None` when the origin has none. An object
     /// longer than `limit_bytes` is refused.
-    // [impl -> dsn~xlb-image-mirror~1]
+    // [impl -> dsn~xlb-fork~1]
     pub(crate) async fn read_object(
         &self,
         location: &str,

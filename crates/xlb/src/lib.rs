@@ -298,7 +298,7 @@ impl AssetClass {
     /// Read one small whole object from the class's origin: `location` is a
     /// key of an S3 origin's bucket or the URL of a URL origin. `None` when
     /// the origin has no such object.
-    // [impl -> dsn~xlb-image-mirror~1]
+    // [impl -> dsn~xlb-fork~1]
     pub async fn read_origin_object(
         &self,
         location: &str,
