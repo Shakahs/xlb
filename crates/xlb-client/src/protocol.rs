@@ -9,7 +9,7 @@
 //! - `subscribe_events`, answered by `event` frames until the client hangs up.
 
 use serde::{Deserialize, Serialize};
-use xlb_core::NodeTopology;
+use xlb_core::{FetchSources, NodeTopology};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -163,13 +163,15 @@ pub struct FetchRecord {
 }
 
 /// Cumulative progress of the fetch this connection asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchProgress {
     pub bytes_so_far: u64,
     /// Size of the blob, once the serving tier has reported it.
     pub total: Option<u64>,
     /// `peer` or `origin`.
     pub tier: Tier,
+    #[serde(default, skip_serializing_if = "FetchSources::is_empty")]
+    pub sources: FetchSources,
 }
 
 /// The tier that served, or is serving, a fetch.
@@ -192,6 +194,8 @@ pub struct FetchResult {
     pub bytes: u64,
     pub tier: Tier,
     pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "FetchSources::is_empty")]
+    pub sources: FetchSources,
 }
 
 /// What one pinned tree covers and how much of it the node holds.
@@ -339,6 +343,7 @@ mod tests {
             bytes_so_far: 5,
             total: Some(10),
             tier: Tier::Peer,
+            sources: FetchSources::default(),
         });
         assert_eq!(
             serde_json::to_string(&progress).unwrap(),
@@ -351,6 +356,7 @@ mod tests {
             bytes: 10,
             tier: Tier::Origin,
             elapsed_ms: 3,
+            sources: FetchSources::default(),
         });
         assert_eq!(
             serde_json::to_string(&result).unwrap(),

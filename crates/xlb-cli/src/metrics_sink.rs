@@ -245,6 +245,7 @@ mod tests {
             bytes_served: bytes,
             peer_bytes: 0,
             origin_bytes: 0,
+            peers: Default::default(),
             duration_ms: 42,
         }
     }

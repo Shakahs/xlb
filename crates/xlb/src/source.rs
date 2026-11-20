@@ -26,7 +26,7 @@ impl FetchTier {
 /// Cumulative download progress for a single in-flight fetch.
 ///
 /// A cache hit never emits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchProgress {
     /// Bytes received so far from the peers and the origin, cumulative.
     pub bytes_so_far: u64,
@@ -34,6 +34,7 @@ pub struct FetchProgress {
     pub total: Option<u64>,
     /// The tier that has delivered more of the bytes so far.
     pub tier: FetchTier,
+    pub sources: xlb_core::FetchSources,
 }
 
 /// Callback sink for incremental [`FetchProgress`] during a fetch.

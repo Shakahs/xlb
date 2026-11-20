@@ -511,13 +511,12 @@ impl PeerTransport {
         ranges: ChunkRanges,
         mut providers: Vec<ProviderChoice>,
         rate: &RequestRate,
-        mut on_bytes: impl FnMut(u64),
+        mut on_bytes: impl FnMut(NodeId, u64),
     ) -> Result<(), PeerError> {
         providers.shuffle(&mut rand::rng());
         providers.sort_by_key(|provider| !provider.same_location);
         let request = Arc::new(GetRequest::blob_ranges(hash, ranges));
         let remote = self.store.remote();
-        let mut received = 0;
         for ProviderChoice { node: provider, timestamp, .. } in providers {
             if !is_fresh(timestamp) || !self.is_eligible(&provider) {
                 continue;
@@ -531,8 +530,8 @@ impl PeerTransport {
             if !is_fresh(timestamp) || !self.is_eligible(&provider) {
                 continue;
             }
-            let initial = received;
             let attempt = async {
+                let mut received = 0;
                 let connection = self.pool.get_or_connect(provider).await
                     .map_err(|err| err.to_string())?;
                 if connection_verdict(&connection) != PathVerdict::Direct {
@@ -545,12 +544,15 @@ impl PeerTransport {
                 while let Some(item) = items.next().await {
                     match item {
                         GetProgressItem::Progress(bytes) => {
-                            received = initial + bytes;
-                            on_bytes(received);
+                            if bytes > received {
+                                on_bytes(provider, bytes - received);
+                                received = bytes;
+                            }
                         }
                         GetProgressItem::Done(stats) => {
-                            received = initial + stats.payload_bytes_read;
-                            on_bytes(received);
+                            if stats.payload_bytes_read > received {
+                                on_bytes(provider, stats.payload_bytes_read - received);
+                            }
                             return Ok(());
                         }
                         GetProgressItem::Error(err) => return Err(err.to_string()),

@@ -274,6 +274,9 @@ mod tests {
                     bytes_so_far,
                     total: Some(8),
                     tier: Tier::Origin,
+                    sources: xlb_core::FetchSources {
+                        origin_bytes: bytes_so_far, peers: Default::default(),
+                    },
                 });
                 write_frame(&mut far, &progress).await.unwrap();
             }
@@ -284,6 +287,9 @@ mod tests {
                 bytes: 8,
                 tier: Tier::Origin,
                 elapsed_ms: 1,
+                sources: xlb_core::FetchSources {
+                    origin_bytes: 8, peers: Default::default(),
+                },
             });
             write_frame(&mut far, &result).await.unwrap();
         });
@@ -295,6 +301,7 @@ mod tests {
             .unwrap();
         assert_eq!(seen, [4, 8]);
         assert_eq!(result.path, "/cache/ab");
+        assert_eq!(result.sources.origin_bytes, 8);
         server.await.unwrap();
     }
 

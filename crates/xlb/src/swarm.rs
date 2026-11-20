@@ -3,9 +3,9 @@
 //! and Tower regulates when requests start.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
     time::Duration,
 };
 
@@ -39,11 +39,12 @@ pub(crate) struct SwarmSources {
     pub(crate) indexed_size: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SwarmProgress {
     pub(crate) size: u64,
     pub(crate) peer_bytes: u64,
     pub(crate) origin_bytes: u64,
+    pub(crate) peers: BTreeMap<String, u64>,
 }
 
 pub(crate) enum SwarmFailure {
@@ -101,7 +102,7 @@ struct SwarmFetch {
     origin_rate: RequestRate,
     peer_rate: RequestRate,
     origin_bytes: AtomicU64,
-    peer_bytes: AtomicU64,
+    peer_bytes: Mutex<BTreeMap<NodeId, u64>>,
 }
 
 fn origin_failure(hash: BlakeHash, error: OriginError) -> SwarmFailure {
@@ -216,10 +217,8 @@ impl SwarmFetch {
         ranges: ChunkRanges,
         providers: Vec<ProviderChoice>,
     ) -> Result<(), SwarmFailure> {
-        let mut reported = 0;
-        peers.fetch_ranges(self.hash, ranges, providers, &self.peer_rate, |received| {
-            self.peer_bytes.fetch_add(received - reported, Ordering::Relaxed);
-            reported = received;
+        peers.fetch_ranges(self.hash, ranges, providers, &self.peer_rate, |peer, received| {
+            *self.peer_bytes.lock().unwrap().entry(peer).or_default() += received;
         }).await.map_err(|err| SwarmFailure::Miss(format!("peers: {err}")))
     }
 
@@ -258,10 +257,12 @@ impl SwarmFetch {
     }
 
     fn progress(&self, size: u64) -> SwarmProgress {
+        let peers = self.peer_bytes.lock().unwrap();
         SwarmProgress {
             size,
-            peer_bytes: self.peer_bytes.load(Ordering::Relaxed).min(size),
-            origin_bytes: self.origin_bytes.load(Ordering::Relaxed).min(size),
+            peer_bytes: peers.values().sum(),
+            origin_bytes: self.origin_bytes.load(Ordering::Relaxed),
+            peers: peers.iter().map(|(peer, bytes)| (peer.to_string(), *bytes)).collect(),
         }
     }
 
@@ -292,8 +293,8 @@ impl SwarmFetch {
             loop {
                 interval.tick().await;
                 let current = self.progress(size);
-                if previous != Some(current) {
-                    progress(current);
+                if previous.as_ref() != Some(&current) {
+                    progress(current.clone());
                     previous = Some(current);
                 }
             }
@@ -334,7 +335,7 @@ pub(crate) async fn fetch(
             sources,
             outboard: OnceCell::new(),
             origin_bytes: AtomicU64::new(0),
-            peer_bytes: AtomicU64::new(0),
+            peer_bytes: Mutex::default(),
         };
         let size = match swarm.sources.indexed_size {
             Some(0) => return Err(SwarmFailure::Miss("the index names an empty chunk".into())),

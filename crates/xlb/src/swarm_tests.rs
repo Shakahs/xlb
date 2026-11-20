@@ -148,6 +148,7 @@ async fn check_mixed_tail_group(corrupt: bool) {
         assert_eq!(std::fs::read(path).unwrap(), data);
         assert_eq!(ranges, [(0, RANGE_BYTES), (RANGE_BYTES, tail), tail_range]);
         assert_eq!(report.peer_bytes, peer_bytes);
+        assert_eq!(report.peers, std::collections::BTreeMap::from([(peer.endpoint.id().to_string(), peer_bytes)]));
         assert_eq!(report.origin_bytes, size - peer_bytes);
     }
     receiver.shutdown().await;

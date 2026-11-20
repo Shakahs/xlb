@@ -313,12 +313,13 @@ async fn do_fetch(
             done = &mut fetch => break done,
             _ = ticker.tick() => {
                 if latest_rx.has_changed().unwrap_or(false) {
-                    let latest = *latest_rx.borrow_and_update();
+                    let latest = latest_rx.borrow_and_update().clone();
                     if let Some(progress) = latest {
                         let frame = Response::FetchProgress(FetchProgress {
                             bytes_so_far: progress.bytes_so_far,
                             total: progress.total,
                             tier: wire_tier(progress.tier),
+                            sources: progress.sources,
                         });
                         write_frame(writer, &frame).await?;
                     }
@@ -343,6 +344,7 @@ async fn do_fetch(
                 bytes: report.bytes_served,
                 tier: wire_tier(tier),
                 elapsed_ms: report.duration_ms,
+                sources: xlb::FetchSources { origin_bytes: report.origin_bytes, peers: report.peers },
             }))
         }
         (Ok(_), None) => Ok(Response::Error {

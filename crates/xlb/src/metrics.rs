@@ -36,6 +36,8 @@ pub struct FetchReport {
     /// Bytes this fetch read from the origin. `0` on a cache hit and on a
     /// miss.
     pub origin_bytes: u64,
+    /// Payload bytes received from each peer endpoint.
+    pub peers: std::collections::BTreeMap<String, u64>,
     /// Wall time for the whole call, including tiers that missed first.
     pub duration_ms: u64,
 }
@@ -78,6 +80,7 @@ mod tests {
             bytes_served: 1,
             peer_bytes: 0,
             origin_bytes: 0,
+            peers: Default::default(),
             duration_ms: 0,
         }
     }

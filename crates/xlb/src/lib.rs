@@ -41,7 +41,7 @@ pub use pinned::{PinError, PinnedTreeInfo, SeedReport};
 pub use sigv4::Credentials;
 pub use source::{FetchProgress, FetchTier, ProgressSink};
 pub use xlb_core::retention;
-pub use xlb_core::{BlakeHash, InvalidHash, NodeTopology, RetentionIndex, RetentionPolicy};
+pub use xlb_core::{BlakeHash, FetchSources, InvalidHash, NodeTopology, RetentionIndex, RetentionPolicy};
 
 use std::{
     collections::HashMap,
@@ -162,6 +162,7 @@ struct Fetched {
     tier: FetchTier,
     peer_bytes: u64,
     origin_bytes: u64,
+    peers: std::collections::BTreeMap<String, u64>,
 }
 
 impl Fetched {
@@ -172,6 +173,7 @@ impl Fetched {
             tier: FetchTier::Cache,
             peer_bytes: 0,
             origin_bytes: 0,
+            peers: Default::default(),
         }
     }
 }
@@ -643,6 +645,7 @@ impl AssetClass {
         let admit = |size: u64| self.reserve(&hash, size);
         let report = flight.clone();
         let progress = move |received: SwarmProgress| {
+            let sources = FetchSources { origin_bytes: received.origin_bytes, peers: received.peers };
             report.send_modify(|state| {
                 state.progress = Some(FetchProgress {
                     bytes_so_far: (received.peer_bytes + received.origin_bytes).min(received.size),
@@ -652,6 +655,7 @@ impl AssetClass {
                     } else {
                         FetchTier::Origin
                     },
+                    sources,
                 })
             });
         };
@@ -690,6 +694,7 @@ impl AssetClass {
             tier,
             peer_bytes: received.peer_bytes,
             origin_bytes: received.origin_bytes,
+            peers: received.peers,
         })
     }
 
@@ -727,7 +732,7 @@ impl AssetClass {
                 loop {
                     let (progress, outcome) = {
                         let state = flight.borrow_and_update();
-                        (state.progress, state.outcome.clone())
+                        (state.progress.clone(), state.outcome.clone())
                     };
                     if let Some(outcome) = outcome {
                         break outcome;
@@ -762,6 +767,7 @@ impl AssetClass {
             bytes_served,
             peer_bytes,
             origin_bytes,
+            peers: outcome.as_ref().map(|fetched| fetched.peers.clone()).unwrap_or_default(),
             duration_ms: started.elapsed().as_millis() as u64,
         };
         if let Some(observer) = &self.0.observer {

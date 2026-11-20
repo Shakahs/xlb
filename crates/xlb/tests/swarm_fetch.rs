@@ -66,6 +66,7 @@ async fn a_new_node_reads_a_completed_peer_chunk_while_another_chunk_loads_from_
         assert_eq!(std::fs::read(result.expect("get the announced chunk")).unwrap(), first);
         assert_eq!(report.peer_bytes, first.len() as u64);
         assert_eq!(report.origin_bytes, 0);
+        assert_eq!(report.peers.get(&peer.node_id().unwrap().to_string()), Some(&(first.len() as u64)));
         assert!(!s3_fetch.is_finished(), "the independent S3 range reads are still pending");
 
         s3.pause_object_ranges(false);
@@ -73,6 +74,7 @@ async fn a_new_node_reads_a_completed_peer_chunk_while_another_chunk_loads_from_
         assert_eq!(std::fs::read(result.expect("complete S3 chunk")).unwrap(), second);
         assert_eq!(report.peer_bytes, 0);
         assert_eq!(report.origin_bytes, second.len() as u64);
+        assert!(report.peers.is_empty());
         let ranges = s3.object_ranges();
         assert!(ranges.windows(2).all(|ranges| ranges[0].1 == ranges[1].0));
         assert_eq!(ranges.first().unwrap().0, 0);
