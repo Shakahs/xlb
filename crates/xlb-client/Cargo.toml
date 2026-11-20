@@ -9,6 +9,7 @@ description = "Client for the xlb daemon's Unix control socket: framing, protoco
 publish = false
 
 [dependencies]
+xlb-core = { path = "../xlb-core", version = "0.8.51" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util"] }

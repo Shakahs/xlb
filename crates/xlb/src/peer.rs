@@ -21,17 +21,8 @@
 //!
 //! ## Fetching
 //!
-//! This module provides the two peer operations of a fetch (see
-//! [`crate::swarm`]): [`BitfieldWatch`] follows the bitfield a peer holds of
-//! a blob through the iroh-blobs observe request, and
-//! [`PeerTransport::fetch_ranges`] sends one ranged request to the iroh-blobs
-//! [`Downloader`], which tries the given peers in order and falls over to
-//! the next when one fails or does not have the data.
-//!
-//! `SplitStrategy::Split` is not used: in iroh-blobs 0.103 it splits a hash
-//! sequence into its children and, for a single blob, downloads the whole
-//! blob from one provider before failing any size that is not a multiple of
-//! 32 (`split_request` in `api/downloader.rs`).
+//! [`PeerTransport::fetch_ranges`] sends cancellable iroh-blobs range
+//! requests to providers advertised by smol-kv and skips recent failures.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -44,17 +35,17 @@ use futures::StreamExt;
 pub use iroh::RelayUrl;
 use iroh::{
     address_lookup::memory::MemoryLookup,
-    endpoint::{presets, Connection, VarInt},
+    endpoint::{presets, Connection, QuicTransportConfig, VarInt},
     protocol::{AcceptError, ProtocolHandler, Router},
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
 };
 use iroh_blobs::{
     api::{
-        downloader::{DownloadOptions, DownloadProgressItem, Downloader, SplitStrategy},
-        proto::Bitfield,
+        remote::GetProgressItem,
         Store,
     },
-    protocol::{ChunkRanges, GetRequest, ObserveRequest},
+    protocol::{ChunkRanges, GetRequest},
+    get::StreamPair,
     provider::events::{
         AbortReason, ConnectMode, EventMask, EventSender, ObserveMode,
         ProviderMessage, RequestMode, ThrottleMode,
@@ -62,6 +53,11 @@ use iroh_blobs::{
     util::connection_pool::ConnectionPool,
     BlobsProtocol, Hash as IrohHash,
 };
+use rand::seq::SliceRandom;
+use tokio::time::Instant;
+
+use crate::{NodeTopology, discovery::{Discovery, ProviderEvent, is_fresh}, rate::RequestRate, store::BlobStore, stream_bytes::QuicBytes};
+use xlb_core::image::IMAGE_CHUNK_BYTES;
 
 /// The node ID of an xlb node: the public key of its iroh endpoint.
 pub type NodeId = EndpointId;
@@ -77,6 +73,51 @@ pub const DEFAULT_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default time a segment may see no progress on any peer before a fetcher
 /// other than its assigned origin reader reads it from the origin.
 pub const DEFAULT_PEER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const PEER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_EXCLUSION: Duration = Duration::from_secs(60);
+// At 100 ms RTT, 64 MiB covers a 5 Gbit/s bandwidth-delay product.
+const PEER_CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderChoice {
+    pub(crate) node: NodeId,
+    pub(crate) same_location: bool,
+    pub(crate) timestamp: u64,
+}
+
+#[derive(Default)]
+struct FailedPeers(Mutex<HashMap<NodeId, Instant>>);
+
+impl FailedPeers {
+    fn insert(&self, node: NodeId, now: Instant) {
+        let mut peers = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        peers.retain(|_, until| *until > now);
+        peers.insert(node, now + PEER_EXCLUSION);
+    }
+
+    fn contains(&self, node: &NodeId, now: Instant) -> bool {
+        self.0.lock().unwrap_or_else(|err| err.into_inner())
+            .get(node).is_some_and(|until| *until > now)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    // [utest -> dsn~xlb-chunk-discovery~1]
+    #[test]
+    fn a_failure_excludes_only_that_holder_for_sixty_seconds() {
+        let failures = FailedPeers::default();
+        let failed = SecretKey::generate().public();
+        let healthy = SecretKey::generate().public();
+        let now = Instant::now();
+        failures.insert(failed, now);
+        assert!(failures.contains(&failed, now + Duration::from_secs(59)));
+        assert!(!failures.contains(&failed, now + Duration::from_secs(60)));
+        assert!(!failures.contains(&healthy, now));
+    }
+}
 
 /// One member of the peer set: a node this node reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,9 +271,7 @@ pub struct PeerConfig {
     pub concurrency: usize,
     /// Time allowed for connecting to one peer before the next is tried.
     pub connect_timeout: Duration,
-    /// How long a segment that no peer holds may see no progress on any peer
-    /// before this node reads it from the origin although another fetcher is
-    /// its assigned origin reader.
+    /// How long an active peer-only load waits for a replacement supplier.
     pub stall_timeout: Duration,
 }
 
@@ -278,58 +317,6 @@ fn direct_path_pool(connect_timeout: Duration) -> PoolOptions {
 type PeerSet = Arc<RwLock<BTreeMap<EndpointId, PeerAddr>>>;
 type AdmitSet = Arc<RwLock<BTreeSet<EndpointId>>>;
 
-/// Follows the bitfields peers hold of a blob.
-#[derive(Clone)]
-pub(crate) struct BitfieldWatch {
-    pool: ConnectionPool,
-    store: Store,
-}
-
-impl BitfieldWatch {
-    /// Observe `hash` on `node` until the peer or the connection ends the
-    /// stream, and return why it ended.
-    ///
-    /// The peer answers an observe request with the bitfield it holds now,
-    /// which is empty for a blob it does not have, and then with every
-    /// growth of it. `report` receives the accumulated bitfield and the
-    /// ranges the latest answer added.
-    // [impl -> dsn~xlb-swarm-fetch~1]
-    pub(crate) async fn follow(
-        &self,
-        node: NodeId,
-        hash: IrohHash,
-        mut report: impl FnMut(&Bitfield, &ChunkRanges),
-    ) -> String {
-        // The pool keeps the connection open while this reference lives.
-        let connection = match self.pool.get_or_connect(node).await {
-            Ok(connection) => connection,
-            Err(e) => return format!("connecting: {e}"),
-        };
-        // A pooled connection may have lost its direct path since it was
-        // handed out last.
-        if connection_verdict(&connection) != PathVerdict::Direct {
-            return "the connection has no direct path".into();
-        }
-        let answers = self
-            .store
-            .remote()
-            .observe(Connection::clone(&connection), ObserveRequest::new(hash));
-        let mut answers = std::pin::pin!(answers);
-        let mut held = Bitfield::empty();
-        while let Some(answer) = answers.next().await {
-            match answer {
-                Ok(added) => {
-                    // Later answers carry only the added ranges.
-                    let _ = held.update(&added);
-                    report(&held, &added.ranges);
-                }
-                Err(e) => return format!("observing: {e}"),
-            }
-        }
-        "the observe stream ended".into()
-    }
-}
-
 pub(crate) struct PeerTransport {
     config: PeerConfig,
     endpoint: Endpoint,
@@ -339,20 +326,28 @@ pub(crate) struct PeerTransport {
     peers: PeerSet,
     /// The nodes this node serves.
     admitted: AdmitSet,
-    downloader: Downloader,
-    watch: BitfieldWatch,
+    failed: FailedPeers,
+    pool: ConnectionPool,
+    store: Store,
+    discovery: Discovery,
 }
 
 impl PeerTransport {
     /// Bind the endpoint and start serving `store` to the (empty) admit set.
     // [impl -> dsn~xlb-fork~1]
-    pub(crate) async fn bind(config: PeerConfig, store: &Store) -> Result<Self, String> {
+    pub(crate) async fn bind(config: PeerConfig, blob_store: &BlobStore) -> Result<Self, String> {
+        let store = blob_store.api();
         let lookup = MemoryLookup::new();
         // The only IP transport is the configured address, so the UDP port
         // is the configured one. The in-memory lookup is the only address
         // lookup service. Relays, when enabled, serve address discovery and
         // hole punching; requests are sent and served on direct paths only.
         let endpoint = Endpoint::builder(presets::Minimal)
+            .transport_config(QuicTransportConfig::builder()
+                .stream_receive_window(VarInt::from_u32(IMAGE_CHUNK_BYTES as u32))
+                .receive_window(VarInt::from_u32(PEER_CONNECTION_WINDOW))
+                .send_window(u64::from(PEER_CONNECTION_WINDOW))
+                .build())
             .secret_key(SecretKey::generate())
             .clear_ip_transports()
             .bind_addr(config.bind_addr)
@@ -386,18 +381,13 @@ impl PeerTransport {
             blobs: BlobsProtocol::new(store, Some(events)),
             served,
         };
+        let gossip = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
+            .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
-
-        let pool = direct_path_pool(config.connect_timeout);
-        let downloader = Downloader::new_with_opts(store, &endpoint, pool.clone());
-        // The downloader keeps its connection pool to itself, so observe
-        // requests travel on connections of a second pool.
-        let watch = BitfieldWatch {
-            pool: ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, pool),
-            store: store.clone(),
-        };
+        let discovery = Discovery::join(&gossip, endpoint.clone(), blob_store.live_set()).await?;
+        let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, direct_path_pool(config.connect_timeout));
 
         Ok(Self {
             config,
@@ -406,8 +396,10 @@ impl PeerTransport {
             lookup,
             peers,
             admitted,
-            downloader,
-            watch,
+            failed: FailedPeers::default(),
+            pool,
+            store: store.clone(),
+            discovery,
         })
     }
 
@@ -419,19 +411,43 @@ impl PeerTransport {
         &self.config
     }
 
-    pub(crate) fn bitfield_watch(&self) -> BitfieldWatch {
-        self.watch.clone()
+    pub(crate) async fn announce(&self, hash: IrohHash) {
+        self.discovery.announce(hash).await;
+    }
+
+    pub(crate) fn set_node_topology(&self, topology: Option<NodeTopology>) {
+        self.discovery.set_node_topology(topology);
+    }
+
+    pub(crate) fn providers(&self, hash: IrohHash) -> impl futures::Stream<Item = ProviderEvent> + Send + 'static {
+        self.discovery.providers(hash)
+    }
+
+    pub(crate) fn learn_provider(&self, address: &EndpointAddr) -> bool {
+        let peers = self.read_peers();
+        if !peers.contains_key(&address.id) {
+            return false;
+        }
+        self.lookup.add_endpoint_info(address.clone());
+        true
+    }
+
+    pub(crate) fn is_eligible(&self, node: &NodeId) -> bool {
+        self.read_peers().contains_key(node) && !self.failed.contains(node, Instant::now())
+    }
+
+    pub(crate) fn has_sources(&self) -> bool {
+        !self.read_peers().is_empty()
+    }
+
+    pub(crate) fn shares_location(&self, location: &str) -> bool {
+        self.discovery.shares_location(location)
     }
 
     /// The relay this endpoint is reachable through, once it has connected
     /// to one. Always `None` with relays disabled.
     pub(crate) fn relay_url(&self) -> Option<RelayUrl> {
         self.endpoint.addr().relay_urls().next().cloned()
-    }
-
-    /// The node IDs of the current peer set.
-    pub(crate) fn peer_ids(&self) -> Vec<NodeId> {
-        self.read_peers().keys().copied().collect()
     }
 
     /// The UDP addresses the endpoint is bound to.
@@ -463,58 +479,99 @@ impl PeerTransport {
             .filter(|peer| peer.node_id != own)
             .map(|peer| (peer.node_id, peer))
             .collect();
-        {
+        let bootstrap = {
             let mut current = self.peers.write().unwrap_or_else(|e| e.into_inner());
             for gone in current.keys().filter(|id| !next.contains_key(*id)) {
                 self.lookup.remove_endpoint_info(*gone);
             }
+            let mut bootstrap = Vec::new();
             for (id, peer) in &next {
+                if current.get(id) == Some(peer) {
+                    continue;
+                }
                 let relay = peer.relay_url.iter().cloned().map(TransportAddr::Relay);
                 let direct = peer.addrs.iter().copied().map(TransportAddr::Ip);
                 self.lookup
                     .set_endpoint_info(EndpointAddr::from_parts(*id, relay.chain(direct)));
+                bootstrap.push(*id);
             }
             *current = next;
-        }
+            bootstrap
+        };
         let admit: BTreeSet<EndpointId> = admit.into_iter().filter(|id| *id != own).collect();
         *self.admitted.write().unwrap_or_else(|e| e.into_inner()) = admit;
+        self.discovery.bootstrap(bootstrap);
     }
 
-    /// Read `ranges` of `hash` into the store through the downloader, trying
-    /// `providers` in order. Ranges the store already holds are not
-    /// requested. `on_bytes` receives the cumulative bytes of the request.
+    /// Request the missing verified ranges from one eligible provider at a time.
+    // [impl -> dsn~xlb-chunk-discovery~1]
     pub(crate) async fn fetch_ranges(
         &self,
         hash: IrohHash,
         ranges: ChunkRanges,
-        providers: Vec<NodeId>,
+        mut providers: Vec<ProviderChoice>,
+        rate: &RequestRate,
         mut on_bytes: impl FnMut(u64),
     ) -> Result<(), PeerError> {
-        let request = GetRequest::blob_ranges(hash, ranges);
-        let options = DownloadOptions::new(request, providers, SplitStrategy::None);
-        let mut items = self
-            .downloader
-            .download_with_opts(options)
-            .stream()
-            .await
-            .map_err(|e| PeerError::Download(e.to_string()))?;
-        while let Some(item) = items.next().await {
-            match item {
-                DownloadProgressItem::Progress(bytes) => on_bytes(bytes),
-                DownloadProgressItem::Error(e) => return Err(PeerError::Download(e.to_string())),
-                DownloadProgressItem::DownloadError => {
-                    return Err(PeerError::Download("download failed".into()))
-                }
-                DownloadProgressItem::TryProvider { .. }
-                | DownloadProgressItem::ProviderFailed { .. }
-                | DownloadProgressItem::PartComplete { .. } => {}
+        providers.shuffle(&mut rand::rng());
+        providers.sort_by_key(|provider| !provider.same_location);
+        let request = Arc::new(GetRequest::blob_ranges(hash, ranges));
+        let remote = self.store.remote();
+        let mut received = 0;
+        for ProviderChoice { node: provider, timestamp, .. } in providers {
+            if !is_fresh(timestamp) || !self.is_eligible(&provider) {
+                continue;
             }
+            let local = remote.local_for_request(request.clone()).await
+                .map_err(|err| PeerError::Download(err.to_string()))?;
+            if local.is_complete() {
+                return Ok(());
+            }
+            rate.start().await;
+            if !is_fresh(timestamp) || !self.is_eligible(&provider) {
+                continue;
+            }
+            let initial = received;
+            let attempt = async {
+                let connection = self.pool.get_or_connect(provider).await
+                    .map_err(|err| err.to_string())?;
+                if connection_verdict(&connection) != PathVerdict::Direct {
+                    return Err("the connection has no direct path".into());
+                }
+                let (send, recv) = connection.open_bi().await.map_err(|err| err.to_string())?;
+                let stream = StreamPair::new(connection.stable_id() as u64, QuicBytes(recv), send);
+                let items = remote.execute_get(stream, local.missing()).stream();
+                tokio::pin!(items);
+                while let Some(item) = items.next().await {
+                    match item {
+                        GetProgressItem::Progress(bytes) => {
+                            received = initial + bytes;
+                            on_bytes(received);
+                        }
+                        GetProgressItem::Done(stats) => {
+                            received = initial + stats.payload_bytes_read;
+                            on_bytes(received);
+                            return Ok(());
+                        }
+                        GetProgressItem::Error(err) => return Err(err.to_string()),
+                    }
+                }
+                Err("transfer ended without a result".into())
+            };
+            let failure = match tokio::time::timeout(PEER_ATTEMPT_TIMEOUT, attempt).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(err)) => err,
+                Err(_) => "transfer attempt timed out".into(),
+            };
+            self.failed.insert(provider, Instant::now());
+            tracing::debug!(%provider, %hash, %failure, "excluding failed XLB provider");
         }
-        Ok(())
+        Err(PeerError::Download("no eligible provider completed the range".into()))
     }
 
     /// Stop accepting, shut the store down and close the endpoint.
     pub(crate) async fn shutdown(&self) {
+        self.discovery.shutdown().await;
         if let Err(e) = self.router.shutdown().await {
             tracing::warn!("peer transport shutdown: {e}");
         }

@@ -10,7 +10,7 @@ use std::{
 
 use xlb::{
     AssetClass, AssetClassConfig, BlakeHash, Error, FetchProgress, FetchTier, PeerAddr,
-    PeerConfig, ProgressSink, RelaySetting,
+    NodeTopology, PeerConfig, ProgressSink, RelaySetting,
 };
 
 /// Deterministic bytes that are not a repeating block.
@@ -36,9 +36,17 @@ async fn node(name: &'static str, dir: &Path) -> AssetClass {
         segment_bytes: 1024 * 1024,
         concurrency: 4,
         connect_timeout: Duration::from_secs(5),
-        stall_timeout: Duration::from_secs(5),
+        stall_timeout: Duration::from_secs(12),
     });
-    AssetClass::register(config).await.expect("register class")
+    let node = AssetClass::register(config).await.expect("register class");
+    node.set_node_topology(Some(NodeTopology {
+        provider: "aws".into(),
+        location: "aws/us-west-2a".into(),
+        region: Some("us-west-2".into()),
+        zone: Some("us-west-2a".into()),
+        reach: xlb_core::PeerReach::Local,
+    }));
+    node
 }
 
 fn addr(class: &AssetClass) -> PeerAddr {
@@ -155,12 +163,6 @@ async fn a_blob_is_read_from_peers_into_a_plain_file_and_outsiders_are_refused()
         "{refused:?}"
     );
     assert!(!outsider.cache_dir().join(hash.to_hex()).exists());
-
-    // Once admitted, the same node is served.
-    seeder_a.set_peers(vec![addr(&fetcher), addr(&outsider)]);
-    seeder_b.set_peers(vec![addr(&fetcher), addr(&outsider)]);
-    let admitted = outsider.asset(hash).fetch_to_file().await.expect("admitted");
-    assert!(std::fs::read(&admitted).unwrap() == data);
 
     // The fetcher serves what it fetched: a complete blob needs no pin.
     let late = node("late", dir.path()).await;

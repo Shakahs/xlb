@@ -1,5 +1,27 @@
+load("@bazel_lib//lib:transitions.bzl", "platform_transition_filegroup")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//third_party/glibc:static_link.bzl", "STATIC_GLIBC_FLAGS", "STATIC_GLIBC_PLATFORM", "STATIC_GLIBC_RUNTIME")
+
+XLB_DEPS = [
+        "//vendor/xlb/crates/xlb",
+        "//vendor/xlb/crates/xlb-client:xlb_client",
+        "//vendor/xlb/crates/xlb-core:xlb_core",
+        "@scheduler_crates//:anyhow",
+        "@scheduler_crates//:axum",
+        "@scheduler_crates//:bytes",
+        "@scheduler_crates//:futures",
+        "@scheduler_crates//:libc",
+        "@scheduler_crates//:rand",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:serde_json",
+        "@scheduler_crates//:tokio",
+        "@scheduler_crates//:tokio-util",
+        "@scheduler_crates//:tokio-uring",
+        "@scheduler_crates//:tower",
+        "@scheduler_crates//:tracing",
+        "@scheduler_crates//:tracing-subscriber",
+]
 
 # The node daemon and its command-line client.
 rust_binary(
@@ -8,17 +30,24 @@ rust_binary(
     crate_name = "xlb_cli",
     edition = "2021",
     visibility = ["//visibility:public"],
-    deps = [
-        "//vendor/xlb/crates/xlb",
-        "//vendor/xlb/crates/xlb-client:xlb_client",
-        "@scheduler_crates//:anyhow",
-        "@scheduler_crates//:libc",
-        "@scheduler_crates//:serde",
-        "@scheduler_crates//:serde_json",
-        "@scheduler_crates//:tokio",
-        "@scheduler_crates//:tracing",
-        "@scheduler_crates//:tracing-subscriber",
-    ],
+    deps = XLB_DEPS,
+)
+
+rust_binary(
+    name = "xlb_extension_binary",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = [STATIC_GLIBC_RUNTIME],
+    crate_name = "xlb_cli",
+    edition = "2021",
+    rustc_flags = STATIC_GLIBC_FLAGS,
+    deps = XLB_DEPS,
+)
+
+platform_transition_filegroup(
+    name = "xlb_talos",
+    srcs = [":xlb_extension_binary"],
+    target_platform = STATIC_GLIBC_PLATFORM,
+    visibility = ["//infra/talosimage:__pkg__", "//scheduler:__pkg__"],
 )
 
 rust_test(

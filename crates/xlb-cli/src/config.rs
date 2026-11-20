@@ -61,6 +61,16 @@ pub struct NodeSettings {
     /// NDJSON file that receives one row per fetch. Absent = no file.
     #[serde(default)]
     pub metrics_path: Option<String>,
+    /// Serve the local OCI pull endpoint from this class's S3 origin.
+    #[serde(default)]
+    pub image_mirror_class: Option<String>,
+    /// Maximum active OCI chunk downloads across pulls on this node.
+    #[serde(default = "default_chunk_concurrency")]
+    pub chunk_concurrency: std::num::NonZeroUsize,
+}
+
+fn default_chunk_concurrency() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(32).unwrap()
 }
 
 fn default_socket_mode() -> String {
@@ -359,6 +369,7 @@ mod tests {
         assert_eq!(cfg.node.socket_mode().unwrap(), 0o666);
         assert_eq!(cfg.node.peer_class, "unknown");
         assert!(cfg.node.metrics_path.is_none());
+        assert_eq!(cfg.node.chunk_concurrency.get(), 32);
 
         let class = &cfg.classes[0];
         let peer = class.peer_config().unwrap().expect("peer tier on by default");

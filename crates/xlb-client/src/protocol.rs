@@ -9,6 +9,7 @@
 //! - `subscribe_events`, answered by `event` frames until the client hangs up.
 
 use serde::{Deserialize, Serialize};
+use xlb_core::NodeTopology;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -37,6 +38,9 @@ pub enum Command {
         /// when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         class: Option<String>,
+        /// Topology the selected node publishes to the peer directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topology: Option<NodeTopology>,
     },
     /// Declare (or replace) pinned tree `name` and seed its bytes from
     /// `from_dirs`. With no `hashes`, the tree covers every hash-named file
@@ -298,6 +302,7 @@ mod tests {
             }],
             admit: None,
             class: None,
+            topology: None,
         };
         let json = r#"{"cmd":"set_peers","peers":[{"node_id":"aa","addrs":["10.0.0.1:4433"]}]}"#;
         assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
@@ -306,7 +311,7 @@ mod tests {
 
     // [utest -> dsn~xlb-peer-reach~1]
     #[test]
-    fn set_peers_carries_the_admitted_node_ids_and_a_peer_its_relay_and_addresses() {
+    fn set_peers_carries_peer_addresses_admission_and_node_topology() {
         let cmd = Command::SetPeers {
             peers: vec![Peer {
                 node_id: "aa".into(),
@@ -315,8 +320,15 @@ mod tests {
             }],
             admit: Some(vec!["bb".into()]),
             class: None,
+            topology: Some(NodeTopology {
+                provider: "nebius".into(),
+                location: "nebius/eu-north1".into(),
+                region: Some("eu-north1".into()),
+                zone: None,
+                reach: xlb_core::PeerReach::Global,
+            }),
         };
-        let json = r#"{"cmd":"set_peers","peers":[{"node_id":"aa","addrs":["10.0.0.1:4433","203.0.113.7:4433"],"relay_url":"https://relay.example./"}],"admit":["bb"]}"#;
+        let json = r#"{"cmd":"set_peers","peers":[{"node_id":"aa","addrs":["10.0.0.1:4433","203.0.113.7:4433"],"relay_url":"https://relay.example./"}],"admit":["bb"],"topology":{"provider":"nebius","location":"nebius/eu-north1","region":"eu-north1","reach":"global"}}"#;
         assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
         assert_eq!(serde_json::from_str::<Command>(json).unwrap(), cmd);
     }

@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::{
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -11,6 +12,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::watch,
 };
 use xlb::{
     sigv4::{self, SigningInput},
@@ -65,6 +67,8 @@ pub struct RangeBehavior {
     /// Never answer a range that starts at or after this offset, except the
     /// one that ends at the end of the object.
     pub hang_from: Option<u64>,
+    /// Once, drop a ranged response after writing a prefix of its body.
+    pub disconnect_once: Option<(u64, usize)>,
 }
 
 struct Served {
@@ -74,6 +78,8 @@ struct Served {
     body: Vec<u8>,
     outboard: Vec<u8>,
     behavior: RangeBehavior,
+    disconnected: AtomicBool,
+    ranges_paused: watch::Sender<bool>,
     seen: Mutex<Vec<Seen>>,
 }
 
@@ -100,6 +106,8 @@ impl OriginServer {
             outboard: outboard_of(&body),
             body,
             behavior,
+            disconnected: AtomicBool::new(false),
+            ranges_paused: watch::Sender::new(false),
             seen: Mutex::default(),
         });
         let accepting = served.clone();
@@ -119,6 +127,11 @@ impl OriginServer {
 
     pub fn seen(&self) -> Vec<Seen> {
         self.served.seen.lock().unwrap().clone()
+    }
+
+    /// Pause data ranges while still serving the final range used to prove size.
+    pub fn pause_object_ranges(&self, paused: bool) {
+        self.served.ranges_paused.send_replace(paused);
     }
 
     /// The byte ranges of the object requested so far, sorted.
@@ -233,6 +246,10 @@ async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
                     if served.behavior.hang_from.is_some_and(|from| start >= from) && !last {
                         std::future::pending::<()>().await;
                     }
+                    if !last {
+                        let mut ranges_paused = served.ranges_paused.subscribe();
+                        let _ = ranges_paused.wait_for(|paused| !paused).await;
+                    }
                     tokio::time::sleep(served.behavior.delay).await;
                     (
                         "206 Partial Content",
@@ -254,9 +271,18 @@ async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
             ""
         };
         let response = format!("HTTP/1.1 {status}\r\n{headers}{content_length}\r\n");
-        if stream.write_all(response.as_bytes()).await.is_err()
-            || stream.write_all(payload).await.is_err()
-        {
+        if stream.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+        let interrupted = served.behavior.disconnect_once.filter(|&(broken, _)| {
+            status == "206 Partial Content" && range.is_some_and(|(start, _)| start == broken)
+                && !served.disconnected.swap(true, Ordering::Relaxed)
+        });
+        if let Some((_, prefix_len)) = interrupted {
+            let _ = stream.write_all(&payload[..prefix_len.min(payload.len())]).await;
+            return;
+        }
+        if stream.write_all(payload).await.is_err() {
             return;
         }
     }

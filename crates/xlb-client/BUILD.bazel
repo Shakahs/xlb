@@ -9,6 +9,7 @@ rust_library(
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "//vendor/xlb/crates/xlb-core:xlb_core",
         "@scheduler_crates//:serde",
         "@scheduler_crates//:serde_json",
         "@scheduler_crates//:tokio",

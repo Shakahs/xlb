@@ -39,6 +39,7 @@ pub async fn set_peers(socket_path: &str, class: Option<&str>, peers: &[&str]) -
         peers: peers.iter().map(|p| parse_peer(p)).collect::<Result<_>>()?,
         admit: None,
         class: class.map(str::to_string),
+        topology: None,
     };
     match Client::connect(socket_path)
         .await?

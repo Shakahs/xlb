@@ -1,7 +1,9 @@
 //! `xlb` — run a node daemon, or talk to one over its control socket.
 
 mod config;
+mod disk_chunks;
 mod fetch_cmd;
+mod image_mirror;
 mod inspect;
 mod metrics_sink;
 mod pin_cmd;
@@ -69,21 +71,29 @@ fn default_socket() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = parse_args(std::env::args().skip(1))?;
+    let words: Vec<&str> = args.positional.iter().map(String::as_str).collect();
+    let daemon = words == ["serve"];
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(move || {
+            use tracing_subscriber::fmt::writer::EitherWriter;
+            if daemon {
+                EitherWriter::A(std::io::stdout())
+            } else {
+                EitherWriter::B(std::io::stderr())
+            }
+        })
         .init();
 
-    let args = parse_args(std::env::args().skip(1))?;
-    let words: Vec<&str> = args.positional.iter().map(String::as_str).collect();
     if args.help || words.is_empty() {
         print!("{USAGE}");
         return Ok(());
     }
-    if words == ["serve"] {
+    if daemon {
         let config = args.config.as_deref().unwrap_or("xlb-node.json");
         return serve::run(config, args.socket.as_deref()).await;
     }

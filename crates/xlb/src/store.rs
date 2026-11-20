@@ -67,6 +67,10 @@ impl LiveSet {
         live.extend(in_flight.keys().map(to_iroh));
         ProtectOutcome::Continue
     }
+
+    pub(crate) fn complete_hashes(&self) -> impl Iterator<Item = IrohHash> {
+        self.cache.hashes().into_iter().map(|hash| to_iroh(&hash))
+    }
 }
 
 /// Keeps a hash in the live set while a transfer for it is in flight.
@@ -111,6 +115,7 @@ impl BlobStore {
         cache_dir: &Path,
         cache: Arc<Cache>,
         gc_interval: Duration,
+        range_concurrency: usize,
     ) -> Result<Self, String> {
         let root = cache_dir.join(STORE_DIR);
         let live = Arc::new(LiveSet {
@@ -119,6 +124,7 @@ impl BlobStore {
             in_flight: Mutex::new(HashMap::new()),
         });
         let mut options = Options::new(&root);
+        options.entity_inbox_size = options.entity_inbox_size.saturating_add(range_concurrency);
         let protect = live.clone();
         options.gc = Some(GcConfig {
             interval: gc_interval,
@@ -139,6 +145,10 @@ impl BlobStore {
 
     pub(crate) fn api(&self) -> &iroh_blobs::api::Store {
         &self.store
+    }
+
+    pub(crate) fn live_set(&self) -> Arc<LiveSet> {
+        self.live.clone()
     }
 
     /// Allow garbage collection: the cache index now names every blob to keep.

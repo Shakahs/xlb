@@ -31,6 +31,7 @@ pub use protocol::{
     ClassInfo, ClassStats, ClassTotals, Command, FetchMetric, FetchProgress, FetchRecord,
     FetchResult, NodeEvent, NodeInfo, Peer, Response, SeedSummary, Tier, TreeInfo,
 };
+pub use xlb_core::NodeTopology;
 
 /// Largest frame either side accepts.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -154,7 +155,7 @@ impl Client {
     /// Replace the peer set of every class with a peer tier. Returns how
     /// many classes took it.
     pub async fn set_peers(&mut self, peers: Vec<Peer>) -> Result<u64, ClientError> {
-        self.replace_peer_sets(peers, None).await
+        self.replace_peer_sets(peers, None, None).await
     }
 
     /// Replace, on every class with a peer tier, the nodes the daemon reads
@@ -165,18 +166,30 @@ impl Client {
         peers: Vec<Peer>,
         admit: Vec<String>,
     ) -> Result<u64, ClientError> {
-        self.replace_peer_sets(peers, Some(admit)).await
+        self.replace_peer_sets(peers, Some(admit), None).await
+    }
+
+    /// Replace the peer sets and publish the daemon's configured topology.
+    pub async fn configure_peers(
+        &mut self,
+        peers: Vec<Peer>,
+        admit: Vec<String>,
+        topology: NodeTopology,
+    ) -> Result<u64, ClientError> {
+        self.replace_peer_sets(peers, Some(admit), Some(topology)).await
     }
 
     async fn replace_peer_sets(
         &mut self,
         peers: Vec<Peer>,
         admit: Option<Vec<String>>,
+        topology: Option<NodeTopology>,
     ) -> Result<u64, ClientError> {
         let command = Command::SetPeers {
             peers,
             admit,
             class: None,
+            topology,
         };
         match self.roundtrip(&command).await? {
             Response::PeersSet { classes } => Ok(classes),

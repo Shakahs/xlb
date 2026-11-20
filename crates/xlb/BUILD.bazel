@@ -15,13 +15,18 @@ rust_library(
         "@scheduler_crates//:hex",
         "@scheduler_crates//:iroh",
         "@scheduler_crates//:iroh-blobs",
+        "@scheduler_crates//:iroh-gossip",
+        "@scheduler_crates//:iroh-smol-kv",
         "@scheduler_crates//:libc",
+        "@scheduler_crates//:rand",
         "@scheduler_crates//:reqwest",
         "@scheduler_crates//:serde",
         "@scheduler_crates//:serde_json",
         "@scheduler_crates//:sha2",
         "@scheduler_crates//:thiserror",
         "@scheduler_crates//:tokio",
+        "@scheduler_crates//:tokio-util",
+        "@scheduler_crates//:tower",
         "@scheduler_crates//:tracing",
     ],
 )
@@ -29,6 +34,7 @@ rust_library(
 rust_test(
     name = "xlb_tests",
     crate = ":xlb",
+    compile_data = ["tests/origin_server/mod.rs"],
     edition = "2021",
     deps = ["@scheduler_crates//:tempfile"],
 )
@@ -41,6 +47,7 @@ rust_test(
     edition = "2021",
     deps = [
         ":xlb",
+        "//vendor/xlb/crates/xlb-core:xlb_core",
         "@scheduler_crates//:tempfile",
         "@scheduler_crates//:tokio",
     ],
@@ -76,6 +83,7 @@ rust_test(
     edition = "2021",
     deps = [
         ":xlb",
+        "//vendor/xlb/crates/xlb-core:xlb_core",
         "@scheduler_crates//:bao-tree",
         "@scheduler_crates//:tempfile",
         "@scheduler_crates//:tokio",

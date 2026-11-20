@@ -14,7 +14,7 @@ use tokio::{
 use xlb::{AssetClass, BlakeHash, FetchTier, NodeId, PeerAddr, ProgressSink};
 use xlb_client::{
     read_frame, write_frame, ClassInfo, ClassStats, Command, FetchProgress, FetchRecord,
-    FetchResult, NodeEvent, NodeInfo, Peer, Response, SeedSummary, Tier, TreeInfo,
+    FetchResult, NodeEvent, NodeInfo, NodeTopology, Peer, Response, SeedSummary, Tier, TreeInfo,
 };
 
 /// How often a running fetch reports progress to its client. Progress is a
@@ -82,6 +82,12 @@ fn class_info(entry: &ClassEntry) -> ClassInfo {
 
 /// Bind the control socket with `mode` and serve it until the task is dropped.
 pub async fn listen(state: NodeState, socket_path: &str, mode: u32) -> Result<()> {
+    if let Some(directory) = std::path::Path::new(socket_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(directory).await?;
+    }
     match std::fs::remove_file(socket_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -181,8 +187,9 @@ async fn handle_conn(state: NodeState, mut stream: UnixStream, owner_only: bool)
                 peers,
                 admit,
                 class,
+                topology,
             } => {
-                let resp = set_peers(&state, &peers, admit.as_deref(), class.as_deref());
+                let resp = set_peers(&state, &peers, admit.as_deref(), class.as_deref(), topology.as_ref());
                 write_frame(&mut writer, &resp).await?;
             }
 
@@ -360,6 +367,7 @@ fn set_peers(
     peers: &[Peer],
     admit: Option<&[String]>,
     class: Option<&str>,
+    topology: Option<&NodeTopology>,
 ) -> Response {
     let node_id = |text: &String| -> Result<NodeId, String> {
         text.parse().map_err(|e| format!("node_id {text:?}: {e}"))
@@ -406,6 +414,7 @@ fn set_peers(
         let selected = class.is_none_or(|name| name == entry.name);
         if selected && entry.class.node_id().is_some() {
             entry.class.set_peer_sets(parsed.clone(), admitted.clone());
+            entry.class.set_node_topology(topology.cloned());
             classes += 1;
         }
     }

@@ -5,7 +5,7 @@ mod origin_server;
 
 use std::{path::Path, time::Duration};
 
-use origin_server::{test_data, OriginServer};
+use origin_server::{test_data, OriginServer, RangeBehavior};
 use xlb::{AssetClass, AssetClassConfig, BlakeHash, Error, FetchTier, OriginConfig};
 
 const RANGE_BYTES: u64 = 256 * 1024;
@@ -19,6 +19,57 @@ async fn class(dir: &Path, origin: OriginConfig, budget: u64) -> AssetClass {
 }
 
 const BUDGET: u64 = 64 * 1024 * 1024;
+
+// [utest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test(flavor = "multi_thread")]
+async fn one_blob_sustains_configured_origin_concurrency_without_overfilling_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let concurrency = 32;
+    let data = test_data(48 * RANGE_BYTES as usize + 17);
+    let hash = BlakeHash::hash(&data);
+    let server = OriginServer::start(hash, data.clone()).await;
+    let class = class(dir.path(), server.config(RANGE_BYTES, concurrency), BUDGET).await;
+    server.pause_object_ranges(true);
+
+    let asset = class.asset(hash);
+    let fetch = tokio::spawn(async move { asset.fetch_to_file().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.object_ranges().len() <= concurrency && !fetch.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("origin window opened");
+    assert!(!fetch.is_finished(), "the fetch must survive a full origin window");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.object_ranges().len(), concurrency + 1, "one completed size probe and the active ranges");
+
+    server.pause_object_ranges(false);
+    let path = fetch.await.unwrap().expect("all ranges become available");
+    assert_eq!(std::fs::read(path).unwrap(), data);
+    assert_eq!(class.s3_request_stats().unwrap().peak_ranges, concurrency);
+    class.shutdown().await;
+}
+
+// [utest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_s3_body_restarts_at_the_first_unverified_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = test_data(2 * RANGE_BYTES as usize + 17);
+    let hash = BlakeHash::hash(&data);
+    let prefix = 64 * 1024;
+    let behavior = RangeBehavior { disconnect_once: Some((0, prefix)), ..RangeBehavior::default() };
+    let server = OriginServer::start_with(hash, data.clone(), behavior).await;
+    let class = class(dir.path(), server.config(RANGE_BYTES, 4), BUDGET).await;
+    let (result, report) = class.asset(hash).fetch_to_file_reported(None).await;
+    assert_eq!(std::fs::read(result.expect("resume the interrupted range")).unwrap(), data);
+    assert_eq!(report.origin_bytes, data.len() as u64);
+    assert_eq!(server.object_ranges(), [
+        (0, RANGE_BYTES),
+        (prefix as u64, RANGE_BYTES),
+        (RANGE_BYTES, 2 * RANGE_BYTES),
+        (2 * RANGE_BYTES, data.len() as u64),
+    ]);
+    class.shutdown().await;
+}
 
 // [utest -> dsn~xlb-fork~1]
 // [utest -> dsn~xlb-swarm-fetch~1]

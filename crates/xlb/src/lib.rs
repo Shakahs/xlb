@@ -20,23 +20,28 @@
 
 pub(crate) mod cache;
 pub mod metrics;
+mod discovery;
+#[cfg(test)]
+extern crate self as xlb;
 pub mod origin;
 pub mod peer;
 pub mod pinned;
+mod rate;
 pub mod sigv4;
 pub(crate) mod source;
 pub(crate) mod store;
+mod stream_bytes;
 pub(crate) mod swarm;
 
 pub use cache::CacheStats;
 pub use metrics::{FetchObserver, FetchReport};
-pub use origin::{OriginConfig, OriginSource};
+pub use origin::{OriginConfig, OriginSource, S3RequestEvent, S3RequestStats};
 pub use peer::{NodeId, PeerAddr, PeerConfig, RelaySetting, RelayUrl};
 pub use pinned::{PinError, PinnedTreeInfo, SeedReport};
 pub use sigv4::Credentials;
 pub use source::{FetchProgress, FetchTier, ProgressSink};
 pub use xlb_core::retention;
-pub use xlb_core::{BlakeHash, InvalidHash, RetentionIndex, RetentionPolicy};
+pub use xlb_core::{BlakeHash, InvalidHash, NodeTopology, RetentionIndex, RetentionPolicy};
 
 use std::{
     collections::HashMap,
@@ -52,7 +57,7 @@ use crate::{
     cache::Cache,
     origin::Origin,
     peer::PeerTransport,
-    store::BlobStore,
+    store::{BlobStore, to_iroh},
     swarm::{SwarmFailure, SwarmProgress, SwarmSources},
 };
 
@@ -185,7 +190,7 @@ struct ClassInner {
     observer: Option<FetchObserver>,
     cache: Arc<Cache>,
     store: BlobStore,
-    peers: Option<PeerTransport>,
+    peers: Option<Arc<PeerTransport>>,
     origin: Option<Origin>,
     trees: pinned::TreeStore,
     /// Names of the declared pinned trees.
@@ -230,18 +235,20 @@ impl AssetClass {
         }
         let cache = Arc::new(Cache::new(&cache_dir, index));
 
-        let store = BlobStore::open(&cache_dir, cache.clone(), config.gc_interval)
+        let range_concurrency = config.origin.as_ref().map(|origin| origin.concurrency)
+            .or_else(|| config.peer.as_ref().map(|peers| peers.concurrency)).unwrap_or(1);
+        let store = BlobStore::open(&cache_dir, cache.clone(), config.gc_interval, range_concurrency)
             .await
             .map_err(Error::Store)?;
         reconcile(&cache, &store).await?;
         store.mark_ready();
 
         let peers = match config.peer {
-            Some(peer) => Some(
-                PeerTransport::bind(peer, store.api())
+            Some(peer) => Some(Arc::new(
+                PeerTransport::bind(peer, &store)
                     .await
                     .map_err(Error::Config)?,
-            ),
+            )),
             None => None,
         };
         let origin = match config.origin {
@@ -276,7 +283,13 @@ impl AssetClass {
         Asset {
             class: self.clone(),
             hash,
+            indexed_size: None,
         }
+    }
+
+    /// Fetch a CAS chunk whose length is supplied by the OCI index.
+    pub fn indexed_chunk(&self, hash: BlakeHash, size: u64) -> Asset {
+        Asset { indexed_size: Some(size), ..self.asset(hash) }
     }
 
     /// The configured name of this class.
@@ -293,6 +306,17 @@ impl AssetClass {
     /// Current cache occupancy. Reads an in-memory index.
     pub fn cache_stats(&self) -> CacheStats {
         self.0.cache.stats()
+    }
+
+    /// Request overlap measured by the S3 client for this class.
+    pub fn s3_request_stats(&self) -> Option<S3RequestStats> {
+        self.0.origin.as_ref().and_then(Origin::s3_request_stats)
+    }
+
+    /// Subscribe once to request records for this S3 class. The client drops
+    /// records if the subscriber falls behind and the queue fills.
+    pub fn subscribe_s3_requests(&self, capacity: std::num::NonZeroUsize) -> Option<tokio::sync::mpsc::Receiver<S3RequestEvent>> {
+        self.0.origin.as_ref()?.subscribe_s3_requests(capacity)
     }
 
     /// Read one small whole object from the class's origin: `location` is a
@@ -319,7 +343,7 @@ impl AssetClass {
 
     /// This node's ID on the peer tier, if the class has one.
     pub fn node_id(&self) -> Option<NodeId> {
-        self.0.peers.as_ref().map(PeerTransport::node_id)
+        self.0.peers.as_deref().map(PeerTransport::node_id)
     }
 
     /// The UDP addresses the peer endpoint is bound to.
@@ -327,7 +351,7 @@ impl AssetClass {
         self.0
             .peers
             .as_ref()
-            .map(PeerTransport::bound_addrs)
+            .map(|transport| transport.bound_addrs())
             .unwrap_or_default()
     }
 
@@ -349,10 +373,17 @@ impl AssetClass {
         }
     }
 
+    /// Set the topology published by the peer endpoint in the node directory.
+    pub fn set_node_topology(&self, topology: Option<NodeTopology>) {
+        if let Some(transport) = &self.0.peers {
+            transport.set_node_topology(topology);
+        }
+    }
+
     /// The relay the peer endpoint is reachable through, once it has
     /// connected to one.
     pub fn relay_url(&self) -> Option<RelayUrl> {
-        self.0.peers.as_ref().and_then(PeerTransport::relay_url)
+        self.0.peers.as_deref().and_then(PeerTransport::relay_url)
     }
 
     /// The current peer set.
@@ -360,7 +391,7 @@ impl AssetClass {
         self.0
             .peers
             .as_ref()
-            .map(PeerTransport::peers)
+            .map(|transport| transport.peers())
             .unwrap_or_default()
     }
 
@@ -529,6 +560,9 @@ impl AssetClass {
             // The index entry keeps the blob alive from here; the import's
             // temporary tag is dropped after it.
             self.0.cache.insert(hash, size);
+            if let Some(peers) = &self.0.peers {
+                peers.announce(to_iroh(&hash)).await;
+            }
             drop(tag);
             Ok(size)
         }
@@ -546,7 +580,7 @@ impl AssetClass {
     }
 
     /// Join the transfer in flight for `hash`, or start one.
-    fn join_flight(&self, hash: BlakeHash) -> watch::Receiver<FlightState> {
+    fn join_flight(&self, hash: BlakeHash, indexed_size: Option<u64>) -> watch::Receiver<FlightState> {
         let mut flights = self.0.flights.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(flight) = flights.get(&hash) {
             // A closed channel is a transfer task that died; replace it.
@@ -559,7 +593,7 @@ impl AssetClass {
         let class = self.clone();
         tokio::spawn(async move {
             let tx: FlightSender = Arc::new(tx);
-            let outcome = class.transfer(hash, &tx).await;
+            let outcome = class.transfer(hash, indexed_size, &tx).await;
             // Unregister before publishing, so a fetch that arrives after the
             // outcome starts from the cache rather than from this flight.
             class
@@ -577,7 +611,7 @@ impl AssetClass {
     /// origin together.
     // [impl -> dsn~xlb-fork~1]
     // [impl -> dsn~xlb-swarm-fetch~1]
-    async fn transfer(&self, hash: BlakeHash, flight: &FlightSender) -> Result<Fetched> {
+    async fn transfer(&self, hash: BlakeHash, indexed_size: Option<u64>, flight: &FlightSender) -> Result<Fetched> {
         if let Some((path, size)) = self.local(&hash) {
             return Ok(Fetched::cached(path, size));
         }
@@ -600,10 +634,11 @@ impl AssetClass {
         let incoming_dir = inner.cache.dir().join(INCOMING_DIR);
         let sources = SwarmSources {
             hash,
-            store: inner.store.api(),
-            peers: inner.peers.as_ref(),
-            origin: inner.origin.as_ref(),
-            incoming_dir: &incoming_dir,
+            store: inner.store.api().clone(),
+            peers: inner.peers.clone(),
+            origin: inner.origin.clone(),
+            incoming_dir,
+            indexed_size,
         };
         let admit = |size: u64| self.reserve(&hash, size);
         let report = flight.clone();
@@ -620,6 +655,7 @@ impl AssetClass {
                 })
             });
         };
+        let started = std::time::Instant::now();
         let received = match swarm::fetch(sources, admit, progress).await {
             Ok(received) => received,
             Err(SwarmFailure::Fatal(e)) => return Err(e),
@@ -628,6 +664,8 @@ impl AssetClass {
                 return Err(Error::FetchFailed { hash, detail });
             }
         };
+        tracing::debug!(%hash, peer_bytes = received.peer_bytes, origin_bytes = received.origin_bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64, "XLB verified the transfer");
 
         // The complete blob leaves the store for its plain file and is
         // served from there.
@@ -638,6 +676,9 @@ impl AssetClass {
             .await
             .map_err(Error::Store)?;
         inner.cache.insert(hash, received.size);
+        if let Some(peers) = &inner.peers {
+            peers.announce(to_iroh(&hash)).await;
+        }
         let tier = match (received.peer_bytes, received.origin_bytes) {
             (0, 0) => FetchTier::Cache,
             (peer, origin) if peer > origin => FetchTier::Peer,
@@ -671,6 +712,7 @@ impl AssetClass {
     pub(crate) async fn fetch_reported(
         &self,
         hash: BlakeHash,
+        indexed_size: Option<u64>,
         sink: Option<ProgressSink>,
     ) -> (Result<PathBuf>, FetchReport) {
         let started = std::time::Instant::now();
@@ -681,7 +723,7 @@ impl AssetClass {
         let outcome = match self.local(&hash) {
             Some((path, size)) => Ok(Fetched::cached(path, size)),
             None => {
-                let mut flight = self.join_flight(hash);
+                let mut flight = self.join_flight(hash, indexed_size);
                 loop {
                     let (progress, outcome) = {
                         let state = flight.borrow_and_update();
@@ -782,6 +824,7 @@ async fn reconcile(cache: &Arc<Cache>, store: &BlobStore) -> Result<()> {
 pub struct Asset {
     class: AssetClass,
     hash: BlakeHash,
+    indexed_size: Option<u64>,
 }
 
 impl Asset {
@@ -792,13 +835,20 @@ impl Asset {
     /// Concurrent calls for the same hash share one transfer.
     // [impl -> dsn~xlb-fork~1]
     pub async fn fetch_to_file(&self) -> Result<PathBuf> {
-        self.class.fetch_reported(self.hash, None).await.0
+        self.class.fetch_reported(self.hash, self.indexed_size, None).await.0
+    }
+
+    /// Open the verified file while the cache still holds it against eviction.
+    pub async fn open_file(&self) -> Result<tokio::fs::File> {
+        let _hold = self.class.0.cache.hold(self.hash);
+        let path = self.fetch_to_file().await?;
+        Ok(tokio::fs::File::open(path).await?)
     }
 
     /// As [`fetch_to_file`](Self::fetch_to_file), reporting cumulative bytes
     /// and the serving tier to `sink`. A cache hit never invokes `sink`.
     pub async fn fetch_to_file_with_progress(&self, sink: ProgressSink) -> Result<PathBuf> {
-        self.class.fetch_reported(self.hash, Some(sink)).await.0
+        self.class.fetch_reported(self.hash, self.indexed_size, Some(sink)).await.0
     }
 
     /// As [`fetch_to_file`](Self::fetch_to_file), returning the
@@ -808,7 +858,7 @@ impl Asset {
         &self,
         sink: Option<ProgressSink>,
     ) -> (Result<PathBuf>, FetchReport) {
-        self.class.fetch_reported(self.hash, sink).await
+        self.class.fetch_reported(self.hash, self.indexed_size, sink).await
     }
 
     /// Whether this blob is complete in the local cache.
