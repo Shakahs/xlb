@@ -3,10 +3,10 @@
 
 mod origin_server;
 
-use std::{path::Path, time::Duration};
+use std::{num::NonZeroUsize, path::Path, time::Duration};
 
 use origin_server::{test_data, OriginServer, RangeBehavior};
-use xlb::{AssetClass, AssetClassConfig, BlakeHash, Error, FetchTier, OriginConfig};
+use xlb::{AssetClass, AssetClassConfig, BlakeHash, Error, FetchTier, OriginConfig, RequestLimits};
 
 const RANGE_BYTES: u64 = 256 * 1024;
 
@@ -28,7 +28,15 @@ async fn one_blob_sustains_configured_origin_concurrency_without_overfilling_the
     let data = test_data(48 * RANGE_BYTES as usize + 17);
     let hash = BlakeHash::hash(&data);
     let server = OriginServer::start(hash, data.clone()).await;
-    let class = class(dir.path(), server.config(RANGE_BYTES, concurrency), BUDGET).await;
+    let mut config = AssetClassConfig::new("models", dir.path());
+    config.cache_budget_bytes = BUDGET;
+    config.origin = Some(server.config(RANGE_BYTES, 1));
+    config.request_limits = Some(RequestLimits::new(
+        NonZeroUsize::new(40).unwrap(),
+        NonZeroUsize::new(concurrency).unwrap(),
+        NonZeroUsize::MIN,
+    ).unwrap());
+    let class = AssetClass::register(config).await.unwrap();
     server.pause_object_ranges(true);
 
     let asset = class.asset(hash);

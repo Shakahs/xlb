@@ -52,7 +52,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    rate::RequestRate,
+    request_limits::{RequestLimits, RequestSlot},
     sigv4::{self, Credentials, SigningInput},
     store::to_iroh,
     stream_bytes::{ByteFragments, receive, receive_exact},
@@ -173,6 +173,7 @@ struct Target {
 
 struct OriginInner {
     config: OriginConfig,
+    request_limits: RequestLimits,
     client: reqwest::Client,
     requests: RequestCounts,
 }
@@ -252,6 +253,7 @@ impl Drop for RequestGuard<'_> {
 struct TrackedResponse<'a> {
     body: reqwest::Response,
     _request: RequestGuard<'a>,
+    _slot: RequestSlot,
 }
 
 /// The origin tier of one class.
@@ -349,7 +351,6 @@ struct OriginRead<'a> {
     origin: &'a OriginInner,
     store: &'a Store,
     hash: BlakeHash,
-    rate: &'a RequestRate,
     received: &'a AtomicU64,
 }
 
@@ -475,7 +476,7 @@ impl RecvStream for RangeFeed<'_> {
 }
 
 impl Origin {
-    pub(crate) fn new(config: OriginConfig) -> Result<Self, OriginError> {
+    pub(crate) fn new(config: OriginConfig, request_limits: RequestLimits) -> Result<Self, OriginError> {
         if config.range_bytes == 0 || config.concurrency == 0 {
             return Err(OriginError::Config(
                 "range_bytes and concurrency must be at least 1".into(),
@@ -499,7 +500,7 @@ impl Origin {
             .connect_timeout(ORIGIN_IDLE_TIMEOUT)
             .read_timeout(ORIGIN_IDLE_TIMEOUT)
             .build()?;
-        Ok(Self(Arc::new(OriginInner { config, client, requests: RequestCounts::default() })))
+        Ok(Self(Arc::new(OriginInner { config, request_limits, client, requests: RequestCounts::default() })))
     }
 
     pub(crate) fn s3_request_stats(&self) -> Option<S3RequestStats> {
@@ -521,11 +522,6 @@ impl Origin {
         self.0.requests.events.set(sender).ok().map(|()| receiver)
     }
 
-    /// Ranged GETs in flight for one blob.
-    pub(crate) fn concurrency(&self) -> usize {
-        self.0.config.concurrency
-    }
-
     /// The size of one ranged GET, in whole chunk groups.
     pub(crate) fn range_bytes(&self) -> u64 {
         (self.0.config.range_bytes / CHUNK_GROUP_BYTES).max(1) * CHUNK_GROUP_BYTES
@@ -533,8 +529,9 @@ impl Origin {
 
     /// The size of the origin object for `hash`.
     pub(crate) async fn object_size(&self, hash: &BlakeHash) -> Result<u64, OriginError> {
-        let request = self.0.request(reqwest::Method::HEAD, "HEAD", hash, "", None)?;
-        let response = self.0.send(request, S3RequestKind::ObjectSize).await?;
+        let response = self.0.send(S3RequestKind::ObjectSize, || {
+            self.0.request(reqwest::Method::HEAD, "HEAD", hash, "", None)
+        }).await?;
         let status = response.body.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(OriginError::NotFound);
@@ -563,8 +560,9 @@ impl Origin {
         limit_bytes: usize,
     ) -> Result<Option<Vec<u8>>, OriginError> {
         let target = self.0.object_target(location)?;
-        let request = self.0.target_request(reqwest::Method::GET, "GET", target, None)?;
-        let mut response = self.0.send(request, S3RequestKind::ObjectRead).await?;
+        let mut response = self.0.send(S3RequestKind::ObjectRead, || {
+            self.0.target_request(reqwest::Method::GET, "GET", target, None)
+        }).await?;
         let status = response.body.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -645,9 +643,8 @@ impl Origin {
         outboard: &OriginOutboard,
         (start, end): (u64, u64),
         received: &AtomicU64,
-        rate: &RequestRate,
     ) -> Result<(), OriginError> {
-        let source = OriginRead { origin: &self.0, store, hash, rate, received };
+        let source = OriginRead { origin: &self.0, store, hash, received };
         let wanted = ChunkRanges::bytes(start..end);
         let mut failures = 0u32;
         loop {
@@ -679,7 +676,13 @@ fn retry_delay(failures: u32) -> Duration {
 }
 
 impl OriginInner {
-    async fn send(&self, request: reqwest::RequestBuilder, kind: S3RequestKind) -> Result<TrackedResponse<'_>, reqwest::Error> {
+    async fn send(
+        &self,
+        kind: S3RequestKind,
+        build: impl FnOnce() -> Result<reqwest::RequestBuilder, OriginError>,
+    ) -> Result<TrackedResponse<'_>, OriginError> {
+        let slot = self.request_limits.origin().await;
+        let request = build()?;
         let counts = &self.requests;
         counts.all.start();
         if matches!(kind, S3RequestKind::DataRange { .. }) {
@@ -690,7 +693,7 @@ impl OriginInner {
         };
         let body = request.send().await?;
         guard.status = Some(body.status().as_u16());
-        Ok(TrackedResponse { body, _request: guard })
+        Ok(TrackedResponse { body, _request: guard, _slot: slot })
     }
 
     /// The request target of the object for `hash`, or with
@@ -802,8 +805,9 @@ impl OriginInner {
         path: &Path,
         expected: u64,
     ) -> Result<(), OriginError> {
-        let request = self.request(reqwest::Method::GET, "GET", hash, OUTBOARD_KEY_SUFFIX, None)?;
-        let mut response = self.send(request, S3RequestKind::Outboard).await?;
+        let mut response = self.send(S3RequestKind::Outboard, || {
+            self.request(reqwest::Method::GET, "GET", hash, OUTBOARD_KEY_SUFFIX, None)
+        }).await?;
         let status = response.body.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(OriginError::NoOutboard);
@@ -838,9 +842,9 @@ impl OriginInner {
 
 impl<'a> OriginRead<'a> {
     async fn open_range(&self, start: u64, end: u64) -> Result<TrackedResponse<'a>, OriginError> {
-        self.rate.start().await;
-        let request = self.origin.request(reqwest::Method::GET, "GET", &self.hash, "", Some((start, end)))?;
-        let response = self.origin.send(request, S3RequestKind::DataRange { start, end }).await?;
+        let response = self.origin.send(S3RequestKind::DataRange { start, end }, || {
+            self.origin.request(reqwest::Method::GET, "GET", &self.hash, "", Some((start, end)))
+        }).await?;
         let status = response.body.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(OriginError::NotFound);
@@ -903,6 +907,7 @@ mod tests {
     use super::*;
 
     fn s3(endpoint: &str) -> OriginInner {
+        let one = std::num::NonZeroUsize::MIN;
         OriginInner {
             config: OriginConfig::new(OriginSource::S3 {
                 endpoint: endpoint.into(),
@@ -914,6 +919,7 @@ mod tests {
                     secret_access_key: "secret".into(),
                 },
             }),
+            request_limits: RequestLimits::new(one, one, one).unwrap(),
             client: reqwest::Client::new(),
             requests: RequestCounts::default(),
         }
@@ -968,6 +974,8 @@ mod tests {
         let config = OriginConfig::new(OriginSource::Url {
             template: "http://127.0.0.1/static.bin".into(),
         });
-        assert!(matches!(Origin::new(config), Err(OriginError::Config(_))));
+        let one = std::num::NonZeroUsize::MIN;
+        let limits = RequestLimits::new(one, one, one).unwrap();
+        assert!(matches!(Origin::new(config, limits), Err(OriginError::Config(_))));
     }
 }

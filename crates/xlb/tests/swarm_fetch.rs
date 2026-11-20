@@ -2,12 +2,12 @@
 
 mod origin_server;
 
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::Path, time::Duration};
 
 use origin_server::{OriginServer, test_data};
 use xlb::{
     AssetClass, AssetClassConfig, BlakeHash, NodeTopology, PeerAddr, PeerConfig,
-    RelaySetting,
+    RelaySetting, RequestLimits,
 };
 use xlb_core::PeerReach;
 
@@ -21,6 +21,13 @@ async fn node(name: &'static str, dir: &Path, origin: &OriginServer) -> AssetCla
         ..PeerConfig::default()
     });
     config.origin = Some(origin.config(RANGE_BYTES, 4));
+    // Four S3 ranges stay open. Leave a slot for the origin size probe if
+    // the first chunk's peer announcement has not arrived yet.
+    config.request_limits = Some(RequestLimits::new(
+        NonZeroUsize::new(5).unwrap(),
+        NonZeroUsize::new(5).unwrap(),
+        NonZeroUsize::MIN,
+    ).unwrap());
     let class = AssetClass::register(config).await.expect("register class");
     class.set_node_topology(Some(NodeTopology {
         provider: "aws".into(),

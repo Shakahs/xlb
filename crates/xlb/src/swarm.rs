@@ -22,7 +22,6 @@ use crate::{
     discovery::{ProviderEvent, is_fresh},
     origin::{CHUNK_GROUP_BYTES, OUTBOARD_KEY_SUFFIX, Origin, OriginError, OriginOutboard, verification_ranges},
     peer::{NodeId, PeerTransport, ProviderChoice},
-    rate::RequestRate,
     store::to_iroh,
 };
 
@@ -31,6 +30,7 @@ use crate::{
 mod tests;
 
 pub(crate) struct SwarmSources {
+    pub range_concurrency: usize,
     pub(crate) hash: BlakeHash,
     pub(crate) store: Store,
     pub(crate) peers: Option<Arc<PeerTransport>>,
@@ -99,8 +99,6 @@ struct SwarmFetch {
     hash: IrohHash,
     providers: watch::Receiver<ProviderList>,
     outboard: OnceCell<OriginOutboard>,
-    origin_rate: RequestRate,
-    peer_rate: RequestRate,
     origin_bytes: AtomicU64,
     peer_bytes: Mutex<BTreeMap<NodeId, u64>>,
 }
@@ -207,7 +205,7 @@ impl SwarmFetch {
             let path = self.sources.incoming_dir.join(format!("{}{OUTBOARD_KEY_SUFFIX}", hash.to_hex()));
             origin.fetch_outboard(&hash, size, path).await
         }).await.map_err(|err| origin_failure(hash, err))?;
-        origin.import_range(&self.sources.store, hash, outboard, range, &self.origin_bytes, &self.origin_rate)
+        origin.import_range(&self.sources.store, hash, outboard, range, &self.origin_bytes)
             .await.map_err(|err| origin_failure(hash, err))
     }
 
@@ -217,7 +215,7 @@ impl SwarmFetch {
         ranges: ChunkRanges,
         providers: Vec<ProviderChoice>,
     ) -> Result<(), SwarmFailure> {
-        peers.fetch_ranges(self.hash, ranges, providers, &self.peer_rate, |peer, received| {
+        peers.fetch_ranges(self.hash, ranges, providers, |peer, received| {
             *self.peer_bytes.lock().unwrap().entry(peer).or_default() += received;
         }).await.map_err(|err| SwarmFailure::Miss(format!("peers: {err}")))
     }
@@ -275,9 +273,6 @@ impl SwarmFetch {
             origin_bytes.min(peer_bytes).max(CHUNK_GROUP_BYTES) / CHUNK_GROUP_BYTES * CHUNK_GROUP_BYTES
         };
         let held = self.local_bitfield().await?;
-        let concurrency = self.sources.origin.as_ref().map(Origin::concurrency)
-            .or_else(|| self.sources.peers.as_ref().map(|peer| peer.config().concurrency))
-            .unwrap_or(1);
         let gather = stream::iter((0..size).step_by(range_bytes as usize))
             .flat_map(|start| {
                 let end = start.saturating_add(range_bytes).min(size);
@@ -285,7 +280,7 @@ impl SwarmFetch {
                 stream::iter(verification_ranges(missing, end))
             })
             .map(|range| self.read_range(size, range))
-            .buffer_unordered(concurrency.max(1))
+            .buffer_unordered(self.sources.range_concurrency)
             .try_for_each(|()| std::future::ready(Ok(())));
         let report = async {
             let mut interval = tokio::time::interval(Duration::from_millis(50));
@@ -330,8 +325,6 @@ pub(crate) async fn fetch(
         let swarm = SwarmFetch {
             hash,
             providers,
-            origin_rate: RequestRate::new(sources.origin.as_ref().map_or(1, Origin::concurrency)),
-            peer_rate: RequestRate::new(peers.as_ref().map_or(1, |peer| peer.config().concurrency)),
             sources,
             outboard: OnceCell::new(),
             origin_bytes: AtomicU64::new(0),

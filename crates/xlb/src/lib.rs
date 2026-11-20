@@ -26,7 +26,7 @@ extern crate self as xlb;
 pub mod origin;
 pub mod peer;
 pub mod pinned;
-mod rate;
+mod request_limits;
 pub mod sigv4;
 pub(crate) mod source;
 pub(crate) mod store;
@@ -38,6 +38,7 @@ pub use metrics::{FetchObserver, FetchReport};
 pub use origin::{OriginConfig, OriginSource, S3RequestEvent, S3RequestStats};
 pub use peer::{NodeId, PeerAddr, PeerConfig, RelaySetting, RelayUrl};
 pub use pinned::{PinError, PinnedTreeInfo, SeedReport};
+pub use request_limits::RequestLimits;
 pub use sigv4::Credentials;
 pub use source::{FetchProgress, FetchTier, ProgressSink};
 pub use xlb_core::retention;
@@ -46,6 +47,7 @@ pub use xlb_core::{BlakeHash, FetchSources, InvalidHash, NodeTopology, Retention
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -131,6 +133,8 @@ pub struct AssetClassConfig {
     pub peer: Option<PeerConfig>,
     /// The origin tier. `None` = no origin.
     pub origin: Option<OriginConfig>,
+    /// Shared outgoing limits. Classes registered independently use their own limits.
+    pub request_limits: Option<RequestLimits>,
     /// How often the blob store drops entries the cache no longer holds.
     pub gc_interval: Duration,
     /// Called once per completed fetch with a [`FetchReport`].
@@ -146,6 +150,7 @@ impl AssetClassConfig {
             cache_budget_bytes: 1024 * 1024 * 1024,
             peer: None,
             origin: None,
+            request_limits: None,
             gc_interval: DEFAULT_GC_INTERVAL,
             observer: None,
         }
@@ -194,6 +199,7 @@ struct ClassInner {
     store: BlobStore,
     peers: Option<Arc<PeerTransport>>,
     origin: Option<Origin>,
+    range_concurrency: usize,
     trees: pinned::TreeStore,
     /// Names of the declared pinned trees.
     tree_names: Mutex<std::collections::BTreeSet<String>>,
@@ -237,8 +243,16 @@ impl AssetClass {
         }
         let cache = Arc::new(Cache::new(&cache_dir, index));
 
-        let range_concurrency = config.origin.as_ref().map(|origin| origin.concurrency)
-            .or_else(|| config.peer.as_ref().map(|peers| peers.concurrency)).unwrap_or(1);
+        let request_limits = match config.request_limits {
+            Some(limits) => limits,
+            None => {
+                let origin = config.origin.as_ref().and_then(|origin| NonZeroUsize::new(origin.concurrency));
+                let peer = config.peer.as_ref().and_then(|peer| NonZeroUsize::new(peer.concurrency));
+                let total = origin.or(peer).unwrap_or(NonZeroUsize::MIN);
+                RequestLimits::new(total, origin.unwrap_or(total), peer.unwrap_or(total))?
+            }
+        };
+        let range_concurrency = request_limits.total_capacity();
         let store = BlobStore::open(&cache_dir, cache.clone(), config.gc_interval, range_concurrency)
             .await
             .map_err(Error::Store)?;
@@ -247,14 +261,14 @@ impl AssetClass {
 
         let peers = match config.peer {
             Some(peer) => Some(Arc::new(
-                PeerTransport::bind(peer, &store)
+                PeerTransport::bind(peer, &store, request_limits.clone())
                     .await
                     .map_err(Error::Config)?,
             )),
             None => None,
         };
         let origin = match config.origin {
-            Some(origin) => Some(Origin::new(origin).map_err(|e| Error::Config(e.to_string()))?),
+            Some(origin) => Some(Origin::new(origin, request_limits).map_err(|e| Error::Config(e.to_string()))?),
             None => None,
         };
 
@@ -265,6 +279,7 @@ impl AssetClass {
             store,
             peers,
             origin,
+            range_concurrency,
             trees,
             tree_names: Mutex::new(tree_names),
             flights: Mutex::new(HashMap::new()),
@@ -641,6 +656,7 @@ impl AssetClass {
             origin: inner.origin.clone(),
             incoming_dir,
             indexed_size,
+            range_concurrency: inner.range_concurrency,
         };
         let admit = |size: u64| self.reserve(&hash, size);
         let report = flight.clone();

@@ -5,7 +5,7 @@ use std::{num::NonZeroUsize, sync::Arc, time::{Duration, Instant}};
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 use tokio_util::task::AbortOnDropHandle;
-use xlb::{AssetClass, AssetClassConfig};
+use xlb::{AssetClass, AssetClassConfig, RequestLimits};
 
 use crate::{
     config::NodeConfig,
@@ -17,6 +17,11 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     let cfg = NodeConfig::load(config_path)?;
     let socket = effective_socket(socket_flag, cfg.node.socket.as_deref());
     let socket_mode = cfg.node.socket_mode()?;
+    let request_limits = RequestLimits::new(
+        cfg.node.total_request_concurrency,
+        cfg.node.s3_request_concurrency,
+        cfg.node.peer_request_concurrency,
+    )?;
 
     // Built before the classes because every class's observer is a handle to
     // it; the node ID is filled in once a class has bound its endpoint.
@@ -36,6 +41,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         config.cache_budget_bytes = cc.cache_budget_bytes;
         config.peer = cc.peer_config()?;
         config.origin = cc.origin_config()?;
+        config.request_limits = Some(request_limits.clone());
         config.observer = Some(metrics.observer());
         let has_origin = config.origin.is_some();
         let class = AssetClass::register(config)

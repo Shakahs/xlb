@@ -56,7 +56,7 @@ use iroh_blobs::{
 use rand::seq::SliceRandom;
 use tokio::time::Instant;
 
-use crate::{NodeTopology, discovery::{Discovery, ProviderEvent, is_fresh}, rate::RequestRate, store::BlobStore, stream_bytes::QuicBytes};
+use crate::{NodeTopology, RequestLimits, discovery::{Discovery, ProviderEvent, is_fresh}, store::BlobStore, stream_bytes::QuicBytes};
 use xlb_core::image::IMAGE_CHUNK_BYTES;
 
 /// The node ID of an xlb node: the public key of its iroh endpoint.
@@ -319,6 +319,7 @@ type AdmitSet = Arc<RwLock<BTreeSet<EndpointId>>>;
 
 pub(crate) struct PeerTransport {
     config: PeerConfig,
+    request_limits: RequestLimits,
     endpoint: Endpoint,
     router: Router,
     lookup: MemoryLookup,
@@ -335,7 +336,7 @@ pub(crate) struct PeerTransport {
 impl PeerTransport {
     /// Bind the endpoint and start serving `store` to the (empty) admit set.
     // [impl -> dsn~xlb-fork~1]
-    pub(crate) async fn bind(config: PeerConfig, blob_store: &BlobStore) -> Result<Self, String> {
+    pub(crate) async fn bind(config: PeerConfig, blob_store: &BlobStore, request_limits: RequestLimits) -> Result<Self, String> {
         let store = blob_store.api();
         let lookup = MemoryLookup::new();
         // The only IP transport is the configured address, so the UDP port
@@ -391,6 +392,7 @@ impl PeerTransport {
 
         Ok(Self {
             config,
+            request_limits,
             endpoint,
             router,
             lookup,
@@ -510,7 +512,6 @@ impl PeerTransport {
         hash: IrohHash,
         ranges: ChunkRanges,
         mut providers: Vec<ProviderChoice>,
-        rate: &RequestRate,
         mut on_bytes: impl FnMut(NodeId, u64),
     ) -> Result<(), PeerError> {
         providers.shuffle(&mut rand::rng());
@@ -526,7 +527,7 @@ impl PeerTransport {
             if local.is_complete() {
                 return Ok(());
             }
-            rate.start().await;
+            let slot = self.request_limits.peer().await;
             if !is_fresh(timestamp) || !self.is_eligible(&provider) {
                 continue;
             }
@@ -565,6 +566,7 @@ impl PeerTransport {
                 Ok(Err(err)) => err,
                 Err(_) => "transfer attempt timed out".into(),
             };
+            drop(slot);
             self.failed.insert(provider, Instant::now());
             tracing::debug!(%provider, %hash, %failure, "excluding failed XLB provider");
         }

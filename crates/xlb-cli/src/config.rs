@@ -22,7 +22,7 @@
 //!
 //! Unknown keys are ignored, so a config may carry `_comment` prose.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
@@ -66,11 +66,30 @@ pub struct NodeSettings {
     pub image_mirror_class: Option<String>,
     /// Maximum active OCI chunk downloads across pulls on this node.
     #[serde(default = "default_chunk_concurrency")]
-    pub chunk_concurrency: std::num::NonZeroUsize,
+    pub chunk_concurrency: NonZeroUsize,
+    /// Maximum in-flight outgoing data and metadata requests across classes.
+    #[serde(default = "default_total_request_concurrency")]
+    pub total_request_concurrency: NonZeroUsize,
+    #[serde(default = "default_s3_request_concurrency")]
+    pub s3_request_concurrency: NonZeroUsize,
+    #[serde(default = "default_peer_request_concurrency")]
+    pub peer_request_concurrency: NonZeroUsize,
 }
 
-fn default_chunk_concurrency() -> std::num::NonZeroUsize {
-    std::num::NonZeroUsize::new(32).unwrap()
+fn default_chunk_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(32).unwrap()
+}
+
+fn default_total_request_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(32).unwrap()
+}
+
+fn default_s3_request_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(32).unwrap()
+}
+
+fn default_peer_request_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(16).unwrap()
 }
 
 fn default_socket_mode() -> String {
