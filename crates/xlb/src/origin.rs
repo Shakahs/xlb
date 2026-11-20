@@ -3,8 +3,8 @@
 //!
 //! The origin is either an S3-compatible bucket read with SigV4-signed,
 //! path-style requests, or an unauthenticated URL template. The object is
-//! read as `Range` requests of [`OriginConfig::range_bytes`], rounded down to
-//! whole 16 KiB chunk groups.
+//! read as `Range` requests of up to [`OriginConfig::range_bytes`]. Bao
+//! verifies whole 16 KiB groups, reusing any verified local bytes in a group.
 //!
 //! ## Outboard
 //!
@@ -36,6 +36,7 @@ use std::{
 };
 
 use bao_tree::{
+    io::round_up_to_chunks_groups,
     iter::{BaoChunk, ResponseIter},
     BaoTree,
 };
@@ -72,8 +73,7 @@ pub const DEFAULT_KEY_TEMPLATE: &str = "models/blake3/{blake3}";
 /// Appended to an object's key or URL to name its outboard.
 pub const OUTBOARD_KEY_SUFFIX: &str = ".obao";
 
-/// iroh-blobs verifies and stores data in 16 KiB chunk groups. A range or
-/// segment boundary inside a group could not be verified on its own.
+/// The origin outboard stores proofs down to 16 KiB groups.
 pub(crate) const CHUNK_GROUP_BYTES: u64 = 16 * 1024;
 
 const HASH_TOKEN: &str = "{blake3}";
@@ -311,10 +311,51 @@ impl OriginOutboard {
     }
 }
 
+/// The whole verification groups that contain missing bytes in an aligned range.
+pub(crate) fn verification_ranges(missing: ChunkRanges, end: u64) -> Vec<(u64, u64)> {
+    round_up_to_chunks_groups(missing, IROH_BLOCK_SIZE)
+        .boundaries()
+        .as_chunks::<2>().0.iter()
+        .map(|[start, stop]| (start.to_bytes(), stop.to_bytes().min(end)))
+        .collect()
+}
+
+struct RangePart {
+    start: u64,
+    end: u64,
+    from_origin: bool,
+}
+
+fn range_parts((start, end): (u64, u64), missing: &ChunkRanges) -> Vec<RangePart> {
+    let missing = &ChunkRanges::bytes(start..end) & missing;
+    let mut parts = Vec::new();
+    let mut offset = start;
+    for [first, stop] in missing.boundaries().as_chunks::<2>().0 {
+        let first = first.to_bytes();
+        let stop = stop.to_bytes().min(end);
+        if offset < first {
+            parts.push(RangePart { start: offset, end: first, from_origin: false });
+        }
+        parts.push(RangePart { start: first, end: stop, from_origin: true });
+        offset = stop;
+    }
+    if offset < end {
+        parts.push(RangePart { start: offset, end, from_origin: false });
+    }
+    parts
+}
+
+struct OriginRead<'a> {
+    origin: &'a OriginInner,
+    store: &'a Store,
+    hash: BlakeHash,
+    rate: &'a RequestRate,
+    received: &'a AtomicU64,
+}
+
 /// The bao encoding of one range of a blob, produced as the store reads it:
 /// the size, then for each node of the range's part of the tree in pre-order
-/// its hash pair from the outboard or its chunk group from the origin's
-/// response body.
+/// its hash pair from the outboard or its chunk group from local and origin data.
 struct RangeFeed<'a> {
     /// Size prefix or hash pair not handed out yet.
     pending: Bytes,
@@ -323,11 +364,11 @@ struct RangeFeed<'a> {
     plan: ResponseIter,
     /// Bytes of the current chunk group still to hand out.
     leaf_remaining: usize,
-    /// Body bytes received and not handed out yet.
+    /// Data received and not handed out yet.
     body: Bytes,
-    response: TrackedResponse<'a>,
-    /// Body bytes handed out by every range of the fetch.
-    received: &'a AtomicU64,
+    source: &'a OriginRead<'a>,
+    parts: std::vec::IntoIter<RangePart>,
+    response: Option<(TrackedResponse<'a>, usize)>,
     /// Why the response body ended early, when it did.
     failure: &'a Mutex<Option<OriginError>>,
 }
@@ -335,9 +376,38 @@ struct RangeFeed<'a> {
 impl RangeFeed<'_> {
     fn fail(&self, error: OriginError) -> io::Error {
         *self.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
-        io::Error::other("the origin response ended early")
+        io::Error::other("could not read the Bao group data")
     }
 
+    async fn fill_body(&mut self) -> Result<(), OriginError> {
+        if let Some((response, remaining)) = &mut self.response {
+            let body = response.body.chunk().await?
+                .ok_or_else(|| OriginError::Protocol("origin closed the range short".into()))?;
+            if body.len() > *remaining {
+                return Err(OriginError::Protocol("origin exceeded the requested range".into()));
+            }
+            self.body = body;
+        } else {
+            let part = self.parts.next()
+                .ok_or_else(|| OriginError::Protocol("missing data for a Bao group".into()))?;
+            let length = (part.end - part.start) as usize;
+            if part.from_origin {
+                let response = self.source.open_range(part.start, part.end).await?;
+                self.response = Some((response, length));
+            } else {
+                // Fully held groups are skipped by the plan. Only the local
+                // portions of the adjacent partial groups can appear here.
+                let bytes = self.source.store.blobs()
+                    .export_ranges(to_iroh(&self.source.hash), part.start..part.end)
+                    .concatenate().await.map_err(|err| OriginError::Rejected(err.to_string()))?;
+                if bytes.len() != length {
+                    return Err(OriginError::Rejected("verified local range is short".into()));
+                }
+                self.body = Bytes::from(bytes);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ByteFragments for RangeFeed<'_> {
@@ -348,16 +418,18 @@ impl ByteFragments for RangeFeed<'_> {
             }
             if self.leaf_remaining != 0 {
                 if self.body.is_empty() {
-                    self.body = match self.response.body.chunk().await {
-                        Ok(Some(chunk)) => chunk,
-                        Ok(None) => return Err(self.fail(OriginError::Protocol("origin closed the range short".into()))),
-                        Err(err) => return Err(self.fail(err.into())),
-                    };
+                    self.fill_body().await.map_err(|error| self.fail(error))?;
                     continue;
                 }
                 let count = self.leaf_remaining.min(self.body.len()).min(limit);
                 self.leaf_remaining -= count;
-                self.received.fetch_add(count as u64, Ordering::Relaxed);
+                if let Some((_, remaining)) = &mut self.response {
+                    self.source.received.fetch_add(count as u64, Ordering::Relaxed);
+                    *remaining -= count;
+                    if *remaining == 0 {
+                        self.response = None;
+                    }
+                }
                 return Ok(Some(self.body.split_to(count)));
             }
             match self.plan.next() {
@@ -560,9 +632,8 @@ impl Origin {
         })
     }
 
-    /// Read bytes `[start, end)` of `hash` from the origin, verify them
-    /// against `outboard` and store them. `start` must be a multiple of the
-    /// chunk group size, and `end` one too or the blob's size.
+    /// Complete the verification groups in `[start, end)` and store them.
+    /// The range must be group-aligned, except at the end of the blob.
     ///
     /// `received` counts the body bytes handed to the store. Retry only
     /// ranges whose chunk groups have yet to be verified and stored.
@@ -576,15 +647,16 @@ impl Origin {
         received: &AtomicU64,
         rate: &RequestRate,
     ) -> Result<(), OriginError> {
+        let source = OriginRead { origin: &self.0, store, hash, rate, received };
         let wanted = ChunkRanges::bytes(start..end);
-        let mut missing = wanted.clone();
         let mut failures = 0u32;
         loop {
+            let held = store.blobs().observe(to_iroh(&hash)).await
+                .map_err(|err| OriginError::Rejected(err.to_string()))?;
+            let missing = &wanted - &held.ranges;
             let mut outcome = Ok(());
-            for boundaries in missing.boundaries().as_chunks::<2>().0 {
-                let range = (boundaries[0].to_bytes(), boundaries[1].to_bytes().min(end));
-                rate.start().await;
-                outcome = self.0.import_attempt(store, &hash, outboard, range, received).await;
+            for range in verification_ranges(missing.clone(), end) {
+                outcome = source.import_attempt(outboard, range, &missing).await;
                 if outcome.is_err() {
                     break;
                 }
@@ -595,9 +667,6 @@ impl Origin {
                     failures += 1;
                     tracing::warn!(%hash, start, end, failures, "origin range retry: {e}");
                     tokio::time::sleep(retry_delay(failures)).await;
-                    let held = store.blobs().observe(to_iroh(&hash)).await
-                        .map_err(|err| OriginError::Rejected(err.to_string()))?;
-                    missing = &wanted - &held.ranges;
                 }
                 Err(e) => return Err(e),
             }
@@ -765,27 +834,13 @@ impl OriginInner {
         Ok(())
     }
 
-    /// One attempt at `[start, end)`: the response body is verified and
-    /// stored chunk group by chunk group as it arrives.
-    async fn import_attempt(
-        &self,
-        store: &Store,
-        hash: &BlakeHash,
-        outboard: &OriginOutboard,
-        (start, end): (u64, u64),
-        received: &AtomicU64,
-    ) -> Result<(), OriginError> {
-        // A range that ends inside the blob's last chunk group must cover the
-        // group to its end: the encoding of a part of a chunk group has
-        // parent nodes below the ones an outboard holds.
-        let ranges = if end == outboard.tree.size() {
-            ChunkRanges::bytes(start..)
-        } else {
-            ChunkRanges::bytes(start..end)
-        };
-        let parents = outboard.parent_pairs(&ranges).await?;
-        let request = self.request(reqwest::Method::GET, "GET", hash, "", Some((start, end)))?;
-        let response = self.send(request, S3RequestKind::DataRange { start, end }).await?;
+}
+
+impl<'a> OriginRead<'a> {
+    async fn open_range(&self, start: u64, end: u64) -> Result<TrackedResponse<'a>, OriginError> {
+        self.rate.start().await;
+        let request = self.origin.request(reqwest::Method::GET, "GET", &self.hash, "", Some((start, end)))?;
+        let response = self.origin.send(request, S3RequestKind::DataRange { start, end }).await?;
         let status = response.body.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(OriginError::NotFound);
@@ -796,20 +851,40 @@ impl OriginInner {
                 status: status.as_u16(),
             });
         }
+        Ok(response)
+    }
+
+    /// Assemble and verify whole groups, streaming in only their missing spans.
+    async fn import_attempt(
+        &self,
+        outboard: &OriginOutboard,
+        (start, end): (u64, u64),
+        missing: &ChunkRanges,
+    ) -> Result<(), OriginError> {
+        // Bao represents a range covering the last group as open-ended so it
+        // does not descend below the last node stored in the outboard.
+        let ranges = if end == outboard.tree.size() {
+            ChunkRanges::bytes(start..)
+        } else {
+            ChunkRanges::bytes(start..end)
+        };
+        let parents = outboard.parent_pairs(&ranges).await?;
         let failure = Mutex::new(None);
-        let feed = RangeFeed {
+        let mut feed = RangeFeed {
             pending: Bytes::copy_from_slice(&outboard.tree.size().to_le_bytes()),
             parents: Bytes::from(parents),
             plan: ResponseIter::new(outboard.tree, ranges.clone()),
             leaf_remaining: 0,
             body: Bytes::new(),
-            response,
-            received,
+            source: self,
+            parts: range_parts((start, end), missing).into_iter(),
+            response: None,
             failure: &failure,
         };
-        let imported = store
+        feed.fill_body().await?;
+        let imported = self.store
             .blobs()
-            .import_bao_reader(to_iroh(hash), ranges, feed)
+            .import_bao_reader(to_iroh(&self.hash), ranges, feed)
             .await
             .map(drop);
         match imported {

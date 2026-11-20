@@ -21,7 +21,7 @@ use xlb_core::{PeerReach, image::IMAGE_CHUNK_BYTES};
 
 use super::*;
 use crate::{AssetClass, AssetClassConfig, NodeTopology, PeerAddr, PeerConfig, RelaySetting, discovery::discovery_topic};
-use origin_server::{OriginServer, test_data};
+use origin_server::{OriginServer, RangeBehavior, test_data};
 
 const BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
 const RANGE_BYTES: u64 = 128 * 1024;
@@ -110,6 +110,59 @@ async fn wait_for_records(receiver: &AssetClass, hash: BlakeHash, expected: &[No
         }
     }
     panic!("the peer directory closed before the advertised providers arrived");
+}
+
+async fn check_mixed_tail_group(corrupt: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let tail = 2 * RANGE_BYTES;
+    let data = test_data(tail as usize + 10_774);
+    let hash = BlakeHash::hash(&data);
+    let behavior = RangeBehavior {
+        corrupt_at: corrupt.then_some(tail as usize + 3),
+        ..RangeBehavior::default()
+    };
+    let s3 = OriginServer::start_with(hash, data.clone(), behavior).await;
+    let receiver = receiver(dir.path(), &s3, Vec::new()).await;
+    let peer = ProtocolPeer::start(&receiver, &[&data], Some(1)).await;
+    receiver.set_peers(vec![peer.address()]);
+    peer.advertise(hash, "aws%2Fus-west-2a").await;
+    wait_for_records(&receiver, hash, &[peer.endpoint.id()]).await;
+
+    let asset = receiver.asset(hash);
+    let (result, report) = asset.fetch_to_file_reported(None).await;
+    let size = data.len() as u64;
+    let peer_bytes = 534;
+    let tail_range = (tail, size - peer_bytes);
+    let ranges = s3.object_ranges();
+    assert_eq!(ranges.iter().copied().filter(|&(_, end)| end > tail).collect::<Vec<_>>(), [tail_range]);
+    if corrupt {
+        assert!(matches!(result, Err(Error::OriginRejected { hash: rejected, .. }) if rejected == hash), "{result:?}");
+        let stored = receiver.0.store.api().blobs().observe(to_iroh(&hash)).await.unwrap();
+        let peer_tail = ChunkRanges::bytes(tail_range.1..size);
+        assert!(peer_tail.is_subset(&stored.ranges), "the peer bytes remain verified");
+        let rejected = ChunkRanges::bytes(tail_range.0..tail_range.1);
+        assert!(!stored.ranges.intersects(&rejected), "corrupt bytes must remain unverified");
+        assert!(!asset.is_cached());
+    } else {
+        let path = result.expect("combine the peer's tail with verified S3 bytes");
+        assert_eq!(std::fs::read(path).unwrap(), data);
+        assert_eq!(ranges, [(0, RANGE_BYTES), (RANGE_BYTES, tail), tail_range]);
+        assert_eq!(report.peer_bytes, peer_bytes);
+        assert_eq!(report.origin_bytes, size - peer_bytes);
+    }
+    receiver.shutdown().await;
+}
+
+// [utest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_completes_a_partial_group_without_downloading_the_peer_bytes_again() {
+    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(false)).await.unwrap();
+}
+
+// [utest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_corruption_in_a_group_partially_received_from_a_peer_is_rejected() {
+    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(true)).await.unwrap();
 }
 
 // [utest -> dsn~xlb-chunk-discovery~1]

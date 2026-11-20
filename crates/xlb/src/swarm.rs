@@ -20,7 +20,7 @@ use tokio::sync::{OnceCell, watch};
 use crate::{
     BlakeHash, Error,
     discovery::{ProviderEvent, is_fresh},
-    origin::{CHUNK_GROUP_BYTES, OUTBOARD_KEY_SUFFIX, Origin, OriginError, OriginOutboard},
+    origin::{CHUNK_GROUP_BYTES, OUTBOARD_KEY_SUFFIX, Origin, OriginError, OriginOutboard, verification_ranges},
     peer::{NodeId, PeerTransport, ProviderChoice},
     rate::RequestRate,
     store::to_iroh,
@@ -109,13 +109,6 @@ fn origin_failure(hash: BlakeHash, error: OriginError) -> SwarmFailure {
         OriginError::Rejected(detail) => SwarmFailure::Fatal(Error::OriginRejected { hash, detail }),
         other => SwarmFailure::Miss(format!("origin: {other}")),
     }
-}
-
-fn missing_ranges(held: &ChunkRanges, (start, end): (u64, u64)) -> Vec<(u64, u64)> {
-    let missing = &ChunkRanges::bytes(start..end) - held;
-    missing.boundaries().as_chunks::<2>().0.iter()
-        .map(|[start, stop]| (start.to_bytes(), stop.to_bytes().min(end)))
-        .collect()
 }
 
 impl SwarmFetch {
@@ -248,11 +241,7 @@ impl SwarmFetch {
         if let Some(origin) = self.sources.origin.as_ref() {
             // A failed peer attempt may have verified part of this range.
             if peer_attempted {
-                let held = self.local_bitfield().await?;
-                for remaining in missing_ranges(&held.ranges, range) {
-                    self.read_origin(origin, size, remaining).await?;
-                }
-                return Ok(());
+                return self.read_origin(origin, size, range).await;
             }
             let result = self.read_origin(origin, size, range).await;
             if matches!(result, Err(SwarmFailure::Miss(_))) {
@@ -291,7 +280,8 @@ impl SwarmFetch {
         let gather = stream::iter((0..size).step_by(range_bytes as usize))
             .flat_map(|start| {
                 let end = start.saturating_add(range_bytes).min(size);
-                stream::iter(missing_ranges(&held.ranges, (start, end)))
+                let missing = &ChunkRanges::bytes(start..end) - &held.ranges;
+                stream::iter(verification_ranges(missing, end))
             })
             .map(|range| self.read_range(size, range))
             .buffer_unordered(concurrency.max(1))

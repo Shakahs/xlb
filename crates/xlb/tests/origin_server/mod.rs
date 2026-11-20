@@ -69,6 +69,8 @@ pub struct RangeBehavior {
     pub hang_from: Option<u64>,
     /// Once, drop a ranged response after writing a prefix of its body.
     pub disconnect_once: Option<(u64, usize)>,
+    /// Corrupt one byte of the body after computing the outboard.
+    pub corrupt_at: Option<usize>,
 }
 
 struct Served {
@@ -95,15 +97,19 @@ impl OriginServer {
         Self::start_with(key_hash, body, RangeBehavior::default()).await
     }
 
-    pub async fn start_with(key_hash: BlakeHash, body: Vec<u8>, behavior: RangeBehavior) -> Self {
+    pub async fn start_with(key_hash: BlakeHash, mut body: Vec<u8>, behavior: RangeBehavior) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let object_path = format!("/{BUCKET}/models/blake3/{}", key_hash.to_hex());
+        let outboard = outboard_of(&body);
+        if let Some(offset) = behavior.corrupt_at {
+            body[offset] ^= 1;
+        }
         let served = Arc::new(Served {
             host: host.clone(),
             outboard_path: format!("{object_path}.obao"),
             object_path,
-            outboard: outboard_of(&body),
+            outboard,
             body,
             behavior,
             disconnected: AtomicBool::new(false),
