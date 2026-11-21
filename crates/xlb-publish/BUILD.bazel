@@ -1,0 +1,48 @@
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+
+rust_library(
+    name = "xlb_publish",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//vendor/xlb/crates/xlb-core:xlb_core",
+        "@scheduler_crates//:anyhow",
+        "@scheduler_crates//:bao-tree",
+        "@scheduler_crates//:blake3",
+        "@scheduler_crates//:bytes",
+        "@scheduler_crates//:flate2",
+        "@scheduler_crates//:futures",
+        "@scheduler_crates//:opendal",
+        "@scheduler_crates//:ruzstd",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:serde_json",
+        "@scheduler_crates//:tokio",
+        "@scheduler_crates//:tokio-util",
+        "@scheduler_crates//:tracing",
+    ],
+)
+
+rust_binary(
+    name = "convert_image_digests",
+    srcs = ["tools/convert_image_digests.rs", "tools/index_image_layer.rs"],
+    crate_root = "tools/convert_image_digests.rs",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":xlb_publish",
+        "//vendor/xlb/crates/xlb-core:xlb_core",
+        "@scheduler_crates//:anyhow",
+        "@scheduler_crates//:blake3",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:serde_json",
+        "@scheduler_crates//:tar",
+    ],
+)
+
+filegroup(
+    name = "traced_sources",
+    srcs = glob(["src/**/*.rs", "tools/*.rs"]),
+    visibility = ["//doc:__pkg__"],
+)

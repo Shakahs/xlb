@@ -1,6 +1,6 @@
 //! Read-only OCI Distribution endpoint for the node's containerd.
 
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -19,7 +19,7 @@ use tower::{Layer, Service, ServiceExt, limit::GlobalConcurrencyLimitLayer, serv
 use xlb::{Asset, AssetClass};
 use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_DIGEST_PREFIX, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex, is_digest_hex};
 
-use crate::disk_chunks::{ChunkSlice, DiskChunks};
+use xlb_mount::{ChunkSlice, DiskChunks};
 
 #[derive(Clone)]
 struct ImageMirror {
@@ -31,9 +31,7 @@ struct ImageMirror {
 }
 
 // [impl -> dsn~xlb-image-mirror~1]
-pub async fn serve(class: AssetClass, concurrency: NonZeroUsize) -> Result<()> {
-    let concurrency = concurrency.get();
-    let disk = DiskChunks::start(concurrency).await.context("start the io_uring chunk reader")?;
+pub async fn serve(class: AssetClass, concurrency: usize, disk: DiskChunks) -> Result<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 5477))
         .await
         .context("bind OCI image mirror")?;

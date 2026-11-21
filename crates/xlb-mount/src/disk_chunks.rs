@@ -8,10 +8,10 @@ use tokio::sync::{mpsc, oneshot};
 
 const READ_BYTES: usize = 64 * 1024;
 
-pub(crate) struct ChunkSlice {
-    pub(crate) file: File,
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+pub struct ChunkSlice {
+    pub file: File,
+    pub start: u64,
+    pub end: u64,
 }
 
 struct ChunkRead {
@@ -20,14 +20,14 @@ struct ChunkRead {
 }
 
 #[derive(Clone)]
-pub(crate) struct DiskChunks(mpsc::Sender<ChunkRead>);
+pub struct DiskChunks(mpsc::Sender<ChunkRead>);
 
 fn messages<T>(receiver: mpsc::Receiver<T>) -> impl Stream<Item = T> {
     stream::unfold(receiver, |mut receiver| async { receiver.recv().await.map(|item| (item, receiver)) })
 }
 
 impl DiskChunks {
-    pub(crate) async fn start(depth: usize) -> io::Result<Self> {
+    pub async fn start(depth: usize) -> io::Result<Self> {
         let (requests, pending) = mpsc::channel::<ChunkRead>(depth);
         let (startup, ready) = oneshot::channel();
         std::thread::Builder::new().name("xlb-cache-reader".into()).spawn(move || {
@@ -46,7 +46,7 @@ impl DiskChunks {
         Ok(Self(requests))
     }
 
-    pub(crate) async fn read(&self, slice: ChunkSlice) -> io::Result<impl Stream<Item = io::Result<Bytes>> + use<>> {
+    pub async fn read(&self, slice: ChunkSlice) -> io::Result<impl Stream<Item = io::Result<Bytes>> + use<>> {
         let (output, body) = mpsc::channel(2);
         self.0.send(ChunkRead { slice, output }).await
             .map_err(|_| io::Error::other("the io_uring reader stopped"))?;
@@ -67,7 +67,7 @@ impl ChunkRead {
             let (result, buffer) = reader.read_at(BytesMut::with_capacity(len), offset).await;
             let count = result?;
             if count == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "cached image chunk ended early"));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "cached chunk ended early"));
             }
             Ok(Some((buffer.freeze(), offset + count as u64)))
         });

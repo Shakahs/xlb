@@ -310,7 +310,7 @@ impl AssetClass {
     }
 
     /// The configured name of this class.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'static str {
         self.0.name
     }
 

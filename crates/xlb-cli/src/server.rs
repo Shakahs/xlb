@@ -27,6 +27,7 @@ pub struct ClassEntry {
     pub name: String,
     pub class: AssetClass,
     pub has_origin: bool,
+    pub(crate) model_mount: Option<xlb_mount::ModelMount>,
 }
 
 #[derive(Clone)]
@@ -302,13 +303,20 @@ async fn do_fetch(
     let sink: ProgressSink = Arc::new(move |progress| {
         latest_tx.send_replace(Some(progress));
     });
-    let asset = entry.class.asset(hash);
-    let fetch = asset.fetch_to_file_reported(Some(sink));
+    let fetch = async {
+        if let Some(mount) = &entry.model_mount {
+            let report = mount.prepare(hash, sink).await?;
+            Ok::<_, anyhow::Error>((mount.path(hash), report))
+        } else {
+            let (result, report) = entry.class.asset(hash).fetch_to_file_reported(Some(sink)).await;
+            Ok((result?, report))
+        }
+    };
     tokio::pin!(fetch);
     let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let (result, report) = loop {
+    let result = loop {
         tokio::select! {
             done = &mut fetch => break done,
             _ = ticker.tick() => {
@@ -328,8 +336,9 @@ async fn do_fetch(
         }
     };
 
-    match (result, report.tier) {
-        (Ok(path), Some(tier)) => {
+    match result {
+        Ok((path, report)) if report.tier.is_some() => {
+            let tier = report.tier.unwrap();
             let _ = state.event_tx.send(NodeEvent::FetchCompleted {
                 class: class_name.to_string(),
                 hash: hash_str.to_string(),
@@ -347,10 +356,10 @@ async fn do_fetch(
                 sources: xlb::FetchSources { origin_bytes: report.origin_bytes, peers: report.peers },
             }))
         }
-        (Ok(_), None) => Ok(Response::Error {
+        Ok(_) => Ok(Response::Error {
             message: "fetch succeeded without a serving tier".into(),
         }),
-        (Err(e), _) => {
+        Err(e) => {
             let _ = state.event_tx.send(NodeEvent::FetchFailed {
                 class: class_name.to_string(),
                 hash: hash_str.to_string(),

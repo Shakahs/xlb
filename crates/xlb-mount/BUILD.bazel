@@ -1,0 +1,32 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+
+rust_library(
+    name = "xlb_mount",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    visibility = ["//vendor/xlb/crates/xlb-cli:__pkg__", "//scheduler:__pkg__"],
+    deps = [
+        "//vendor/xlb/crates/xlb",
+        "//vendor/xlb/crates/xlb-core:xlb_core",
+        "@scheduler_crates//:anyhow",
+        "@scheduler_crates//:bytes",
+        "@scheduler_crates//:containerd-snapshots",
+        "@scheduler_crates//:fuser",
+        "@scheduler_crates//:futures",
+        "@scheduler_crates//:libc",
+        "@scheduler_crates//:rand",
+        "@scheduler_crates//:serde",
+        "@scheduler_crates//:serde_json",
+        "@scheduler_crates//:tokio",
+        "@scheduler_crates//:tokio-stream",
+        "@scheduler_crates//:tokio-uring",
+        "@scheduler_crates//:tonic",
+        "@scheduler_crates//:tracing",
+    ],
+)
+
+filegroup(
+    name = "traced_sources",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//doc:__pkg__"],
+)

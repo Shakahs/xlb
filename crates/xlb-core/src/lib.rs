@@ -3,8 +3,10 @@
 //!
 //! The native `xlb` crate re-exports these types from its root.
 
+pub mod chunks;
 pub mod hash;
 pub mod image;
+pub mod layer;
 pub mod peer;
 pub mod retention;
 

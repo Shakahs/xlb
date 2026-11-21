@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::BlakeHash;
 
-pub const IMAGE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub const IMAGE_CHUNK_BYTES: usize = crate::chunks::CAS_CHUNK_BYTES as usize;
 /// Index objects are keyed by the blob's BLAKE3 OCI digest (`blake3:<hex>`).
 pub const IMAGE_INDEX_PREFIX: &str = "images/blake3/";
 pub const IMAGE_INDEX_LIMIT: usize = 16 * 1024 * 1024;

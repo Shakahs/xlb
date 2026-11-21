@@ -64,6 +64,9 @@ pub struct NodeSettings {
     /// Serve the local OCI pull endpoint from this class's S3 origin.
     #[serde(default)]
     pub image_mirror_class: Option<String>,
+    /// Serve the containerd snapshot service over a node-local Unix socket.
+    #[serde(default)]
+    pub snapshotter: Option<xlb_mount::SnapshotSettings>,
     /// Maximum active OCI chunk downloads across pulls on this node.
     #[serde(default = "default_chunk_concurrency")]
     pub chunk_concurrency: NonZeroUsize,
@@ -113,6 +116,9 @@ impl NodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassConfig {
     pub name: String,
+    /// Expose chunk-indexed models from this class at a read-only mount.
+    #[serde(default)]
+    pub model_mount: Option<PathBuf>,
     /// Directory of the plain files, one per complete blob.
     pub cache_dir: String,
     /// LRU budget for unpinned blobs.

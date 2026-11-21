@@ -1,10 +1,10 @@
 [package]
 name = "xlb"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.8.51"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/xlb"
 description = "BLAKE3-verified blob distribution to plain files: local cache, iroh-blobs peers, ranged HTTP origin"
 readme = "README.md"
 keywords = ["p2p", "content-addressed", "blob", "blake3", "iroh"]
@@ -18,12 +18,12 @@ path = "src/lib.rs"
 # enclosing repository. These requirements mirror what that universe provides.
 [dependencies]
 xlb-core = { path = "../xlb-core", version = "0.8.51" }
-bao-tree = { version = "0.16", default-features = false }
+bao-tree = { version = "0.17", default-features = false }
 bytes = "1"
 futures = "0.3"
 hex = "0.4"
 iroh = { version = "1.4", default-features = false, features = ["tls-aws-lc-rs"] }
-iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
+iroh-blobs = { version = "0.105", default-features = false, features = ["fs-store"] }
 iroh-gossip = { version = "0.103", default-features = false, features = ["net"] }
 iroh-smol-kv = { version = "0.5", default-features = false }
 libc = "0.2"

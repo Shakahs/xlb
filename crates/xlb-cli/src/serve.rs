@@ -33,7 +33,16 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         cfg.node.metrics_path.as_deref(),
     )?);
 
+    let concurrency = cfg.node.chunk_concurrency.get();
+    let disk = if cfg.node.image_mirror_class.is_some() || cfg.node.snapshotter.is_some()
+        || cfg.classes.iter().any(|class| class.model_mount.is_some())
+    {
+        Some(xlb_mount::DiskChunks::start(concurrency).await.context("start the io_uring chunk reader")?)
+    } else {
+        None
+    };
     let mut classes = Vec::new();
+    let mut model_sessions = Vec::new();
     for cc in &cfg.classes {
         // AssetClassConfig.name is &'static str; leak each name once at startup.
         let name: &'static str = Box::leak(cc.name.clone().into_boxed_str());
@@ -47,10 +56,19 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         let class = AssetClass::register(config)
             .await
             .with_context(|| format!("register class {}", cc.name))?;
+        let model_mount = if let Some(root) = &cc.model_mount {
+            let disk = disk.clone().context("model mount requires a chunk reader")?;
+            let (mount, session) = xlb_mount::ModelMount::start(root, class.clone(), disk, concurrency).await?;
+            model_sessions.push(session);
+            Some(mount)
+        } else {
+            None
+        };
         classes.push(ClassEntry {
             name: cc.name.clone(),
             class,
             has_origin,
+            model_mount,
         });
     }
 
@@ -93,7 +111,17 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
             .with_context(|| format!("image mirror requires an S3 origin for class {name}"))?;
         let class = state.classes.iter().find(|entry| entry.name == name)
             .context("image mirror class is not registered")?;
-        crate::image_mirror::serve(class.class.clone(), cfg.node.chunk_concurrency).await
+        let disk = disk.clone().context("image mirror requires a chunk reader")?;
+        crate::image_mirror::serve(class.class.clone(), concurrency, disk).await
+    };
+    let snapshotter = async {
+        let Some(config) = cfg.node.snapshotter.clone() else {
+            return std::future::pending().await;
+        };
+        let class = state.classes.iter().find(|entry| entry.name == config.class)
+            .context("snapshotter class is not registered")?;
+        let disk = disk.clone().context("snapshotter requires a chunk reader")?;
+        xlb_mount::serve_snapshots(config, class.class.clone(), disk).await
     };
 
     // The full node ID and the bound addresses are what a peer needs.
@@ -108,10 +136,12 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     tokio::select! {
         signal = shutdown_signal() => signal?,
         result = mirror => result?,
+        result = snapshotter => result?,
         // The listener only returns when it could not bind.
         listener = listener => listener.context("socket task")??,
     }
     println!("shutting down");
+    drop(model_sessions);
     // Close the endpoints before they drop, so peers see a clean close.
     for entry in state.classes.iter() {
         entry.class.shutdown().await;

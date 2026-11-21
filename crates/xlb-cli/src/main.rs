@@ -1,7 +1,6 @@
 //! `xlb` — run a node daemon, or talk to one over its control socket.
 
 mod config;
-mod disk_chunks;
 mod fetch_cmd;
 mod image_mirror;
 mod inspect;

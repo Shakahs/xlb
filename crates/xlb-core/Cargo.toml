@@ -1,10 +1,10 @@
 [package]
 name = "xlb-core"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.8.51"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/xlb"
 description = "xlb's platform-neutral core: BlakeHash and the retention policy."
 
 [dependencies]

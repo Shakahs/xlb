@@ -2,7 +2,7 @@
 # iteration but is intended to move to its own repo. yah's `.gitignore`
 # excludes `external/`, so this tree carries independent git history.
 [workspace]
-members = ["crates/xlb", "crates/xlb-cli", "crates/xlb-client", "crates/xlb-core"]
+members = ["crates/xlb", "crates/xlb-cli", "crates/xlb-client", "crates/xlb-core", "crates/xlb-mount", "crates/xlb-publish"]
 resolver = "2"
 
 [workspace.package]
