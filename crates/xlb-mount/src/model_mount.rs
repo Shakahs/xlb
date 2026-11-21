@@ -16,22 +16,21 @@ use fuser::{
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio::runtime::Handle;
 use xlb::{AssetClass, BlakeHash, FetchProgress, FetchReport, FetchSources, FetchTier, ProgressSink};
-use xlb_core::chunks::{CAS_INDEX_LIMIT, ChunkIndex, MODEL_INDEX_PREFIX};
+use xlb_core::chunks::{CAS_INDEX_LIMIT, ModelIndex, MODEL_INDEX_PREFIX};
 
-use crate::{chunk_file::ChunkFile, snapshot_store::write_index, snapshotter::clear_disconnected_mount};
+use crate::{chunk_file::ChunkFile, snapshotter::clear_disconnected_mount};
 
 const ENTRY_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct ModelEntries {
     inodes: HashMap<BlakeHash, INodeNo>,
-    files: Vec<(BlakeHash, ChunkFile)>,
+    files: Vec<(BlakeHash, Option<ChunkFile>)>,
 }
 
 #[derive(Clone)]
 pub struct ModelMount {
     root: PathBuf,
-    indexes: PathBuf,
     class: AssetClass,
     entries: Arc<RwLock<ModelEntries>>,
     runtime: Handle,
@@ -40,15 +39,13 @@ pub struct ModelMount {
 
 impl ModelMount {
     pub async fn start(root: &Path, class: AssetClass, concurrency: usize) -> Result<(Self, BackgroundSession)> {
-        let indexes = class.cache_dir().join(".model-indexes");
-        tokio::fs::create_dir_all(&indexes).await?;
         match tokio::fs::create_dir_all(root).await {
             Ok(()) => {}
             Err(error) if error.raw_os_error() == Some(libc::ENOTCONN) => {}
             Err(error) => return Err(error.into()),
         }
         let mount = Self {
-            root: root.to_owned(), indexes, class, entries: Arc::default(), runtime: Handle::current(), concurrency,
+            root: root.to_owned(), class, entries: Arc::default(), runtime: Handle::current(), concurrency,
         };
         let filesystem = mount.clone();
         let session = tokio::task::spawn_blocking(move || {
@@ -70,15 +67,12 @@ impl ModelMount {
 
     pub async fn prepare(&self, hash: BlakeHash, report_progress: ProgressSink) -> Result<FetchReport> {
         let started = Instant::now();
-        let (_, file) = self.resolve(hash).await?.context("model has no CAS index")?;
+        let (ino, file) = self.resolve(hash).await?.context("model has no CAS index")?;
         let total = file.index.size_bytes;
-        let index = &file.index;
+        let file = &file;
         let mut chunks = stream::iter(0..file.index.chunks.len() as u64)
             .map(|ordinal| async move {
-                let (chunk, length) = index.chunk(ordinal).context("model CAS index is truncated")?;
-                let (result, report) = self.class.indexed_chunk(chunk, length).read_chunk_reported().await;
-                result?;
-                ensure!(report.bytes_served == length, "model CAS chunk {chunk} has an unexpected length");
+                let (_, report) = file.read_chunk(ordinal).await.map_err(|error| self.check_read(ino, file, error))?;
                 Ok::<_, anyhow::Error>(report)
             }).buffer_unordered(self.concurrency);
         let mut sources = FetchSources::default();
@@ -105,42 +99,63 @@ impl ModelMount {
         })
     }
 
-    fn file(&self, ino: INodeNo) -> Option<ChunkFile> {
+    fn hash(&self, ino: INodeNo) -> Option<BlakeHash> {
         let index = usize::try_from(ino.0.checked_sub(2)?).ok()?;
-        self.entries.read().unwrap().files.get(index).map(|(_, file)| file.clone())
+        self.entries.read().unwrap().files.get(index).map(|(hash, _)| *hash)
+    }
+
+    fn check_read(&self, ino: INodeNo, file: &ChunkFile, error: anyhow::Error) -> anyhow::Error {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == ErrorKind::InvalidData) {
+            let mut entries = self.entries.write().unwrap();
+            let (_, stored) = &mut entries.files[(ino.0 - 2) as usize];
+            if stored.as_ref().is_some_and(|stored| Arc::ptr_eq(&stored.index, &file.index)) {
+                *stored = None;
+            }
+        }
+        error
+    }
+
+    async fn decode(&self, hash: BlakeHash, bytes: &[u8]) -> Result<ChunkFile> {
+        let index: ModelIndex = serde_json::from_slice(bytes).context("parse model CAS index")?;
+        ensure!(index.matches_root(hash), "model CAS index does not match its BLAKE3 name");
+        let legacy = index.layout.chunks.len() > 1 && index.chaining_values.is_empty();
+        let file = ChunkFile::new(Arc::new(index.layout), self.class.clone())?
+            .with_model_values(index.chaining_values);
+        if legacy {
+            let file = &file;
+            let mut reads = stream::iter(0..file.index.chunks.len() as u64)
+                .map(|ordinal| file.read_chunk(ordinal))
+                .buffered(self.concurrency);
+            let mut hasher = blake3::Hasher::new();
+            while let Some((body, _)) = reads.try_next().await? {
+                hasher.update(&body);
+            }
+            ensure!(hasher.finalize().as_bytes() == hash.as_bytes(),
+                "legacy model CAS index does not match its BLAKE3 name");
+        }
+        Ok(file)
     }
 
     async fn resolve(&self, hash: BlakeHash) -> Result<Option<(INodeNo, ChunkFile)>> {
         {
             let entries = self.entries.read().unwrap();
             if let Some(&ino) = entries.inodes.get(&hash) {
-                return Ok(Some((ino, entries.files[(ino.0 - 2) as usize].1.clone())));
+                if let Some(file) = &entries.files[(ino.0 - 2) as usize].1 {
+                    return Ok(Some((ino, file.clone())));
+                }
             }
         }
-        let path = self.indexes.join(hash.to_hex());
-        let (bytes, download) = match tokio::fs::read(&path).await {
-            Ok(bytes) => (bytes, false),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                let key = format!("{MODEL_INDEX_PREFIX}{hash}");
-                let Some(bytes) = self.class.read_origin_object(&key, CAS_INDEX_LIMIT).await? else {
-                    return Ok(None);
-                };
-                (bytes, true)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let index: ChunkIndex = serde_json::from_slice(&bytes).context("parse model CAS index")?;
-        let file = ChunkFile::new(Arc::new(index), self.class.clone())?;
-        if download {
-            tokio::task::spawn_blocking(move || write_index(&path, &bytes)).await??;
-        }
+        let key = format!("{MODEL_INDEX_PREFIX}{hash}");
+        let Some(bytes) = self.class.read_origin_object(&key, CAS_INDEX_LIMIT).await? else { return Ok(None); };
+        let file = self.decode(hash, &bytes).await?;
         let mut entries = self.entries.write().unwrap();
         if let Some(&ino) = entries.inodes.get(&hash) {
-            return Ok(Some((ino, entries.files[(ino.0 - 2) as usize].1.clone())));
+            let stored = entries.files[(ino.0 - 2) as usize].1.get_or_insert(file);
+            return Ok(Some((ino, stored.clone())));
         }
         let ino = INodeNo(entries.files.len() as u64 + 2);
         entries.inodes.insert(hash, ino);
-        entries.files.push((hash, file.clone()));
+        entries.files.push((hash, Some(file.clone())));
         Ok(Some((ino, file)))
     }
 }
@@ -188,12 +203,20 @@ impl Filesystem for ModelMount {
 
     fn getattr(&self, _request: &Request, ino: INodeNo, _file: Option<FileHandle>, reply: ReplyAttr) {
         if ino == INodeNo::ROOT {
-            reply.attr(&ENTRY_TTL, &attr(ino, 0));
-        } else if let Some(file) = self.file(ino) {
-            reply.attr(&ENTRY_TTL, &attr(ino, file.index.size_bytes));
-        } else {
-            reply.error(Errno::ENOENT);
+            return reply.attr(&ENTRY_TTL, &attr(ino, 0));
         }
+        let Some(hash) = self.hash(ino) else { return reply.error(Errno::ENOENT); };
+        let mount = self.clone();
+        self.runtime.spawn(async move {
+            match mount.resolve(hash).await {
+                Ok(Some((_, file))) => reply.attr(&ENTRY_TTL, &attr(ino, file.index.size_bytes)),
+                Ok(None) => reply.error(Errno::ENOENT),
+                Err(error) => {
+                    tracing::warn!(%hash, %error, "resolve mounted model attributes");
+                    reply.error(Errno::EIO);
+                }
+            }
+        });
     }
 
     fn readdir(&self, _request: &Request, ino: INodeNo, _file: FileHandle, offset: u64, mut reply: ReplyDirectory) {
@@ -219,11 +242,16 @@ impl Filesystem for ModelMount {
     fn read(&self, _request: &Request, ino: INodeNo, _file: FileHandle, offset: u64, size: u32,
         _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData,
     ) {
-        let Some(file) = self.file(ino) else {
+        let Some(hash) = self.hash(ino) else {
             return reply.error(Errno::ENOENT);
         };
+        let mount = self.clone();
         self.runtime.spawn(async move {
-            match file.read(offset, size).await {
+            let result = async {
+                let (_, file) = mount.resolve(hash).await?.context("model has no CAS index")?;
+                file.read(offset, size).await.map_err(|error| mount.check_read(ino, &file, error))
+            }.await;
+            match result {
                 Ok(bytes) => reply.data(&bytes),
                 Err(error) => {
                     tracing::warn!(%ino, %error, "read mounted model");

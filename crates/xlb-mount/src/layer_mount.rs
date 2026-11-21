@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
+    mem::size_of,
     os::unix::ffi::OsStrExt,
     path::Path,
     sync::Arc,
@@ -10,8 +11,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyXattr, Request, SessionACL,
+    INodeNo, IoctlFlags, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEntry, ReplyIoctl, ReplyXattr, Request, SessionACL,
 };
 use tokio::runtime::Handle;
 use xlb::AssetClass;
@@ -20,6 +21,11 @@ use xlb_core::layer::{LayerEntry, LayerEntryKind, LayerIndex};
 use crate::chunk_file::ChunkFile;
 
 const ENTRY_TTL: Duration = Duration::from_secs(3600);
+const FS_GET_FLAGS: u32 = libc::FS_IOC_GETFLAGS as u32;
+const FS_GET_COMPAT_FLAGS: u32 = libc::_IOR::<libc::c_int>(b'f' as u32, 1) as u32;
+// Linux struct fsxattr has five u32 fields and eight reserved bytes.
+const FS_XATTR_BYTES: usize = 5 * size_of::<u32>() + 8;
+const FS_GET_XATTR: u32 = libc::_IOR::<[u8; FS_XATTR_BYTES]>(b'X' as u32, 31) as u32;
 
 struct LayerNode {
     attr: FileAttr,
@@ -229,6 +235,20 @@ impl Filesystem for LayerMount {
         let Some(node) = self.node(ino) else { return reply.error(Errno::ENOENT); };
         let names: Vec<_> = node.xattrs.keys().flat_map(|name| name.bytes().chain([0])).collect();
         reply_xattr(&names, size, reply);
+    }
+
+    fn ioctl(&self, _: &Request, ino: INodeNo, _: FileHandle, _: IoctlFlags, command: u32,
+        _: &[u8], out_size: u32, reply: ReplyIoctl,
+    ) {
+        if self.node(ino).is_none() { return reply.error(Errno::ENOENT); }
+        // Overlayfs needs these getters for copy-up. Indexed layers have no inode flags.
+        let output: &[u8] = match command {
+            FS_GET_FLAGS | FS_GET_COMPAT_FLAGS => &[0; size_of::<u32>()],
+            FS_GET_XATTR => &[0; FS_XATTR_BYTES],
+            _ => return reply.error(Errno::ENOTTY),
+        };
+        if (out_size as usize) < output.len() { return reply.error(Errno::EINVAL); }
+        reply.ioctl(0, output);
     }
 }
 

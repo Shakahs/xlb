@@ -13,6 +13,7 @@ name = "xlb"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = "1"
 xlb     = { path = "../xlb" }
 xlb-client = { path = "../xlb-client" }
 xlb-core = { path = "../xlb-core" }

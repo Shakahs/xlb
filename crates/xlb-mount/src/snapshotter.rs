@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
+    ffi::CString,
     fs,
     io::ErrorKind,
+    mem::MaybeUninit,
     os::unix::fs::{MetadataExt, PermissionsExt, chown},
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,9 +19,9 @@ use tokio::{net::UnixListener, runtime::Handle, sync::Mutex};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Status, transport::Server};
 use xlb::AssetClass;
-use xlb_core::{BlakeHash, chunks::CAS_INDEX_LIMIT, image::blake3_digest_hex, layer::{LAYER_INDEX_LABEL, LAYER_INDEX_PREFIX, LayerIndex}};
+use xlb_core::{BlakeHash, image::blake3_digest_hex, layer::{LAYER_INDEX_LABEL, LAYER_INDEX_LIMIT, LAYER_INDEX_PREFIX, LayerIndex}};
 
-use crate::{layer_mount::mount_layer, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, write_index}};
+use crate::{layer_mount::mount_layer, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
 
 const SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
@@ -48,9 +50,8 @@ pub async fn serve_snapshots(config: SnapshotSettings, class: AssetClass) -> Res
     let mut sessions = HashMap::new();
     for record in records.values() {
         if let Some(digest) = record.layer {
-            let bytes = tokio::fs::read(store.index(digest)).await.context("restore OCI layer index")?;
             let diff_id = record.info.labels.get(SNAPSHOT_DIFF_ID).context("snapshot has no diff ID")?;
-            let index = verify_index(&bytes, digest, diff_id)?;
+            let index = load_layer_index(&store, &class, digest, diff_id).await.context("restore OCI layer index")?;
             let session = start_layer(index, &store.upper(record), class.clone()).await?;
             sessions.insert(record.id.clone(), session);
         }
@@ -78,6 +79,23 @@ fn verify_index(bytes: &[u8], digest: BlakeHash, diff_id: &str) -> Result<LayerI
     Ok(index)
 }
 
+async fn load_layer_index(store: &SnapshotStore, class: &AssetClass, digest: BlakeHash, diff_id: &str) -> Result<LayerIndex, Status> {
+    let path = store.index(digest);
+    match read_index(&path).await {
+        Ok(bytes) => match verify_index(&bytes, digest, diff_id) {
+            Ok(index) => return Ok(index),
+            Err(error) => tracing::warn!(%digest, %error, "refetch unreadable OCI filesystem index"),
+        },
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => {},
+        Err(error) => return Err(failure(error)),
+    }
+    let bytes = class.read_origin_object(&format!("{LAYER_INDEX_PREFIX}{digest}"), LAYER_INDEX_LIMIT).await.map_err(failure)?
+        .ok_or_else(|| Status::not_found(format!("OCI filesystem index {digest} is missing")))?;
+    let index = verify_index(&bytes, digest, diff_id).map_err(failure)?;
+    tokio::task::spawn_blocking(move || write_index(&path, &bytes)).await.map_err(failure)?.map_err(failure)?;
+    Ok(index)
+}
+
 async fn start_layer(index: LayerIndex, path: &Path, class: AssetClass) -> Result<BackgroundSession> {
     let path = path.to_owned();
     let runtime = Handle::current();
@@ -88,18 +106,18 @@ async fn start_layer(index: LayerIndex, path: &Path, class: AssetClass) -> Resul
 }
 
 pub(crate) fn clear_disconnected_mount(path: &Path) -> Result<()> {
-    match fs::metadata(path) {
-        Ok(_) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::ENOTCONN) => {
-            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-            // SAFETY: the path is NUL-terminated and lives through the syscall.
-            if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
+    let path = CString::new(path.as_os_str().as_encoded_bytes())?;
+    let mut stats = MaybeUninit::<libc::statfs>::uninit();
+    // Unlike cached inode attributes, statfs checks the live FUSE session.
+    // SAFETY: the pathname is NUL-terminated and stats provides writable storage.
+    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOTCONN) { return Err(error.into()); }
+    // SAFETY: the pathname is NUL-terminated and lives through the syscall.
+    if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
 }
 
 fn failure(error: impl std::fmt::Display) -> Status {
@@ -140,21 +158,6 @@ impl CasSnapshotter {
         Ok(vec![Mount { source, r#type: mount_type.into(), options, ..Mount::default() }])
     }
 
-    async fn layer_index(&self, digest: BlakeHash, diff_id: &str) -> Result<LayerIndex, Status> {
-        let path = self.store.index(digest);
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => verify_index(&bytes, digest, diff_id).map_err(failure),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                let bytes = self.class.read_origin_object(&format!("{LAYER_INDEX_PREFIX}{digest}"), CAS_INDEX_LIMIT).await.map_err(failure)?
-                    .ok_or_else(|| Status::not_found(format!("OCI filesystem index {digest} is missing")))?;
-                let index = verify_index(&bytes, digest, diff_id).map_err(failure)?;
-                tokio::task::spawn_blocking(move || write_index(&path, &bytes)).await.map_err(failure)?.map_err(failure)?;
-                Ok(index)
-            }
-            Err(error) => Err(failure(error)),
-        }
-    }
-
     async fn create(&self, key: String, parent: String, labels: HashMap<String, String>, kind: Kind) -> Result<Vec<Mount>, Status> {
         let target = labels.get(SNAPSHOT_REF);
         let digest = labels.get(LAYER_INDEX_LABEL);
@@ -173,7 +176,7 @@ impl CasSnapshotter {
         };
 
         let index = match &remote {
-            Some((digest, diff_id)) => Some(self.layer_index(*digest, diff_id).await?),
+            Some((digest, diff_id)) => Some(load_layer_index(&self.store, &self.class, *digest, diff_id).await?),
             None => None,
         };
         let mut state = self.state.lock().await;

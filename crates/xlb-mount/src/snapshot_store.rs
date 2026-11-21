@@ -8,7 +8,8 @@ use std::{
 
 use containerd_snapshots::{Info, Usage};
 use serde::{Deserialize, Serialize};
-use xlb_core::BlakeHash;
+use tokio::io::AsyncReadExt;
+use xlb_core::{BlakeHash, layer::LAYER_INDEX_LIMIT};
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct SnapshotRecord {
@@ -79,6 +80,15 @@ pub(crate) fn write_index(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })();
     if result.is_err() { let _ = fs::remove_file(staged); }
     result
+}
+
+pub(crate) async fn read_index(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path).await?.take(LAYER_INDEX_LIMIT as u64 + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() > LAYER_INDEX_LIMIT {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "cached CAS index exceeds its size limit"));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn disk_usage(root: &Path) -> std::io::Result<Usage> {

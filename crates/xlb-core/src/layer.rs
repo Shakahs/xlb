@@ -8,6 +8,7 @@ use crate::{BlakeHash, chunks::ChunkIndex};
 
 pub const LAYER_INDEX_PREFIX: &str = "layer-indexes/blake3/";
 pub const LAYER_INDEX_LABEL: &str = "containerd.io/snapshot/xlb.layer-index";
+pub const LAYER_INDEX_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LayerIndex {

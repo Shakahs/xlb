@@ -9,6 +9,8 @@ rust_library(
         "//vendor/xlb/crates/xlb",
         "//vendor/xlb/crates/xlb-core:xlb_core",
         "@scheduler_crates//:anyhow",
+        "@scheduler_crates//:blake3",
+        "@scheduler_crates//:bytes",
         "@scheduler_crates//:containerd-snapshots",
         "@scheduler_crates//:fuser",
         "@scheduler_crates//:futures",

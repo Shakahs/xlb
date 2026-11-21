@@ -1,6 +1,6 @@
 //! Read-only OCI Distribution endpoint for the node's containerd.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io::{Error, ErrorKind}, ops::Range, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -12,12 +12,13 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use rand::seq::SliceRandom;
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::task::AbortOnDropHandle;
 use tower::{Layer, Service, ServiceExt, limit::GlobalConcurrencyLimitLayer, service_fn};
-use xlb::{Asset, AssetClass};
+use xlb::{Asset, AssetClass, BlakeHash};
+use xlb_core::chunks::positioned_value;
 use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_DIGEST_PREFIX, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex, is_digest_hex};
 
 #[derive(Clone)]
@@ -49,8 +50,16 @@ fn router(class: AssetClass, concurrency: usize) -> Router {
         })
 }
 
-async fn open_slice((asset, start, end): (Asset, u64, u64)) -> Result<Bytes> {
-    Ok(asset.read_chunk().await?.slice(start as usize..end as usize))
+async fn open_slice((asset, range, positioned): (Asset, Range<usize>, Option<(u64, BlakeHash)>)) -> Result<Bytes> {
+    let bytes = asset.read_chunk().await?;
+    if let Some((offset, value)) = positioned {
+        let payload = bytes.clone();
+        let actual = tokio::task::spawn_blocking(move || positioned_value(offset, &payload)).await?;
+        if actual != value {
+            return Err(Error::new(ErrorKind::InvalidData, "OCI chunk differs from its indexed position").into());
+        }
+    }
+    Ok(bytes.slice(range))
 }
 
 impl ImageMirror {
@@ -63,11 +72,27 @@ impl ImageMirror {
             return Ok(None);
         };
         let blob: ImageBlobIndex = serde_json::from_slice(&bytes).context("parse OCI image index")?;
-        anyhow::ensure!(blob.has_complete_chunk_list(), "OCI blob index has the wrong number of chunks");
+        let hash = BlakeHash::from_hex(digest)?;
+        anyhow::ensure!(blob.matches_root(hash), "OCI blob index differs from its BLAKE3 digest");
         HeaderValue::from_str(&blob.media_type).context("invalid indexed OCI media type")?;
+        if blob.chunks.len() > 1 && blob.chaining_values.is_empty() {
+            let limit = &self.chunk_limit;
+            let blob = &blob;
+            let mut chunks = stream::iter(0..blob.chunks.len()).map(|position| {
+                let offset = position as u64 * IMAGE_CHUNK_BYTES as u64;
+                let size = (blob.size_bytes - offset).min(IMAGE_CHUNK_BYTES as u64);
+                let chunk = self.class.indexed_chunk(blob.chunks[position], size);
+                limit.layer(service_fn(open_slice)).oneshot((chunk, 0..size as usize, None))
+            }).buffered(self.concurrency);
+            let mut hasher = blake3::Hasher::new();
+            while let Some(bytes) = chunks.try_next().await? {
+                hasher.update(&bytes);
+            }
+            anyhow::ensure!(hasher.finalize().as_bytes() == hash.as_bytes(),
+                "legacy OCI blob index differs from its BLAKE3 digest");
+        }
         let blob = Arc::new(blob);
-        self.index.write().await.insert(digest.to_owned(), blob.clone());
-        Ok(Some(blob))
+        Ok(Some(self.index.write().await.entry(digest.to_owned()).or_insert(blob).clone()))
     }
 }
 
@@ -131,12 +156,12 @@ impl ImageMirror {
             }
             None => (0, size),
         };
-        let body = self.chunk_body(blob, start, length);
+        let body = self.chunk_body(digest.to_owned(), blob, start, length);
         Ok(response.header(header::CONTENT_LENGTH, length).body(body)?)
     }
 
     // [impl -> dsn~xlb-chunk-discovery~1]
-    fn chunk_body(&self, blob: Arc<ImageBlobIndex>, start: u64, length: u64) -> Body {
+    fn chunk_body(&self, digest: String, blob: Arc<ImageBlobIndex>, start: u64, length: u64) -> Body {
         let end = start + length;
         let chunk_bytes = IMAGE_CHUNK_BYTES as u64;
         let class = self.class.clone();
@@ -144,6 +169,8 @@ impl ImageMirror {
         let last = end.div_ceil(chunk_bytes);
         let width = self.concurrency;
         let limit = self.chunk_limit.clone();
+        let cached = self.index.clone();
+        let resolved = blob.clone();
         let sources = stream::iter((first..last).step_by(width))
             .flat_map(move |window| {
                 let mut positions: Vec<_> = (window..(window + width as u64).min(last)).collect();
@@ -152,21 +179,37 @@ impl ImageMirror {
                     let offset = position * chunk_bytes;
                     let size = (blob.size_bytes - offset).min(chunk_bytes);
                     let asset = class.indexed_chunk(blob.chunks[position as usize], size);
-                    let local_start = start.saturating_sub(offset);
-                    let local_end = (end - offset).min(size);
+                    let range = start.saturating_sub(offset) as usize..(end - offset).min(size) as usize;
+                    let positioned = blob.chaining_values.get(position as usize).map(|value| (offset, *value));
                     let mut open = limit.layer(service_fn(open_slice));
                     let pull = tokio::spawn(async move {
                         open.ready().await?;
                         // The asset store finishes a shared fetch after its caller drops.
                         // Keep the Tower permit until that fetch finishes, too.
-                        tokio::spawn(open.call((asset, local_start, local_end))).await?
+                        tokio::spawn(open.call((asset, range, positioned))).await?
                     });
                     (position, AbortOnDropHandle::new(pull))
                 }).collect();
                 pulls.sort_unstable_by_key(|(position, _)| *position);
                 stream::iter(pulls.into_iter().map(|(_, pull)| pull))
             })
-            .then(|pull| async move { pull.await? });
+            .then(move |pull| {
+                let cached = cached.clone();
+                let resolved = resolved.clone();
+                let digest = digest.clone();
+                async move {
+                    let result = pull.await?;
+                    if let Err(error) = &result {
+                        if error.downcast_ref::<Error>().is_some_and(|error| error.kind() == ErrorKind::InvalidData) {
+                            let mut index = cached.write().await;
+                            if index.get(&digest).is_some_and(|current| Arc::ptr_eq(current, &resolved)) {
+                                index.remove(&digest);
+                            }
+                        }
+                    }
+                    result
+                }
+            });
         Body::from_stream(sources)
     }
 }

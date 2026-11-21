@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, ensure};
 use serde::Deserialize;
 use serde_json::Value;
-use xlb_core::{chunks::CAS_INDEX_LIMIT, layer::LAYER_INDEX_LABEL};
+use xlb_core::layer::{LAYER_INDEX_LABEL, LAYER_INDEX_LIMIT};
 
 use xlb_publish::image_archive;
 mod index_image_layer;
@@ -108,8 +108,10 @@ fn layer_digests(source: &LayerSource, img: &PathBuf, descriptor: &Value) -> any
     }
     ensure!(stored.bytes == size, "layer stream has {} bytes, its descriptor {size}", stored.bytes);
     let blob = stored.hasher.finalize();
+    let entries = index.entries.len();
     let index = serde_json::to_vec(&index)?;
-    ensure!(index.len() <= CAS_INDEX_LIMIT, "OCI layer index exceeds its read limit");
+    ensure!(index.len() <= LAYER_INDEX_LIMIT, "OCI layer {} index has {} bytes for {entries} entries, limit {LAYER_INDEX_LIMIT}",
+        source.path.display(), index.len());
     std::fs::write(&source.index, &index)?;
     Ok(LayerDigests { blob, diff_id, index: blake3::hash(&index) })
 }

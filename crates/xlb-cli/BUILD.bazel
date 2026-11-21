@@ -10,6 +10,7 @@ XLB_DEPS = [
         "//vendor/xlb/crates/xlb-mount:xlb_mount",
         "@scheduler_crates//:anyhow",
         "@scheduler_crates//:axum",
+        "@scheduler_crates//:blake3",
         "@scheduler_crates//:bytes",
         "@scheduler_crates//:futures",
         "@scheduler_crates//:libc",

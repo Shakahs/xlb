@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::BlakeHash;
+use crate::{BlakeHash, chunks::matches_content_root};
 
 pub const IMAGE_CHUNK_BYTES: usize = crate::chunks::CAS_CHUNK_BYTES as usize;
 /// Index objects are keyed by the blob's BLAKE3 OCI digest (`blake3:<hex>`).
@@ -28,10 +28,16 @@ pub struct ImageBlobIndex {
     pub chunks: Vec<BlakeHash>,
     pub size_bytes: u64,
     pub media_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chaining_values: Vec<BlakeHash>,
 }
 
 impl ImageBlobIndex {
     pub fn has_complete_chunk_list(&self) -> bool {
         self.chunks.len() as u64 == self.size_bytes.div_ceil(IMAGE_CHUNK_BYTES as u64)
+    }
+
+    pub fn matches_root(&self, root: BlakeHash) -> bool {
+        self.has_complete_chunk_list() && matches_content_root(&self.chunks, &self.chaining_values, root)
     }
 }

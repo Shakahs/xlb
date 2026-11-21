@@ -15,8 +15,10 @@ use serde::Deserialize;
 use tokio::{io::{AsyncRead, AsyncReadExt}, process::Child, sync::Semaphore};
 use tokio_util::io::SyncIoBridge;
 use xlb_core::{
+    BlakeHash,
+    chunks::positioned_value,
     image::{IMAGE_CHUNK_BYTES, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex},
-    layer::{LAYER_INDEX_LABEL, LAYER_INDEX_PREFIX, LayerIndex},
+    layer::{LAYER_INDEX_LABEL, LAYER_INDEX_LIMIT, LAYER_INDEX_PREFIX, LayerIndex},
 };
 
 use crate::cas::{cas_chunk_stored, object_stored, publish_cas_chunk};
@@ -76,11 +78,11 @@ pub struct ApplicationImage {
 
 impl ApplicationImage {
     pub fn open(plan: &Path, resolve: impl Fn(&Path) -> Option<PathBuf>) -> anyhow::Result<Self> {
-        let inputs: ImageInputs = serde_json::from_slice(&read_metadata(plan)?)?;
+        let inputs: ImageInputs = serde_json::from_slice(&read_metadata(plan, IMAGE_INDEX_LIMIT)?)?;
         let runfile = |path: &Path| resolve(path).with_context(|| format!("locate image input {}", path.display()));
-        let descriptor: Descriptor = serde_json::from_slice(&read_metadata(&runfile(&inputs.descriptor)?)?)?;
+        let descriptor: Descriptor = serde_json::from_slice(&read_metadata(&runfile(&inputs.descriptor)?, IMAGE_INDEX_LIMIT)?)?;
         let manifest_path = runfile(&inputs.manifest)?;
-        let bytes = read_metadata(&manifest_path)?;
+        let bytes = read_metadata(&manifest_path, IMAGE_INDEX_LIMIT)?;
         ensure!(bytes.len() as u64 == descriptor.size && blake3::hash(&bytes).to_hex().as_str() == oci_digest_hex(&descriptor.digest)?,
             "OCI manifest digest or size differs from its descriptor");
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
@@ -130,12 +132,14 @@ impl ApplicationImage {
 impl LayerPublication {
     // [impl -> dsn~xlb-fuse-snapshots~1]
     async fn publish(&self, blob: &ImageBlob, origin: &Operator, uploads: Arc<Semaphore>, concurrency: usize) -> anyhow::Result<()> {
-        let bytes = read_metadata(&self.path)?;
+        let bytes = read_metadata(&self.path, LAYER_INDEX_LIMIT)?;
         ensure!(self.key.ends_with(blake3::hash(&bytes).to_hex().as_str()), "OCI filesystem index differs from its descriptor");
         let index: LayerIndex = serde_json::from_slice(&bytes)?;
         let archive = index.archive;
         ensure!(archive.is_complete(), "OCI filesystem index has an incomplete archive");
-        if object_stored(origin, &self.key, bytes.len() as u64).await? {
+        let stored = object_stored(origin, &self.key, bytes.len() as u64).await?
+            && origin.read_with(&self.key).range(..bytes.len() as u64).await?.to_bytes() == bytes;
+        if stored {
             let mut chunks = stream::iter(0..archive.chunks.len() as u64).map(|ordinal| {
                 let uploads = uploads.clone();
                 let chunk = archive.chunk(ordinal).expect("validated archive chunk list");
@@ -193,7 +197,7 @@ impl ImageBlob {
         match origin.read(&index_key).await {
             Ok(bytes) => {
                 let entry: ImageBlobIndex = serde_json::from_slice(&bytes.to_vec())?;
-                ensure!(entry.has_complete_chunk_list() && entry.size_bytes == descriptor.size && entry.media_type == descriptor.media_type,
+                ensure!(entry.matches_root(BlakeHash::from_hex(digest)?) && entry.size_bytes == descriptor.size && entry.media_type == descriptor.media_type,
                     "published OCI index differs from the layout descriptor");
                 let complete = stream::iter(entry.chunks.iter().enumerate().map(|(position, hash)| {
                     let size = (entry.size_bytes - position as u64 * IMAGE_CHUNK_BYTES as u64).min(IMAGE_CHUNK_BYTES as u64);
@@ -203,7 +207,7 @@ impl ImageBlob {
                         cas_chunk_stored(origin, *hash, size).await
                     }
                 })).buffer_unordered(concurrency).try_collect::<Vec<_>>().await?;
-                if complete.into_iter().all(|present| present) {
+                if (entry.chunks.len() < 2 || !entry.chaining_values.is_empty()) && complete.into_iter().all(|present| present) {
                     return Ok(());
                 }
                 tracing::warn!(digest = %descriptor.digest, "repairing incomplete OCI blob");
@@ -213,7 +217,7 @@ impl ImageBlob {
         }
         tracing::info!(digest = %descriptor.digest, bytes = descriptor.size, "publishing OCI blob to Tigris");
         let reader = BlobReader::open(&self.input, descriptor.size, digest).await?;
-        let chunks = stream::try_unfold(reader, |mut reader| {
+        let ranges: Vec<_> = stream::try_unfold(reader, |mut reader| {
             let uploads = uploads.clone();
             async move {
                 if reader.remaining == 0 {
@@ -221,17 +225,26 @@ impl ImageBlob {
                     return Ok(None);
                 }
                 let permit = uploads.acquire_owned().await?;
+                let offset = descriptor.size - reader.remaining;
                 let bytes = reader.read_chunk().await?;
-                Ok(Some(((bytes, permit), reader)))
+                Ok(Some(((offset, bytes, permit), reader)))
             }
-        }).map_ok(|(bytes, permit)| async move {
-            let result = publish_cas_chunk(origin, bytes).await;
+        }).map_ok(|(offset, bytes, permit)| async move {
+            let positioned = if descriptor.size > IMAGE_CHUNK_BYTES as u64 {
+                let payload = bytes.clone();
+                Some(tokio::task::spawn_blocking(move || positioned_value(offset, &payload)).await?)
+            } else { None };
+            let hash = publish_cas_chunk(origin, bytes).await?;
             drop(permit);
-            result
+            Ok::<_, anyhow::Error>((hash, positioned))
         })
             .try_buffered(concurrency).try_collect().await
             .with_context(|| format!("publish OCI blob {}", descriptor.digest))?;
-        let index = ImageBlobIndex { chunks, size_bytes: descriptor.size, media_type: descriptor.media_type.clone() };
+        let (chunks, values): (Vec<_>, Vec<_>) = ranges.into_iter().unzip();
+        let index = ImageBlobIndex {
+            chunks, size_bytes: descriptor.size, media_type: descriptor.media_type.clone(),
+            chaining_values: values.into_iter().flatten().collect(),
+        };
         let index = serde_json::to_vec(&index)?;
         ensure!(index.len() <= IMAGE_INDEX_LIMIT, "OCI blob index exceeds its read limit");
         origin.write(&index_key, index).await?;
@@ -293,10 +306,10 @@ fn oci_digest_hex(digest: &str) -> anyhow::Result<&str> {
     blake3_digest_hex(digest).with_context(|| format!("expected a BLAKE3 OCI digest, got {digest}"))
 }
 
-fn read_metadata(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut reader = std::fs::File::open(path)?.take(IMAGE_INDEX_LIMIT as u64 + 1);
+fn read_metadata(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let mut reader = std::fs::File::open(path)?.take(limit as u64 + 1);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= IMAGE_INDEX_LIMIT, "OCI metadata exceeds its read limit");
+    ensure!(bytes.len() <= limit, "OCI metadata exceeds its read limit of {limit} bytes");
     Ok(bytes)
 }

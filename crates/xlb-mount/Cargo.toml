@@ -7,6 +7,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+blake3 = "1"
+bytes = "1"
 containerd-snapshots = { git = "https://github.com/containerd/rust-extensions", rev = "71584ba988d38c5e5e2147d703071543a9dc182e" }
 fuser = { version = "=0.18.0", default-features = false }
 futures = "0.3"
