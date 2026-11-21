@@ -71,6 +71,8 @@ pub struct RangeBehavior {
     pub disconnect_once: Option<(u64, usize)>,
     /// Corrupt one byte of the body after computing the outboard.
     pub corrupt_at: Option<usize>,
+    /// Hold the final range when ranges are paused, for indexed reads without a size probe.
+    pub pause_tail: bool,
 }
 
 struct Served {
@@ -135,7 +137,7 @@ impl OriginServer {
         self.served.seen.lock().unwrap().clone()
     }
 
-    /// Pause data ranges while still serving the final range used to prove size.
+    /// Pause data ranges. By default the final range can still prove the object size.
     pub fn pause_object_ranges(&self, paused: bool) {
         self.served.ranges_paused.send_replace(paused);
     }
@@ -252,7 +254,7 @@ async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
                     if served.behavior.hang_from.is_some_and(|from| start >= from) && !last {
                         std::future::pending::<()>().await;
                     }
-                    if !last {
+                    if !last || served.behavior.pause_tail {
                         let mut ranges_paused = served.ranges_paused.subscribe();
                         let _ = ranges_paused.wait_for(|paused| !paused).await;
                     }

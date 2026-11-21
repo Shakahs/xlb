@@ -2,11 +2,12 @@
 
 use std::{
     ffi::CString,
+    fs,
     hash::{BuildHasherDefault, Hash, Hasher},
     io,
     mem::MaybeUninit,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -14,7 +15,7 @@ use bao_tree::{BlockSize, io::outboard::PreOrderMemOutboard};
 use bytes::Bytes;
 use dashmap::DashSet;
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FileDeviceBuilder, HybridCache, HybridCacheBuilder,
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy, IoEngineConfig, RecoverMode,
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,20 @@ const CACHE_BLOCK_BYTES: usize = 32 * MIB;
 const MAX_OUTBOARD_BYTES: usize = 32_704;
 const MEMORY_SHARDS: usize = 8;
 const DEVICE_PATH: &str = ".foyer/chunks";
+
+fn cache_directory(root: &Path) -> io::Result<PathBuf> {
+    let path = root.join(DEVICE_PATH);
+    match fs::symlink_metadata(&path) {
+        // The previous device stored its disposable cache in a regular file.
+        Ok(metadata) if metadata.is_file() => fs::remove_file(&path)?,
+        Ok(metadata) if metadata.is_dir() => return Ok(path),
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Foyer cache path")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error),
+    }
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum CasKey {
@@ -101,7 +116,7 @@ pub struct CasCache {
 impl CasCache {
     /// Size the cache from the scratch filesystem and installed RAM.
     pub fn talos_budgets(cache_dir: &Path) -> Result<(usize, u64)> {
-        std::fs::create_dir_all(cache_dir)?;
+        let device_path = cache_directory(cache_dir)?;
         let path = CString::new(cache_dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
         let mut volume = MaybeUninit::<libc::statvfs>::uninit();
         // statvfs initializes the output on success. The pathname is NUL terminated.
@@ -111,11 +126,10 @@ impl CasCache {
             }
             volume.assume_init()
         };
-        let already_allocated = match std::fs::metadata(cache_dir.join(DEVICE_PATH)) {
-            Ok(file) => file.blocks() * 512,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
+        let already_allocated = fs::read_dir(&device_path)?.try_fold(0, |allocated, entry| {
+            let metadata = entry?.metadata()?;
+            Ok::<_, io::Error>(allocated + if metadata.is_file() { metadata.blocks() * 512 } else { 0 })
+        })?;
         let capacity = volume.f_blocks * volume.f_frsize;
         let available = volume.f_bavail * volume.f_frsize + already_allocated;
         let disk = (capacity - capacity.div_ceil(4)).min(available);
@@ -153,9 +167,11 @@ impl CasCache {
         if disk / CACHE_BLOCK_BYTES < 3 {
             return Err(Error::Config("Foyer disk budget must fit its write and reclaim blocks".into()));
         }
-        let path = root.join(DEVICE_PATH);
-        std::fs::create_dir_all(path.parent().expect("Foyer device directory"))?;
-        let device = FileDeviceBuilder::new(&path).with_capacity(disk).build()
+        let path = cache_directory(root)?;
+        let builder = FsDeviceBuilder::new(&path).with_capacity(disk);
+        #[cfg(target_os = "linux")]
+        let builder = builder.with_direct(true);
+        let device = builder.build()
             .map_err(|error| Error::Store(format!("open Foyer device at {}: {error}", root.display())))?;
         let cache = HybridCacheBuilder::new()
             .with_policy(HybridCachePolicy::WriteOnEviction)
@@ -364,5 +380,87 @@ mod tests {
         assert_eq!(reopened.get(hash).await.unwrap().unwrap().body(), &full);
         assert_eq!(reopened.get(tail_hash).await.unwrap().unwrap().body(), &tail);
         reopened.close().await.unwrap();
+    }
+
+    // [utest -> dsn~xlb-foyer-cas~1]
+    #[tokio::test]
+    async fn a_malformed_root_manifest_does_not_destroy_verified_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let open = || CasCache::open(directory.path(), 160 * MIB, 128 * MIB);
+        let cache = open().await.unwrap();
+        let payload = Bytes::from_static(b"this complete tail has a valid digest");
+        let digest = BlakeHash::hash(&payload);
+        cache.insert(digest, payload.len() as u64, payload.clone()).await.unwrap();
+        cache.cache.flush_if(|key, _| matches!(key, CasKey::Chunk(_))).await;
+        cache.cache.storage().wait().await;
+
+        // Commit a malformed manifest through Foyer so its storage checksum
+        // remains valid. Model the process stopping before XLB can replace it.
+        cache.cache.storage_writer(CasKey::RootManifest).force()
+            .insert(CasValue::RootManifest(Bytes::from_static(b"not a list of digests")));
+        cache.cache.storage().wait().await;
+        cache.cache.close().await.unwrap();
+        drop(cache);
+
+        let reopened = open().await.unwrap();
+        assert!(reopened.complete_hashes().is_empty());
+        assert_eq!(reopened.get(digest).await.unwrap().unwrap().body(), &payload);
+        assert_eq!(reopened.complete_hashes(), [digest]);
+        reopened.close().await.unwrap();
+    }
+
+    // [utest -> dsn~xlb-foyer-cas~1]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn full_cache_recovers_verified_entries_after_reclaim() {
+        for (memory, disk, chunk_count) in [(160 * MIB, 128 * MIB, 32u8), (256 * MIB, 256 * MIB, 56)] {
+            let directory = tempfile::tempdir().unwrap();
+            let device = directory.path().join(DEVICE_PATH);
+            fs::create_dir_all(device.parent().unwrap()).unwrap();
+            fs::write(&device, b"disposable legacy device").unwrap();
+            let cache = CasCache::open(directory.path(), memory, disk).await.unwrap();
+            assert!(device.is_dir());
+            let chunk = |id| Bytes::from(vec![id; CAS_CHUNK_BYTES as usize]);
+            let first = chunk(0);
+            let first_hash = BlakeHash::hash(&first);
+            let held = cache.insert(first_hash, CAS_CHUNK_BYTES, first.clone()).await.unwrap();
+            assert!(matches!(cache.insert(first_hash, CAS_CHUNK_BYTES, chunk(1)).await,
+                Err(Error::HashMismatch { .. })));
+            assert_eq!(cache.get(first_hash).await.unwrap().unwrap().body(), &first);
+
+            let mut hashes = vec![(0, first_hash)];
+            for id in 1..chunk_count {
+                let body = chunk(id);
+                let digest = BlakeHash::hash(&body);
+                cache.insert(digest, CAS_CHUNK_BYTES, body).await.unwrap();
+                cache.cache.storage().wait().await;
+                hashes.push((id, digest));
+            }
+            assert!(cache.occupancy().1 <= memory as u64);
+            assert_eq!(held.body(), &first);
+            cache.close().await.unwrap();
+            drop(cache);
+            let partition_bytes = fs::read_dir(&device).unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len()).sum::<u64>();
+            assert_eq!(partition_bytes, disk as u64);
+
+            let reopened = CasCache::open(directory.path(), memory, disk).await.unwrap();
+            let recovered = reopened.complete_hashes();
+            assert!(!recovered.is_empty());
+            assert!(recovered.len() < hashes.len(), "disk capacity cannot hold the full working set");
+            for group in hashes.chunks(4) {
+                let reads = futures::future::join_all(group.iter().map(|&(id, digest)| {
+                    let reopened = &reopened;
+                    async move { (id, digest, reopened.get(digest).await.unwrap()) }
+                })).await;
+                for (id, digest, read) in reads {
+                    if let Some(read) = read {
+                        assert_eq!(read.body(), &chunk(id));
+                        assert_eq!(BlakeHash::hash(read.body()), digest);
+                    }
+                }
+            }
+            assert_eq!(held.body(), &first);
+            reopened.close().await.unwrap();
+        }
     }
 }

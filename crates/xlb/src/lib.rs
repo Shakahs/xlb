@@ -198,6 +198,7 @@ impl Fetched {
 /// The shared view of one transfer in flight.
 #[derive(Debug, Clone, Default)]
 struct FlightState {
+    indexed_size: Option<u64>,
     progress: Option<FetchProgress>,
     outcome: Option<Result<Fetched>>,
     stage: Option<Arc<StagedChunk>>,
@@ -704,7 +705,7 @@ impl AssetClass {
                 return flight.clone();
             }
         }
-        let (tx, rx) = watch::channel(FlightState::default());
+        let (tx, rx) = watch::channel(FlightState { indexed_size, ..Default::default() });
         flights.insert(hash, rx.clone());
         let class = self.clone();
         tokio::spawn(async move {
@@ -871,9 +872,10 @@ impl AssetClass {
         let outcome = match self.local_content(&hash, indexed_size).await {
             Ok(Some(hit)) => Ok(hit),
             Err(error) => Err(error),
-            Ok(None) => {
+            Ok(None) => loop {
                 let mut flight = self.join_flight(hash, indexed_size);
-                loop {
+                let same_length = flight.borrow().indexed_size == indexed_size;
+                let result = loop {
                     let (progress, outcome) = {
                         let state = flight.borrow_and_update();
                         (state.progress.clone(), state.outcome.clone())
@@ -881,7 +883,7 @@ impl AssetClass {
                     if let Some(outcome) = outcome {
                         break outcome;
                     }
-                    if let (Some(progress), Some(sink)) = (progress, &sink) {
+                    if let (true, Some(progress), Some(sink)) = (same_length, progress, &sink) {
                         sink(progress);
                     }
                     if flight.changed().await.is_err() {
@@ -890,12 +892,17 @@ impl AssetClass {
                             detail: "the transfer task ended without an outcome".into(),
                         });
                     }
+                };
+                if result.is_ok() || same_length {
+                    break result;
                 }
+                // Preserve a single staged transfer per digest, but give this
+                // caller another attempt using its own independently indexed length.
             }
         };
 
         let outcome = outcome.and_then(|fetched| {
-            if matches!(&fetched.content, FetchedContent::Chunk(_)) && indexed_size != Some(fetched.size) {
+            if indexed_size.is_some_and(|length| length != fetched.size) {
                 return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length")));
             }
             Ok(fetched)
@@ -950,11 +957,7 @@ async fn reconcile(cache: &Arc<Cache>, store: &BlobStore) -> Result<()> {
     found.sort_by_key(|(modified, hash, _, _)| (*modified, hash.to_hex()));
 
     for (_, hash, path, len) in found {
-        if store.complete_size(&hash).await.map_err(Error::Store)? == Some(len) {
-            cache.insert(hash, len);
-            continue;
-        }
-        // Unknown to the store: verify by importing it in place.
+        // A stored length cannot detect a change to the referenced file.
         match store.import_reference(path.clone()).await {
             Ok((actual, tag)) if actual == hash => {
                 cache.insert(hash, len);

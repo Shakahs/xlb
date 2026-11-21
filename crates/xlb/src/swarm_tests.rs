@@ -20,7 +20,7 @@ use tokio_util::task::AbortOnDropHandle;
 use xlb_core::{PeerReach, image::IMAGE_CHUNK_BYTES};
 
 use super::*;
-use crate::{AssetClass, AssetClassConfig, NodeTopology, PeerAddr, PeerConfig, RelaySetting, discovery::discovery_topic};
+use crate::{AssetClass, AssetClassConfig, NodeTopology, PeerAddr, PeerConfig, RelaySetting, RequestLimits, discovery::discovery_topic};
 use origin_server::{OriginServer, RangeBehavior, test_data};
 
 const BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
@@ -112,7 +112,7 @@ async fn wait_for_records(receiver: &AssetClass, hash: BlakeHash, expected: &[No
     panic!("the peer directory closed before the advertised providers arrived");
 }
 
-async fn check_mixed_tail_group(corrupt: bool) {
+async fn check_mixed_tail_group(corrupt: bool, disconnect: bool) {
     let dir = tempfile::tempdir().unwrap();
     let tail = 2 * RANGE_BYTES;
     let data = test_data(tail as usize + 10_774);
@@ -129,7 +129,16 @@ async fn check_mixed_tail_group(corrupt: bool) {
     wait_for_records(&receiver, hash, &[peer.endpoint.id()]).await;
 
     let asset = receiver.asset(hash);
-    let (result, report) = asset.fetch_to_file_reported(None).await;
+    let fetch = asset.fetch_to_file_reported(None);
+    let (result, report) = if disconnect {
+        let cut_connection = async {
+            while peer.gets.load(Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            peer.endpoint.close().await;
+        };
+        tokio::join!(fetch, cut_connection).0
+    } else { fetch.await };
     let size = data.len() as u64;
     let peer_bytes = 534;
     let tail_range = (tail, size - peer_bytes);
@@ -157,13 +166,19 @@ async fn check_mixed_tail_group(corrupt: bool) {
 // [utest -> dsn~xlb-swarm-fetch~1]
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_completes_a_partial_group_without_downloading_the_peer_bytes_again() {
-    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(false)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(false, false)).await.unwrap();
 }
 
 // [utest -> dsn~xlb-swarm-fetch~1]
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_corruption_in_a_group_partially_received_from_a_peer_is_rejected() {
-    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(true)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(true, false)).await.unwrap();
+}
+
+// [utest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_flight_peer_disconnect_does_not_discard_verified_bytes() {
+    tokio::time::timeout(Duration::from_secs(25), check_mixed_tail_group(false, true)).await.unwrap();
 }
 
 // [utest -> dsn~xlb-chunk-discovery~1]
@@ -254,6 +269,172 @@ async fn restarted_cas_node_announces_and_serves_its_spilled_chunk() {
         assert_eq!(report.origin_bytes, 0);
         tokio::join!(reader.shutdown(), holder.shutdown());
     }).await.unwrap();
+}
+
+fn cache_address(node: &AssetClass) -> PeerAddr {
+    PeerAddr { node_id: node.node_id().unwrap(), addrs: node.bound_addrs(), relay_url: None }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_index_lengths_do_not_fail_an_unrelated_reader() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let data = test_data(RANGE_BYTES as usize + 23);
+        let size = data.len() as u64;
+        let hash = BlakeHash::hash(&data);
+        let origin = OriginServer::start_with(hash, data.clone(), RangeBehavior {
+            pause_tail: true, ..RangeBehavior::default()
+        }).await;
+        origin.pause_object_ranges(true);
+        let mut config = AssetClassConfig::new("chunks", directory.path());
+        config.cas_memory_bytes = Some(160 << 20);
+        config.cache_budget_bytes = 128 << 20;
+        config.origin = Some(origin.config(RANGE_BYTES, 2));
+        let node = AssetClass::register(config).await.unwrap();
+
+        let invalid = node.indexed_chunk(hash, size - 1);
+        let wrong_read = tokio::spawn(async move { invalid.read_chunk().await });
+        while origin.object_ranges().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let valid = node.indexed_chunk(hash, size);
+        let correct_read = valid.read_chunk();
+        tokio::pin!(correct_read);
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut correct_read).await.is_err());
+        origin.pause_object_ranges(false);
+        assert!(wrong_read.await.unwrap().is_err());
+        assert!(correct_read.await.is_ok_and(|body| body.as_ref() == data),
+            "valid metadata must not inherit an error from the conflicting request");
+        assert!(valid.read_chunk().await.is_ok_and(|body| body.as_ref() == data));
+        node.shutdown().await;
+    }).await.expect("the correct read recovers after the conflicting request");
+}
+
+// [itest -> dsn~xlb-foyer-cas~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_cache_chunk_is_reloaded_from_signed_s3() {
+    use std::os::unix::fs::FileExt;
+
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let directory = tempfile::tempdir().unwrap();
+        let data = test_data(IMAGE_CHUNK_BYTES);
+        let hash = BlakeHash::hash(&data);
+        let origin = OriginServer::start(hash, data.clone()).await;
+        let start = || {
+            let mut config = AssetClassConfig::new("chunks", directory.path());
+            config.cas_memory_bytes = Some(160 << 20);
+            config.cache_budget_bytes = 128 << 20;
+            config.origin = Some(origin.config(RANGE_BYTES, 2));
+            AssetClass::register(config)
+        };
+        let node = start().await.unwrap();
+        let size = data.len() as u64;
+        assert_eq!(&node.indexed_chunk(hash, size).read_chunk().await.unwrap()[..], &data);
+        node.shutdown().await;
+        drop(node);
+
+        let device = directory.path().join(".foyer/chunks");
+        let signature = &data[..32];
+        let mut damaged = false;
+        for entry in std::fs::read_dir(device).unwrap() {
+            let path = entry.unwrap().path();
+            let block = std::fs::read(&path).unwrap();
+            if let Some(offset) = block.windows(signature.len()).position(|bytes| bytes == signature) {
+                std::fs::OpenOptions::new().write(true).open(path).unwrap()
+                    .write_all_at(&[signature[0] ^ 1], offset as u64).unwrap();
+                damaged = true;
+            }
+        }
+        assert!(damaged, "the complete payload was written to the device before the fault");
+
+        let recovered = start().await.unwrap();
+        let asset = recovered.indexed_chunk(hash, size);
+        let (payload, report) = asset.read_chunk_reported().await;
+        assert_eq!(&payload.unwrap()[..], &data);
+        assert_eq!(report.origin_bytes, size);
+        let (_, warm) = asset.read_chunk_reported().await;
+        assert_eq!(warm.origin_bytes, 0);
+        recovered.shutdown().await;
+    }).await.expect("recover verified data after cache disk corruption");
+}
+
+// [itest -> dsn~xlb-chunk-discovery~1,dsn~xlb-foyer-cas~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mixed_cluster_reads_from_the_global_holder_after_local_loss() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let directory = tempfile::tempdir().unwrap();
+        let data = test_data(IMAGE_CHUNK_BYTES);
+        let hash = BlakeHash::hash(&data);
+        let origin = OriginServer::start(hash, data.clone()).await;
+        let s3_data = test_data(IMAGE_CHUNK_BYTES / 2 + 17);
+        let s3_hash = BlakeHash::hash(&s3_data);
+        let fallback = OriginServer::start_with(s3_hash, s3_data.clone(), RangeBehavior { pause_tail: true, ..Default::default() }).await;
+        let node = async |name: &str, location: &str, reach, budget: (usize, u64), source: &OriginServer| {
+            let mut config = AssetClassConfig::new("chunks", directory.path().join(name));
+            config.cas_memory_bytes = Some(budget.0 << 20);
+            config.cache_budget_bytes = budget.1 << 20;
+            config.origin = Some(source.config(RANGE_BYTES, 4));
+            config.peer = Some(PeerConfig { bind_addr: BIND, relay: RelaySetting::Disabled, ..PeerConfig::default() });
+            config.request_limits = Some(RequestLimits::new(2.try_into().unwrap(), 1.try_into().unwrap(), 1.try_into().unwrap()).unwrap());
+            let class = AssetClass::register(config).await.unwrap();
+            class.set_node_topology(Some(NodeTopology {
+                provider: location.split('/').next().unwrap().into(), location: location.into(), region: None, zone: None, reach,
+            }));
+            class
+        };
+        let local = node("local", "aws/us-west-2a", PeerReach::Local, (160, 128), &origin).await;
+        let global = node("global", "nebius/eu-north1", PeerReach::Global, (256, 256), &origin).await;
+        let outside = node("outside", "aws/us-east-1a", PeerReach::Local, (160, 128), &origin).await;
+        let reader = node("reader", "aws/us-west-2a", PeerReach::Local, (160, 128), &fallback).await;
+        for holder in [&local, &global, &outside] {
+            let payload = holder.indexed_chunk(hash, data.len() as u64).read_chunk().await.unwrap();
+            assert_eq!(&payload[..], data);
+        }
+        let reader_id = reader.node_id().unwrap();
+        let global_id = global.node_id().unwrap();
+        let local_id = local.node_id().unwrap();
+        let outside_id = outside.node_id().unwrap();
+        reader.set_peers(vec![cache_address(&local), cache_address(&global)]);
+        local.set_peers(vec![cache_address(&reader)]);
+        global.set_peer_sets(vec![cache_address(&outside)], vec![reader_id, outside_id]);
+        outside.set_peer_sets(vec![cache_address(&global)], vec![reader_id, global_id]);
+        wait_for_records(&reader, hash, &[local_id, global_id, outside_id]).await;
+        local.shutdown().await;
+
+        fallback.pause_object_ranges(true);
+        let s3_asset = reader.indexed_chunk(s3_hash, s3_data.len() as u64);
+        let s3_read = tokio::spawn(async move { s3_asset.read_chunk_reported().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !reader.s3_request_stats().is_some_and(|stats| stats.active_ranges == 1) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the indexed S3 read reaches the paused origin");
+        let reads = futures::future::join_all((0..4).map(|_| {
+            let asset = reader.indexed_chunk(hash, data.len() as u64);
+            async move { asset.read_chunk_reported().await }
+        })).await;
+        let mut saw_global = false;
+        for (result, report) in reads {
+            assert_eq!(&result.unwrap()[..], data);
+            assert_eq!(report.origin_bytes, 0);
+            if report.peer_bytes != 0 {
+                assert_eq!(report.peers.len(), 1);
+                assert_eq!(report.peers.get(&global_id.to_string()), Some(&(data.len() as u64)));
+                saw_global = true;
+            }
+        }
+        assert!(saw_global);
+        let (warm, report) = reader.indexed_chunk(hash, data.len() as u64).read_chunk_reported().await;
+        assert_eq!(&warm.unwrap()[..], data);
+        assert_eq!((report.peer_bytes, report.origin_bytes), (0, 0));
+        assert!(!s3_read.is_finished(), "peer and cache reads finish while S3 reads are pending");
+        fallback.pause_object_ranges(false);
+        let (body, report) = s3_read.await.unwrap();
+        assert_eq!(&body.unwrap()[..], s3_data);
+        assert_eq!((report.peer_bytes, report.origin_bytes), (0, s3_data.len() as u64));
+        assert_eq!(reader.s3_request_stats().unwrap().peak_ranges, 1);
+        tokio::join!(reader.shutdown(), global.shutdown(), outside.shutdown());
+    }).await.expect("global peer fallback after zone-local loss");
 }
 
 // [utest -> dsn~xlb-chunk-discovery~1]

@@ -144,6 +144,16 @@ async fn a_blob_is_read_from_the_origin_as_signed_ranges() {
     assert_eq!(kept.unwrap(), path);
     assert_eq!(report.tier, Some(FetchTier::Cache));
     reopened.shutdown().await;
+
+    let mut damaged = data.clone();
+    damaged[17] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    let reopened = self::class(dir.path(), server.config(RANGE_BYTES, 4), BUDGET).await;
+    let (recovered, report) = reopened.asset(hash).fetch_to_file_reported(None).await;
+    assert!(std::fs::read(recovered.unwrap()).unwrap() == data,
+        "startup reused a same-length cache file whose bytes had changed");
+    assert_eq!(report.tier, Some(FetchTier::Origin));
+    reopened.shutdown().await;
 }
 
 // [utest -> dsn~xlb-swarm-fetch~1]
@@ -169,6 +179,23 @@ async fn origin_content_that_does_not_verify_fails_the_fetch_and_leaves_no_file(
     assert!(!class.cache_dir().join(wanted.to_hex()).exists());
     assert!(!class.asset(wanted).is_cached());
     class.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_file_does_not_bypass_the_indexed_length_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = test_data(48 * 1024 + 7);
+    let hash = BlakeHash::hash(&data);
+    let server = OriginServer::start(hash, data.clone()).await;
+    let node = class(dir.path(), server.config(RANGE_BYTES, 1), BUDGET).await;
+    let size = data.len() as u64;
+    let correct = node.indexed_chunk(hash, size);
+    let path = correct.fetch_to_file().await.unwrap();
+    assert!(node.indexed_chunk(hash, size - 1).fetch_to_file().await.is_err(),
+        "a cache hit must reject metadata that names a different length");
+    assert_eq!(correct.fetch_to_file().await.unwrap(), path);
+    assert_eq!(std::fs::read(path).unwrap(), data);
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
