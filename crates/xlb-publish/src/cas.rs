@@ -30,7 +30,7 @@ pub fn origin_outboard_bytes(size: u64) -> u64 {
 pub async fn object_stored(origin: &Operator, key: &str, size: u64) -> Result<bool> {
     match origin.stat(key).await {
         Ok(metadata) => Ok(metadata.is_file() && metadata.content_length() == size),
-        Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -60,15 +60,28 @@ pub async fn publish_cas_chunk(origin: &Operator, bytes: Bytes) -> Result<BlakeH
     Ok(hash)
 }
 
+// [impl -> dsn~xlb-model-origin~1]
 async fn store_cas_object(origin: &Operator, key: String, bytes: Bytes) -> Result<()> {
-    if matching_cas_object(origin, &key, &bytes).await? {
+    let size = bytes.len() as u64;
+    let check_object = || async {
+        match origin.stat(&key).await {
+            Ok(metadata) if metadata.is_file() && metadata.content_length() == size => Ok(true),
+            Ok(_) => Err(Error::new(ErrorKind::ConditionNotMatch, "existing CAS object has an unexpected length")
+                .with_context("key", &key)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+    if check_object().await? {
         return Ok(());
     }
     if origin.info().capability().write_with_if_not_exists {
-        match origin.write_with(&key, bytes.clone()).if_not_exists(true).await {
+        match origin.write_with(&key, bytes).if_not_exists(true).await {
             Ok(_) => {}
-            Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {
-                if !matching_cas_object(origin, &key, &bytes).await? { return Err(error.into()); }
+            Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {
+                if !check_object().await? {
+                    return Err(error.set_temporary().into());
+                }
             }
             Err(error) => return Err(error.into()),
         }
@@ -76,18 +89,6 @@ async fn store_cas_object(origin: &Operator, key: String, bytes: Bytes) -> Resul
         origin.write(&key, bytes).await?;
     }
     Ok(())
-}
-
-async fn matching_cas_object(origin: &Operator, key: &str, expected: &Bytes) -> Result<bool> {
-    let size = expected.len() as u64;
-    if !object_stored(origin, key, size).await? {
-        return Ok(false);
-    }
-    if size > 0 {
-        let existing = origin.read_with(key).range(..size).await?;
-        ensure!(existing.to_bytes() == *expected, "{key} differs from its verified CAS bytes");
-    }
-    Ok(true)
 }
 
 // [impl -> dsn~xlb-fuse-snapshots~1]
