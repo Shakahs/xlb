@@ -17,7 +17,7 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::task::AbortOnDropHandle;
 use tower::{Layer, Service, ServiceExt, limit::GlobalConcurrencyLimitLayer, service_fn};
 use xlb::{Asset, AssetClass};
-use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex};
+use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_DIGEST_PREFIX, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex, is_digest_hex};
 
 use crate::disk_chunks::{ChunkSlice, DiskChunks};
 
@@ -95,15 +95,20 @@ async fn serve_blob(
     }
 }
 
+/// The BLAKE3 hex an OCI blob or manifest request names. Blobs are named by
+/// `blake3:<hex>`; manifests also by the tag `<hex>`, which pods reference
+/// because the kubelet rejects digest algorithms it does not register.
 fn image_digest(path: &str) -> Option<&str> {
     let (resource, reference) = path.rsplit_once('/')?;
     let (repository, kind) = resource.rsplit_once('/')?;
-    if repository.is_empty() || !matches!(kind, "blobs" | "manifests") {
+    if repository.is_empty() {
         return None;
     }
-    let digest = reference.strip_prefix("sha256:")?;
-    (digest.len() == 64 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
-        .then_some(digest)
+    match kind {
+        "blobs" => blake3_digest_hex(reference),
+        "manifests" => blake3_digest_hex(reference).or_else(|| is_digest_hex(reference).then_some(reference)),
+        _ => None,
+    }
 }
 
 impl ImageMirror {
@@ -114,7 +119,7 @@ impl ImageMirror {
         let size = blob.size_bytes;
         let mut response = Response::builder()
             .header(header::CONTENT_TYPE, &blob.media_type)
-            .header("docker-content-digest", format!("sha256:{digest}"))
+            .header("docker-content-digest", format!("{IMAGE_DIGEST_PREFIX}{digest}"))
             .header(header::ACCEPT_RANGES, "bytes");
         if method == Method::HEAD {
             return Ok(response.header(header::CONTENT_LENGTH, size).body(Body::empty())?);
