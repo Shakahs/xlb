@@ -119,11 +119,17 @@ pub struct ClassConfig {
     /// Expose chunk-indexed models from this class at a read-only mount.
     #[serde(default)]
     pub model_mount: Option<PathBuf>,
-    /// Directory of the plain files, one per complete blob.
+    /// Root directory for the configured cache class.
     pub cache_dir: String,
-    /// LRU budget for unpinned blobs.
+    /// Disk budget for the class when the budget is set explicitly.
     #[serde(default = "default_cache_budget")]
     pub cache_budget_bytes: u64,
+    /// Resident CAS bytes for mounted and mirrored chunks.
+    #[serde(default)]
+    pub cas_memory_bytes: Option<usize>,
+    /// Derive the Talos CAS budget from the mounted scratch device and RAM.
+    #[serde(default)]
+    pub talos_scratch_cache: bool,
     /// Whether the class serves and reads the peer set.
     #[serde(default = "yes")]
     pub peers: bool,

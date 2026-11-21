@@ -1,6 +1,6 @@
 //! Signed availability records on XLB's iroh-gossip topic.
 
-use std::{collections::BTreeSet, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::BTreeSet, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -12,7 +12,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::{BlakeHash, NodeTopology, store::LiveSet};
+use crate::{BlakeHash, NodeTopology};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const ENTRY_TTL: Duration = Duration::from_secs(90);
@@ -45,7 +45,7 @@ impl Discovery {
     pub(crate) async fn join(
         gossip: &Gossip,
         endpoint: Endpoint,
-        live: Arc<LiveSet>,
+        complete_hashes: impl Fn() -> Vec<Hash> + Send + 'static,
     ) -> Result<Self, String> {
         let topic = gossip.subscribe(discovery_topic(), Vec::new()).await.map_err(|err| err.to_string())?;
         let client = Client::local(topic, Config {
@@ -73,7 +73,7 @@ impl Discovery {
                 if let Some(topology) = topology {
                     let location = location_key(&topology.location);
                     publish_node(&announce, &own, topology).await;
-                    for hash in live.complete_hashes() {
+                    for hash in complete_hashes() {
                         publish(&announce, &own, hash, &location).await;
                     }
                 }

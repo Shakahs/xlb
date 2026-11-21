@@ -137,7 +137,7 @@ async fn check_mixed_tail_group(corrupt: bool) {
     assert_eq!(ranges.iter().copied().filter(|&(_, end)| end > tail).collect::<Vec<_>>(), [tail_range]);
     if corrupt {
         assert!(matches!(result, Err(Error::OriginRejected { hash: rejected, .. }) if rejected == hash), "{result:?}");
-        let stored = receiver.0.store.api().blobs().observe(to_iroh(&hash)).await.unwrap();
+        let stored = receiver.file_store().unwrap().api().blobs().observe(to_iroh(&hash)).await.unwrap();
         let peer_tail = ChunkRanges::bytes(tail_range.1..size);
         assert!(peer_tail.is_subset(&stored.ranges), "the peer bytes remain verified");
         let rejected = ChunkRanges::bytes(tail_range.0..tail_range.1);
@@ -207,6 +207,53 @@ async fn concurrent_indexed_chunks_use_the_direct_peer_path() {
         println!("Verified 100 MiB of indexed peer data in {elapsed:?} ({gbps:.2} Gbit/s)");
         tokio::join!(client.shutdown(), holder.shutdown());
     }).await.expect("verify a large peer fetch within 45 seconds");
+}
+
+// [itest -> dsn~xlb-foyer-cas~1]
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_cas_node_announces_and_serves_its_spilled_chunk() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = test_data(IMAGE_CHUNK_BYTES);
+        let hash = BlakeHash::hash(&data);
+        let origin = OriginServer::start(hash, data.clone()).await;
+        let holder_path = dir.path().join("holder");
+        let config = |path: &Path| {
+            let mut config = AssetClassConfig::new("chunks", path);
+            config.cas_memory_bytes = Some(160 << 20);
+            config.cache_budget_bytes = 128 << 20;
+            config.peer = Some(PeerConfig {
+                bind_addr: BIND, relay: RelaySetting::Disabled, ..PeerConfig::default()
+            });
+            config
+        };
+        let mut source_config = config(&holder_path);
+        source_config.origin = Some(origin.config(RANGE_BYTES, 4));
+        let first = AssetClass::register(source_config).await.unwrap();
+        let bytes = first.indexed_chunk(hash, data.len() as u64).read_chunk().await.unwrap();
+        assert_eq!(&bytes[..], &data);
+        assert!(!holder_path.join(hash.to_hex()).exists());
+        first.shutdown().await;
+        drop(first);
+
+        let holder = AssetClass::register(config(&holder_path)).await.unwrap();
+        let reader = AssetClass::register(config(&dir.path().join("reader"))).await.unwrap();
+        let topology = NodeTopology {
+            provider: "aws".into(), location: "aws/us-west-2a".into(),
+            region: Some("us-west-2".into()), zone: Some("us-west-2a".into()), reach: PeerReach::Local,
+        };
+        holder.set_node_topology(Some(topology.clone()));
+        reader.set_node_topology(Some(topology));
+        let holder_id = holder.node_id().unwrap();
+        holder.set_peer_sets(Vec::new(), vec![reader.node_id().unwrap()]);
+        reader.set_peers(vec![PeerAddr { node_id: holder_id, addrs: holder.bound_addrs(), relay_url: None }]);
+        wait_for_records(&reader, hash, &[holder_id]).await;
+        let (body, report) = reader.indexed_chunk(hash, data.len() as u64).read_chunk_reported().await;
+        assert_eq!(&body.unwrap()[..], &data);
+        assert_eq!(report.peer_bytes, data.len() as u64);
+        assert_eq!(report.origin_bytes, 0);
+        tokio::join!(reader.shutdown(), holder.shutdown());
+    }).await.unwrap();
 }
 
 // [utest -> dsn~xlb-chunk-discovery~1]

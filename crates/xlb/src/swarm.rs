@@ -215,7 +215,7 @@ impl SwarmFetch {
         ranges: ChunkRanges,
         providers: Vec<ProviderChoice>,
     ) -> Result<(), SwarmFailure> {
-        peers.fetch_ranges(self.hash, ranges, providers, |peer, received| {
+        peers.fetch_ranges(&self.sources.store, self.hash, ranges, providers, |peer, received| {
             *self.peer_bytes.lock().unwrap().entry(peer).or_default() += received;
         }).await.map_err(|err| SwarmFailure::Miss(format!("peers: {err}")))
     }

@@ -19,7 +19,7 @@ use tonic::{Status, transport::Server};
 use xlb::AssetClass;
 use xlb_core::{BlakeHash, chunks::CAS_INDEX_LIMIT, image::blake3_digest_hex, layer::{LAYER_INDEX_LABEL, LAYER_INDEX_PREFIX, LayerIndex}};
 
-use crate::{DiskChunks, layer_mount::mount_layer, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, write_index}};
+use crate::{layer_mount::mount_layer, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, write_index}};
 
 const SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
@@ -40,11 +40,10 @@ struct CasSnapshotter {
     store: SnapshotStore,
     state: Mutex<SnapshotState>,
     class: AssetClass,
-    disk: DiskChunks,
 }
 
 // [impl -> dsn~xlb-fuse-snapshots~1]
-pub async fn serve_snapshots(config: SnapshotSettings, class: AssetClass, disk: DiskChunks) -> Result<()> {
+pub async fn serve_snapshots(config: SnapshotSettings, class: AssetClass) -> Result<()> {
     let (store, records) = SnapshotStore::open(config.root)?;
     let mut sessions = HashMap::new();
     for record in records.values() {
@@ -52,11 +51,11 @@ pub async fn serve_snapshots(config: SnapshotSettings, class: AssetClass, disk: 
             let bytes = tokio::fs::read(store.index(digest)).await.context("restore OCI layer index")?;
             let diff_id = record.info.labels.get(SNAPSHOT_DIFF_ID).context("snapshot has no diff ID")?;
             let index = verify_index(&bytes, digest, diff_id)?;
-            let session = start_layer(index, &store.upper(record), class.clone(), disk.clone()).await?;
+            let session = start_layer(index, &store.upper(record), class.clone()).await?;
             sessions.insert(record.id.clone(), session);
         }
     }
-    let snapshots = Arc::new(CasSnapshotter { store, state: Mutex::new(SnapshotState { records, sessions }), class, disk });
+    let snapshots = Arc::new(CasSnapshotter { store, state: Mutex::new(SnapshotState { records, sessions }), class });
     let directory = config.socket.parent().context("snapshot socket needs a parent directory")?;
     tokio::fs::create_dir_all(directory).await?;
     match tokio::fs::remove_file(&config.socket).await {
@@ -79,12 +78,12 @@ fn verify_index(bytes: &[u8], digest: BlakeHash, diff_id: &str) -> Result<LayerI
     Ok(index)
 }
 
-async fn start_layer(index: LayerIndex, path: &Path, class: AssetClass, disk: DiskChunks) -> Result<BackgroundSession> {
+async fn start_layer(index: LayerIndex, path: &Path, class: AssetClass) -> Result<BackgroundSession> {
     let path = path.to_owned();
     let runtime = Handle::current();
     tokio::task::spawn_blocking(move || {
         clear_disconnected_mount(&path)?;
-        mount_layer(index, class, disk, &path, runtime)
+        mount_layer(index, class, &path, runtime)
     }).await?
 }
 
@@ -196,7 +195,7 @@ impl CasSnapshotter {
         fs::create_dir_all(&upper).map_err(failure)?;
         let prepare = async {
             if let Some(index) = index {
-                let session = start_layer(index, &upper, self.class.clone(), self.disk.clone()).await.map_err(failure)?;
+                let session = start_layer(index, &upper, self.class.clone()).await.map_err(failure)?;
                 Ok(Some(session))
             } else {
                 if kind == Kind::Active {

@@ -11,7 +11,8 @@ use axum::{
     routing::get,
     Router,
 };
-use futures::{StreamExt, TryStreamExt, stream};
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use rand::seq::SliceRandom;
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::task::AbortOnDropHandle;
@@ -19,27 +20,24 @@ use tower::{Layer, Service, ServiceExt, limit::GlobalConcurrencyLimitLayer, serv
 use xlb::{Asset, AssetClass};
 use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_DIGEST_PREFIX, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex, is_digest_hex};
 
-use xlb_mount::{ChunkSlice, DiskChunks};
-
 #[derive(Clone)]
 struct ImageMirror {
     class: AssetClass,
     index: Arc<RwLock<HashMap<String, Arc<ImageBlobIndex>>>>,
     concurrency: usize,
     chunk_limit: GlobalConcurrencyLimitLayer,
-    disk: DiskChunks,
 }
 
 // [impl -> dsn~xlb-image-mirror~1]
-pub async fn serve(class: AssetClass, concurrency: usize, disk: DiskChunks) -> Result<()> {
+pub async fn serve(class: AssetClass, concurrency: usize) -> Result<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 5477))
         .await
         .context("bind OCI image mirror")?;
-    axum::serve(listener, router(class, concurrency, disk)).await?;
+    axum::serve(listener, router(class, concurrency)).await?;
     Ok(())
 }
 
-fn router(class: AssetClass, concurrency: usize, disk: DiskChunks) -> Router {
+fn router(class: AssetClass, concurrency: usize) -> Router {
     Router::new()
         .route("/v2/", get(|| async {
             ([("docker-distribution-api-version", "registry/2.0")], StatusCode::OK)
@@ -47,14 +45,12 @@ fn router(class: AssetClass, concurrency: usize, disk: DiskChunks) -> Router {
         .route("/v2/{*path}", get(serve_blob))
         .with_state(ImageMirror {
             class, index: Arc::default(), concurrency,
-            chunk_limit: GlobalConcurrencyLimitLayer::new(concurrency), disk,
+            chunk_limit: GlobalConcurrencyLimitLayer::new(concurrency),
         })
 }
 
-async fn open_slice((asset, size, start, end): (Asset, u64, u64, u64)) -> Result<ChunkSlice> {
-    let file = asset.open_file().await?;
-    anyhow::ensure!(file.metadata().await?.len() == size, "OCI chunk size differs from its index");
-    Ok(ChunkSlice { file: file.into_std().await, start, end })
+async fn open_slice((asset, start, end): (Asset, u64, u64)) -> Result<Bytes> {
+    Ok(asset.read_chunk().await?.slice(start as usize..end as usize))
 }
 
 impl ImageMirror {
@@ -148,7 +144,6 @@ impl ImageMirror {
         let last = end.div_ceil(chunk_bytes);
         let width = self.concurrency;
         let limit = self.chunk_limit.clone();
-        let disk = self.disk.clone();
         let sources = stream::iter((first..last).step_by(width))
             .flat_map(move |window| {
                 let mut positions: Vec<_> = (window..(window + width as u64).min(last)).collect();
@@ -164,19 +159,14 @@ impl ImageMirror {
                         open.ready().await?;
                         // The asset store finishes a shared fetch after its caller drops.
                         // Keep the Tower permit until that fetch finishes, too.
-                        tokio::spawn(open.call((asset, size, local_start, local_end))).await?
+                        tokio::spawn(open.call((asset, local_start, local_end))).await?
                     });
                     (position, AbortOnDropHandle::new(pull))
                 }).collect();
                 pulls.sort_unstable_by_key(|(position, _)| *position);
                 stream::iter(pulls.into_iter().map(|(_, pull)| pull))
             })
-            .then(|pull| async move { pull.await? })
-            .and_then(move |slice| {
-                let disk = disk.clone();
-                async move { Ok(disk.read(slice).await?.map_err(anyhow::Error::from)) }
-            })
-            .try_flatten();
+            .then(|pull| async move { pull.await? });
         Body::from_stream(sources)
     }
 }

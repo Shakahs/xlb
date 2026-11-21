@@ -34,13 +34,6 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     )?);
 
     let concurrency = cfg.node.chunk_concurrency.get();
-    let disk = if cfg.node.image_mirror_class.is_some() || cfg.node.snapshotter.is_some()
-        || cfg.classes.iter().any(|class| class.model_mount.is_some())
-    {
-        Some(xlb_mount::DiskChunks::start(concurrency).await.context("start the io_uring chunk reader")?)
-    } else {
-        None
-    };
     let mut classes = Vec::new();
     let mut model_sessions = Vec::new();
     for cc in &cfg.classes {
@@ -48,6 +41,19 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         let name: &'static str = Box::leak(cc.name.clone().into_boxed_str());
         let mut config = AssetClassConfig::new(name, cc.cache_dir());
         config.cache_budget_bytes = cc.cache_budget_bytes;
+        if cc.model_mount.is_some()
+            || cfg.node.image_mirror_class.as_deref() == Some(cc.name.as_str())
+            || cfg.node.snapshotter.as_ref().is_some_and(|settings| settings.class == cc.name)
+        {
+            if cc.talos_scratch_cache {
+                let (memory, disk) = xlb::cas_cache::CasCache::talos_budgets(&cc.cache_dir())?;
+                config.cas_memory_bytes = Some(memory);
+                config.cache_budget_bytes = disk;
+                tracing::info!(class = %cc.name, memory, disk, "size XLB CAS from Talos scratch and RAM");
+            } else {
+                config.cas_memory_bytes = Some(cc.cas_memory_bytes.unwrap_or(512 * 1024 * 1024));
+            }
+        }
         config.peer = cc.peer_config()?;
         config.origin = cc.origin_config()?;
         config.request_limits = Some(request_limits.clone());
@@ -57,8 +63,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
             .await
             .with_context(|| format!("register class {}", cc.name))?;
         let model_mount = if let Some(root) = &cc.model_mount {
-            let disk = disk.clone().context("model mount requires a chunk reader")?;
-            let (mount, session) = xlb_mount::ModelMount::start(root, class.clone(), disk, concurrency).await?;
+            let (mount, session) = xlb_mount::ModelMount::start(root, class.clone(), concurrency).await?;
             model_sessions.push(session);
             Some(mount)
         } else {
@@ -99,7 +104,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     }).collect();
     let listener_state = state.clone();
     let listener_socket = socket.clone();
-    let listener = tokio::spawn(async move {
+    let mut listener = tokio::spawn(async move {
         crate::server::listen(listener_state, &listener_socket, socket_mode).await
     });
     let mirror = async {
@@ -111,8 +116,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
             .with_context(|| format!("image mirror requires an S3 origin for class {name}"))?;
         let class = state.classes.iter().find(|entry| entry.name == name)
             .context("image mirror class is not registered")?;
-        let disk = disk.clone().context("image mirror requires a chunk reader")?;
-        crate::image_mirror::serve(class.class.clone(), concurrency, disk).await
+        crate::image_mirror::serve(class.class.clone(), concurrency).await
     };
     let snapshotter = async {
         let Some(config) = cfg.node.snapshotter.clone() else {
@@ -120,8 +124,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         };
         let class = state.classes.iter().find(|entry| entry.name == config.class)
             .context("snapshotter class is not registered")?;
-        let disk = disk.clone().context("snapshotter requires a chunk reader")?;
-        xlb_mount::serve_snapshots(config, class.class.clone(), disk).await
+        xlb_mount::serve_snapshots(config, class.class.clone()).await
     };
 
     // The full node ID and the bound addresses are what a peer needs.
@@ -138,8 +141,9 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         result = mirror => result?,
         result = snapshotter => result?,
         // The listener only returns when it could not bind.
-        listener = listener => listener.context("socket task")??,
+        listener = &mut listener => listener.context("socket task")??,
     }
+    listener.abort();
     println!("shutting down");
     drop(model_sessions);
     // Close the endpoints before they drop, so peers see a clean close.

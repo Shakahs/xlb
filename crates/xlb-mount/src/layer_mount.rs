@@ -17,7 +17,7 @@ use tokio::runtime::Handle;
 use xlb::AssetClass;
 use xlb_core::layer::{LayerEntry, LayerEntryKind, LayerIndex};
 
-use crate::{chunk_file::ChunkFile, DiskChunks};
+use crate::chunk_file::ChunkFile;
 
 const ENTRY_TTL: Duration = Duration::from_secs(3600);
 
@@ -37,9 +37,9 @@ struct LayerMount {
 
 // [impl -> dsn~xlb-fuse-snapshots~1]
 pub(crate) fn mount_layer(
-    index: LayerIndex, class: AssetClass, disk: DiskChunks, mountpoint: &Path, runtime: Handle,
+    index: LayerIndex, class: AssetClass, mountpoint: &Path, runtime: Handle,
 ) -> Result<BackgroundSession> {
-    let archive = ChunkFile::new(Arc::new(index.archive), class, disk)?;
+    let archive = ChunkFile::new(Arc::new(index.archive), class)?;
     let nodes = layer_nodes(index.entries, archive.index.size_bytes)?;
     let layer = LayerMount { archive, nodes, runtime };
     let mut config = Config::default();

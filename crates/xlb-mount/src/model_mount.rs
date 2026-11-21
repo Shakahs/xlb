@@ -18,7 +18,7 @@ use tokio::runtime::Handle;
 use xlb::{AssetClass, BlakeHash, FetchProgress, FetchReport, FetchSources, FetchTier, ProgressSink};
 use xlb_core::chunks::{CAS_INDEX_LIMIT, ChunkIndex, MODEL_INDEX_PREFIX};
 
-use crate::{chunk_file::ChunkFile, DiskChunks, snapshot_store::write_index, snapshotter::clear_disconnected_mount};
+use crate::{chunk_file::ChunkFile, snapshot_store::write_index, snapshotter::clear_disconnected_mount};
 
 const ENTRY_TTL: Duration = Duration::from_secs(60);
 
@@ -33,14 +33,13 @@ pub struct ModelMount {
     root: PathBuf,
     indexes: PathBuf,
     class: AssetClass,
-    disk: DiskChunks,
     entries: Arc<RwLock<ModelEntries>>,
     runtime: Handle,
     concurrency: usize,
 }
 
 impl ModelMount {
-    pub async fn start(root: &Path, class: AssetClass, disk: DiskChunks, concurrency: usize) -> Result<(Self, BackgroundSession)> {
+    pub async fn start(root: &Path, class: AssetClass, concurrency: usize) -> Result<(Self, BackgroundSession)> {
         let indexes = class.cache_dir().join(".model-indexes");
         tokio::fs::create_dir_all(&indexes).await?;
         match tokio::fs::create_dir_all(root).await {
@@ -49,7 +48,7 @@ impl ModelMount {
             Err(error) => return Err(error.into()),
         }
         let mount = Self {
-            root: root.to_owned(), indexes, class, disk, entries: Arc::default(), runtime: Handle::current(), concurrency,
+            root: root.to_owned(), indexes, class, entries: Arc::default(), runtime: Handle::current(), concurrency,
         };
         let filesystem = mount.clone();
         let session = tokio::task::spawn_blocking(move || {
@@ -77,7 +76,7 @@ impl ModelMount {
         let mut chunks = stream::iter(0..file.index.chunks.len() as u64)
             .map(|ordinal| async move {
                 let (chunk, length) = index.chunk(ordinal).context("model CAS index is truncated")?;
-                let (result, report) = self.class.indexed_chunk(chunk, length).fetch_to_file_reported(None).await;
+                let (result, report) = self.class.indexed_chunk(chunk, length).read_chunk_reported().await;
                 result?;
                 ensure!(report.bytes_served == length, "model CAS chunk {chunk} has an unexpected length");
                 Ok::<_, anyhow::Error>(report)
@@ -131,7 +130,7 @@ impl ModelMount {
             Err(error) => return Err(error.into()),
         };
         let index: ChunkIndex = serde_json::from_slice(&bytes).context("parse model CAS index")?;
-        let file = ChunkFile::new(Arc::new(index), self.class.clone(), self.disk.clone())?;
+        let file = ChunkFile::new(Arc::new(index), self.class.clone())?;
         if download {
             tokio::task::spawn_blocking(move || write_index(&path, &bytes)).await??;
         }

@@ -56,7 +56,7 @@ use iroh_blobs::{
 use rand::seq::SliceRandom;
 use tokio::time::Instant;
 
-use crate::{NodeTopology, RequestLimits, discovery::{Discovery, ProviderEvent, is_fresh}, store::BlobStore, stream_bytes::QuicBytes};
+use crate::{NodeTopology, RequestLimits, discovery::{Discovery, ProviderEvent, is_fresh}, stream_bytes::QuicBytes};
 use xlb_core::image::IMAGE_CHUNK_BYTES;
 
 /// The node ID of an xlb node: the public key of its iroh endpoint.
@@ -329,15 +329,18 @@ pub(crate) struct PeerTransport {
     admitted: AdmitSet,
     failed: FailedPeers,
     pool: ConnectionPool,
-    store: Store,
     discovery: Discovery,
 }
 
 impl PeerTransport {
     /// Bind the endpoint and start serving `store` to the (empty) admit set.
     // [impl -> dsn~xlb-fork~1]
-    pub(crate) async fn bind(config: PeerConfig, blob_store: &BlobStore, request_limits: RequestLimits) -> Result<Self, String> {
-        let store = blob_store.api();
+    pub(crate) async fn bind(
+        config: PeerConfig,
+        store: &Store,
+        complete_hashes: impl Fn() -> Vec<IrohHash> + Send + 'static,
+        request_limits: RequestLimits,
+    ) -> Result<Self, String> {
         let lookup = MemoryLookup::new();
         // The only IP transport is the configured address, so the UDP port
         // is the configured one. The in-memory lookup is the only address
@@ -387,7 +390,7 @@ impl PeerTransport {
             .accept(iroh_blobs::ALPN, blobs)
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
-        let discovery = Discovery::join(&gossip, endpoint.clone(), blob_store.live_set()).await?;
+        let discovery = Discovery::join(&gossip, endpoint.clone(), complete_hashes).await?;
         let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, direct_path_pool(config.connect_timeout));
 
         Ok(Self {
@@ -400,7 +403,6 @@ impl PeerTransport {
             admitted,
             failed: FailedPeers::default(),
             pool,
-            store: store.clone(),
             discovery,
         })
     }
@@ -509,6 +511,7 @@ impl PeerTransport {
     // [impl -> dsn~xlb-chunk-discovery~1]
     pub(crate) async fn fetch_ranges(
         &self,
+        store: &Store,
         hash: IrohHash,
         ranges: ChunkRanges,
         mut providers: Vec<ProviderChoice>,
@@ -517,7 +520,7 @@ impl PeerTransport {
         providers.shuffle(&mut rand::rng());
         providers.sort_by_key(|provider| !provider.same_location);
         let request = Arc::new(GetRequest::blob_ranges(hash, ranges));
-        let remote = self.store.remote();
+        let remote = store.remote();
         for ProviderChoice { node: provider, timestamp, .. } in providers {
             if !is_fresh(timestamp) || !self.is_eligible(&provider) {
                 continue;
