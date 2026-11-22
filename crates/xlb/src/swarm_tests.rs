@@ -509,7 +509,7 @@ async fn a_local_holder_refuses_a_direct_request_from_another_zone() {
     }).await.expect("the holder must reject the direct request");
 }
 
-async fn retry_origin_after(first_get: FirstGet) {
+async fn retry_origin_after(first_get: FirstGet) -> OriginServer {
     let directory = tempfile::tempdir().unwrap();
     let body = test_data(192 * 1024);
     let hash = BlakeHash::hash(&body);
@@ -522,12 +522,13 @@ async fn retry_origin_after(first_get: FirstGet) {
     assert_eq!(origin.gets(), 2);
     assert!(asset.is_cached());
     node.shutdown().await.unwrap();
+    origin
 }
 
 // [utest -> dsn~xlb-swarm-fetch~1]
 #[tokio::test]
 async fn a_throttled_origin_get_is_retried() {
-    retry_origin_after(FirstGet::Throttle).await;
+    assert_eq!(retry_origin_after(FirstGet::Throttle).await.get_offsets(), [0, 0]);
 }
 
 // [itest -> dsn~xlb-swarm-fetch~1]
@@ -548,9 +549,11 @@ async fn origin_chunk_gets_reuse_an_http1_connection() {
     node.shutdown().await.unwrap();
 }
 
+// [utest -> dsn~xlb-swarm-fetch~1]
 #[tokio::test]
-async fn an_interrupted_origin_body_is_retried_from_the_start() {
-    retry_origin_after(FirstGet::Disconnect(64 * 1024)).await;
+async fn an_interrupted_origin_body_resumes_from_the_received_offset() {
+    const RECEIVED: usize = 64 * 1024;
+    assert_eq!(retry_origin_after(FirstGet::Disconnect(RECEIVED)).await.get_offsets(), [0, RECEIVED]);
 }
 
 #[tokio::test]
@@ -719,6 +722,71 @@ async fn benchmark_chunk_sources(holder_count: usize) {
     client.shutdown().await.unwrap();
     for holder in holders { holder.shutdown().await.unwrap(); }
     assert_eq!(success, CHUNKS * ROUNDS);
+}
+
+/// A node fetching a model working set several times its CAS memory from S3
+/// at production chunk concurrency. Resident memory after each round
+/// settles must stay within the configured CAS memory.
+// [itest -> dsn~xlb-foyer-cas~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "run as the separate origin_cas_memory_budget_test Bazel action"]
+async fn origin_fetches_stay_within_the_cas_memory_budget() {
+    use crate::cas_cache::resident_memory;
+    use std::num::NonZeroUsize;
+
+    const MEMORY: usize = 256 << 20;
+    const BUDGET_OVERHEAD: u64 = 64 << 20;
+    const CHUNKS: usize = 128;
+    const ROUNDS: usize = 4;
+    const CONCURRENCY: usize = 100;
+    crate::allocator::map_chunk_buffers().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut chunks = Vec::with_capacity(CHUNKS);
+    let mut sizes = Vec::with_capacity(CHUNKS);
+    {
+        let seed = test_data(IMAGE_CHUNK_BYTES);
+        for ordinal in 0..CHUNKS {
+            let mut body = seed.clone();
+            body[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            let body = Bytes::from(body);
+            sizes.push((BlakeHash::hash(&body), body.len() as u64));
+            chunks.push((BlakeHash::hash(&body), body));
+        }
+    }
+    let s3 = OriginServer::start_many(chunks).await;
+    let limit = NonZeroUsize::new(CONCURRENCY).unwrap();
+    let mut config = AssetClassConfig::new("chunks", directory.path().join("node"));
+    config.cas_memory_bytes = MEMORY;
+    config.origin = Some(s3.config(CONCURRENCY));
+    config.request_limits = Some(RequestLimits::new(limit, limit, limit).unwrap());
+    config.chunk_limit = Some(tower::limit::GlobalConcurrencyLimitLayer::new(CONCURRENCY));
+    let node = AssetClass::register(config).await.unwrap();
+    let baseline = resident_memory::anonymous_bytes();
+    for round in 1..=ROUNDS {
+        let mut fetches = tokio::task::JoinSet::new();
+        for &(hash, size) in &sizes {
+            let node = node.clone();
+            fetches.spawn(async move { node.indexed_chunk(hash, size).read_chunk().await.map(drop) });
+        }
+        while let Some(fetch) = fetches.join_next().await {
+            fetch.unwrap().unwrap();
+        }
+        node.0.cache.wait_for_storage().await;
+        println!(
+            "round {round}: resident growth {} MiB, Foyer memory {} MiB",
+            resident_memory::anonymous_bytes().saturating_sub(baseline) >> 20,
+            node.0.cache.occupancy().1 >> 20,
+        );
+    }
+    let usage = node.0.cache.occupancy().1;
+    let settled = resident_memory::anonymous_bytes().saturating_sub(baseline);
+    let trimmed = resident_memory::growth_after_trim(baseline);
+    println!("settled growth {} MiB, after malloc_trim {} MiB, Foyer memory {} MiB of {} MiB, {} S3 GETs",
+        settled >> 20, trimmed >> 20, usage >> 20, MEMORY >> 20, s3.gets());
+    node.shutdown().await.unwrap();
+    assert!(usage <= MEMORY as u64, "Foyer weighs {usage} bytes against a {MEMORY} byte budget");
+    assert!(settled <= MEMORY as u64 + BUDGET_OVERHEAD,
+        "resident memory grew {} MiB for a {} MiB CAS budget", settled >> 20, MEMORY >> 20);
 }
 
 // [itest -> dsn~xlb-foyer-cas~1]

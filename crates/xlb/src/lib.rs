@@ -1,5 +1,6 @@
 //! BLAKE3-verified chunks for the model mount, OCI mirror and snapshotter.
 
+pub mod allocator;
 mod cache_checkpoint;
 pub mod cas_cache;
 mod inventory_publication;

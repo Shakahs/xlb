@@ -6,10 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use backon::{ExponentialBuilder, Retryable};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use futures::{StreamExt, TryStreamExt};
-use opendal::{Buffer, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Operator, layers::TimeoutLayer};
+use opendal::{Buffer, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Operator, layers::{RetryLayer, TimeoutLayer}};
 use opendal_http_transport_reqwest::ReqwestTransport;
 use opentelemetry::{KeyValue, global, metrics::{Counter, UpDownCounter}};
 use tokio::sync::mpsc;
@@ -174,7 +173,6 @@ pub(crate) struct Origin {
     operator: Operator,
     key_template: String,
     requests: Arc<RequestCounts>,
-    retries: u32,
 }
 
 impl Origin {
@@ -203,11 +201,14 @@ impl Origin {
             counts: requests.clone(),
             chunk_prefix: chunk_prefix.to_owned(),
         }));
+        // Retry sits outside the timeout so a timed-out read is retried
+        // rather than dropping the retry layer's body state.
         let operator = operator.with_context(context)
             .layer(TimeoutLayer::new().with_io_timeout(ORIGIN_IDLE_TIMEOUT))
+            .layer(RetryLayer::new().with_jitter().with_max_times(config.retries as usize))
             .layer(opendal::layers::OtelTraceLayer::new())
             .layer(opendal::layers::OtelMetricsLayer::builder().register(&opentelemetry::global::meter("opendal")));
-        Ok(Self { operator, key_template: config.key_template, retries: config.retries, requests })
+        Ok(Self { operator, key_template: config.key_template, requests })
     }
 
     pub(crate) fn s3_request_stats(&self) -> S3RequestStats {
@@ -227,36 +228,34 @@ impl Origin {
     }
 
     pub(crate) async fn read_object(&self, key: &str, limit: usize) -> Result<Option<Vec<u8>>, OriginError> {
-        match self.read_whole(key, limit).await {
-            Ok(buffer) => Ok(Some(buffer.to_vec())),
+        match self.read_limited(key, limit).await {
             Err(OriginError::Storage(error)) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+            result => result.map(Some),
         }
     }
 
-    pub(crate) async fn read_chunk(&self, hash: BlakeHash, length: usize) -> Result<Bytes, OriginError> {
-        self.read_whole(&self.key_template.replace(HASH_TOKEN, &hash.to_hex()), length)
-            .await.map(|buffer| buffer.to_bytes())
+    /// Read an object of unknown length, stopping as soon as it passes `limit`.
+    async fn read_limited(&self, key: &str, limit: usize) -> Result<Vec<u8>, OriginError> {
+        let mut stream = self.operator.reader(key).await?.into_stream(..).await?;
+        let mut body = Vec::new();
+        while let Some(buffer) = stream.try_next().await? {
+            if body.len() + buffer.len() > limit {
+                return Err(OriginError::TooLarge { key: key.to_owned(), limit });
+            }
+            body.put(buffer);
+        }
+        Ok(body)
     }
 
-    // Keep retry outside the reader so an interrupted body starts a fresh GET.
+    /// Read one CAS chunk into a buffer of its indexed length. OpenDAL's
+    /// retry layer resumes an interrupted body from the bytes received.
     // [impl -> dsn~xlb-swarm-fetch~1]
-    async fn read_whole(&self, key: &str, limit: usize) -> Result<Buffer, OriginError> {
-        (|| async {
-            let mut stream = self.operator.reader(key).await?.into_stream(..).await?;
-            let mut length = 0;
-            let mut parts = Vec::new();
-            while let Some(buffer) = stream.try_next().await? {
-                length += buffer.len();
-                if length > limit {
-                    return Err(OriginError::TooLarge { key: key.to_owned(), limit });
-                }
-                parts.extend(buffer);
-            }
-            Ok(parts.into_iter().collect())
-        })
-        .retry(ExponentialBuilder::default().with_jitter().with_max_times(self.retries as usize))
-        .when(|error| matches!(error, OriginError::Storage(error) if error.is_temporary()))
-        .await
+    // [impl -> dsn~xlb-foyer-cas~1]
+    pub(crate) async fn read_chunk(&self, hash: BlakeHash, length: usize) -> Result<Bytes, OriginError> {
+        let key = self.key_template.replace(HASH_TOKEN, &hash.to_hex());
+        let reader = self.operator.reader_with(&key).content_length_hint(length as u64).await?;
+        let mut body = Vec::with_capacity(length);
+        reader.read_into(&mut body, 0..length as u64).await?;
+        Ok(Bytes::from(body))
     }
 }

@@ -98,4 +98,30 @@ rust_test(
     deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
+# Each CAS memory budget test reads its own process's resident memory, so it
+# runs alone in its action. The io_uring test needs a real guest kernel.
+rust_test(
+    name = "origin_cas_memory_budget_test",
+    crate = ":xlb",
+    args = ["--ignored", "--exact", "--nocapture", "swarm_tests::origin_fetches_stay_within_the_cas_memory_budget"],
+    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    edition = "2021",
+    exec_properties = {"test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
+    size = "large",
+    tags = ["cpu:8"],
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+)
+
+rust_test(
+    name = "uring_cas_memory_budget_test",
+    crate = ":xlb",
+    args = ["--ignored", "--exact", "--nocapture", "cas_cache::tests::uring_cache_stays_within_its_memory_budget_under_chunk_churn"],
+    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    edition = "2021",
+    exec_properties = {"test.workload-isolation-type": "firecracker", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
+    size = "large",
+    tags = ["cpu:8"],
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+)
+
 filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])

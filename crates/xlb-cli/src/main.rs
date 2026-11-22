@@ -62,6 +62,7 @@ fn default_socket() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    xlb::allocator::map_chunk_buffers()?;
     let args = parse_args(std::env::args().skip(1))?;
     let words: Vec<&str> = args.positional.iter().map(String::as_str).collect();
     let daemon = words == ["serve"];

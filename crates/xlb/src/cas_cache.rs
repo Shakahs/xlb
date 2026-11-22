@@ -295,6 +295,12 @@ impl CasCache {
         self.cache.remove(&CasKey::Chunk(*hash.as_bytes()));
     }
 
+    /// Wait until Foyer has written every queued eviction to disk.
+    #[cfg(test)]
+    pub(super) async fn wait_for_storage(&self) {
+        self.cache.storage().wait().await;
+    }
+
     /// Checkpoint only on the discovery task or after it has stopped.
     pub async fn checkpoint(&self) -> Result<()> {
         self.prune();
@@ -331,11 +337,100 @@ impl CasCache {
     }
 }
 
+/// Process memory readings for tests that hold XLB to its CAS memory budget.
+/// Each such test runs in its own Bazel action, so the readings are the
+/// test's alone.
+#[cfg(test)]
+pub(crate) mod resident_memory {
+    /// Anonymous resident memory of this process, from procfs.
+    pub(crate) fn anonymous_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib = status.lines().find_map(|line| line.strip_prefix("RssAnon:"))
+            .and_then(|value| value.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .expect("RssAnon in /proc/self/status");
+        kib << 10
+    }
+
+    /// Return freed arena pages to the kernel and read the remaining growth.
+    /// Growth that disappears here was freed memory glibc had retained.
+    pub(crate) fn growth_after_trim(baseline: u64) -> u64 {
+        // SAFETY: malloc_trim only releases free pages held by glibc.
+        unsafe { libc::malloc_trim(0) };
+        anonymous_bytes().saturating_sub(baseline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use foyer::PsyncIoEngineConfig;
 
     use super::*;
+
+    /// Fixed process growth outside the CAS budget: runtime, io_uring rings,
+    /// and allocator bookkeeping.
+    const BUDGET_OVERHEAD: u64 = 64 * MIB as u64;
+
+    fn churn_chunk(ordinal: usize) -> Bytes {
+        let mut body = vec![ordinal as u8; CAS_CHUNK_BYTES as usize];
+        body[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+        Bytes::from(body)
+    }
+
+    /// Production opens Foyer with io_uring and receives chunks on many
+    /// threads while readers take chunks back out. Resident memory after the
+    /// work settles must stay within the configured CAS memory.
+    // [utest -> dsn~xlb-foyer-cas~1]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "run as the separate uring_cas_memory_budget_test Bazel action"]
+    async fn uring_cache_stays_within_its_memory_budget_under_chunk_churn() {
+        const MEMORY: usize = 256 * MIB;
+        const DISK: usize = 1024 * MIB;
+        const CHUNKS: usize = 128;
+        const ROUNDS: usize = 4;
+        const CONCURRENCY: usize = 100;
+        crate::allocator::map_chunk_buffers().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(CasCache::open_with_io(
+            directory.path(), MEMORY, DISK, Box::new(foyer::UringIoEngineConfig::new()),
+        ).await.unwrap());
+        let hashes: Arc<Vec<BlakeHash>> = Arc::new((0..CHUNKS).map(|ordinal| BlakeHash::hash(&churn_chunk(ordinal))).collect());
+        let baseline = resident_memory::anonymous_bytes();
+        let slots = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+        for round in 1..=ROUNDS {
+            let mut transfers = tokio::task::JoinSet::new();
+            for ordinal in 0..CHUNKS {
+                let (cache, hashes, slots) = (cache.clone(), hashes.clone(), slots.clone());
+                transfers.spawn(async move {
+                    let _slot = slots.acquire_owned().await.unwrap();
+                    let hash = hashes[ordinal];
+                    if cache.get(hash).await.unwrap().is_none() {
+                        cache.insert(hash, CAS_CHUNK_BYTES, churn_chunk(ordinal)).await.unwrap();
+                    }
+                });
+            }
+            while let Some(transfer) = transfers.join_next().await {
+                transfer.unwrap();
+            }
+            cache.wait_for_storage().await;
+            println!(
+                "round {round}: resident growth {} MiB, Foyer memory {} MiB",
+                resident_memory::anonymous_bytes().saturating_sub(baseline) >> 20,
+                cache.occupancy().1 >> 20,
+            );
+        }
+        let usage = cache.occupancy().1;
+        let settled = resident_memory::anonymous_bytes().saturating_sub(baseline);
+        let trimmed = resident_memory::growth_after_trim(baseline);
+        println!("settled growth {} MiB, after malloc_trim {} MiB, Foyer memory {} MiB of {} MiB",
+            settled >> 20, trimmed >> 20, usage >> 20, MEMORY >> 20);
+        cache.close().await.unwrap();
+        assert!(usage <= MEMORY as u64, "Foyer weighs {usage} bytes against a {MEMORY} byte budget");
+        assert!(settled <= MEMORY as u64 + BUDGET_OVERHEAD,
+            "resident memory grew {} MiB for a {} MiB CAS budget", settled >> 20, MEMORY >> 20);
+    }
 
     // [utest -> dsn~xlb-foyer-cas~1]
     #[tokio::test]

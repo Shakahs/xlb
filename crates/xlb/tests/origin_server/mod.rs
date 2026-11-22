@@ -53,6 +53,7 @@ struct Served {
     first_get: Option<FirstGet>,
     paused: watch::Sender<bool>,
     gets: AtomicUsize,
+    get_offsets: std::sync::Mutex<Vec<usize>>,
     connections: AtomicUsize,
 }
 
@@ -82,6 +83,7 @@ impl OriginServer {
             first_get,
             paused: watch::Sender::new(false),
             gets: AtomicUsize::new(0),
+            get_offsets: std::sync::Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
         });
         let accepting = served.clone();
@@ -105,6 +107,11 @@ impl OriginServer {
         self.served.gets.load(Ordering::Relaxed)
     }
 
+    /// The first byte each GET asked for, in arrival order.
+    pub fn get_offsets(&self) -> Vec<usize> {
+        self.served.get_offsets.lock().unwrap().clone()
+    }
+
     pub fn connections(&self) -> usize {
         self.served.connections.load(Ordering::Relaxed)
     }
@@ -124,6 +131,14 @@ impl OriginServer {
             retries: 1,
         }
     }
+}
+
+/// The `[start, end)` span of a single `bytes=start-[last]` range.
+fn byte_range(value: &str, length: usize) -> Option<(usize, usize)> {
+    let (start, last) = value.strip_prefix("bytes=")?.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    let end = if last.is_empty() { length } else { last.parse::<usize>().ok()?.saturating_add(1).min(length) };
+    (start < end).then_some((start, end))
 }
 
 async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
@@ -170,6 +185,7 @@ async fn serve_request(stream: &mut TcpStream, served: &Served) -> bool {
         header("x-amz-date"),
     );
     let mut first_get = None;
+    let mut content_range = String::new();
     let (status, length, payload) = if version != "HTTP/1.1" {
         ("505 HTTP Version Not Supported", 0, &[][..])
     } else if auth != expected.authorization || header("host") != served.host {
@@ -178,16 +194,24 @@ async fn serve_request(stream: &mut TcpStream, served: &Served) -> bool {
         ("404 Not Found", 0, &[][..])
     } else if method == "HEAD" {
         ("200 OK", served.bodies[path].len(), &[][..])
-    } else if method == "GET" && header("range").is_empty() {
+    } else if method == "GET" {
+        let body = served.bodies[path].as_ref();
+        let range = header("range");
+        let span = if range.is_empty() { Some((0, body.len())) } else { byte_range(range, body.len()) };
         if served.gets.fetch_add(1, Ordering::Relaxed) == 0 {
             first_get = served.first_get;
         }
+        served.get_offsets.lock().unwrap().push(span.map_or(0, |(start, _)| start));
         let mut paused = served.paused.subscribe();
         let _ = paused.wait_for(|paused| !paused).await;
-        if matches!(first_get, Some(FirstGet::Throttle)) {
-            ("429 Too Many Requests", 0, &[][..])
-        } else {
-            ("200 OK", served.bodies[path].len(), served.bodies[path].as_ref())
+        match span {
+            _ if matches!(first_get, Some(FirstGet::Throttle)) => ("429 Too Many Requests", 0, &[][..]),
+            Some((start, end)) if !range.is_empty() => {
+                content_range = format!("Content-Range: bytes {start}-{}/{}\r\n", end - 1, body.len());
+                ("206 Partial Content", end - start, &body[start..end])
+            }
+            Some(_) => ("200 OK", body.len(), body),
+            None => ("416 Range Not Satisfiable", 0, &[][..]),
         }
     } else {
         ("400 Bad Request", 0, &[][..])
@@ -195,7 +219,7 @@ async fn serve_request(stream: &mut TcpStream, served: &Served) -> bool {
     let keep_alive = !matches!(first_get, Some(FirstGet::Disconnect(_)))
         && !header("connection").eq_ignore_ascii_case("close");
     let connection = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: {connection}\r\n\r\n");
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\n{content_range}Connection: {connection}\r\n\r\n");
     let payload_length = match first_get {
         Some(FirstGet::Disconnect(prefix)) => prefix.min(payload.len()),
         _ => payload.len(),
