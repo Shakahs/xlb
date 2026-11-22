@@ -236,7 +236,7 @@ async fn chunk_limit_is_shared_across_asset_classes() {
     let entries: Vec<_> = bodies.iter().map(|body| (BlakeHash::hash(body), body.clone())).collect();
     let origin = OriginServer::start_many(entries.clone()).await;
     origin.pause(true);
-    let shared = tower::limit::GlobalConcurrencyLimitLayer::new(1);
+    let shared = crate::ChunkAdmission::new(1);
     let mut nodes = Vec::new();
     for name in ["first", "second"] {
         let mut config = AssetClassConfig::new(name, directory.path().join(name));
@@ -645,7 +645,7 @@ async fn benchmark_chunk_sources(holder_count: usize) {
     config.origin = Some(s3.config(100));
     let s3_limits = limits();
     config.request_limits = Some(s3_limits.clone());
-    config.chunk_limit = Some(tower::limit::GlobalConcurrencyLimitLayer::new(100));
+    config.chunk_limit = Some(crate::ChunkAdmission::new(100));
     let client = AssetClass::register(config).await.unwrap();
     let started = Instant::now();
     let results: Vec<_> = futures::stream::iter(chunks.iter().map(|(hash, body)| {
@@ -666,7 +666,7 @@ async fn benchmark_chunk_sources(holder_count: usize) {
         let mut config = AssetClassConfig::new("chunks", directory.path().join(path));
         config.cas_memory_bytes = if path.starts_with("holder") { 2560 << 20 } else { 1536 << 20 };
         config.request_limits = Some(peer_limits.clone());
-        config.chunk_limit = Some(tower::limit::GlobalConcurrencyLimitLayer::new(100));
+        config.chunk_limit = Some(crate::ChunkAdmission::new(100));
         config.peer = Some(PeerConfig { bind_addr: BIND, relay: RelaySetting::Disabled, concurrency: limit, ..PeerConfig::default() });
         config
     };
@@ -759,7 +759,7 @@ async fn origin_fetches_stay_within_the_cas_memory_budget() {
     config.cas_memory_bytes = MEMORY;
     config.origin = Some(s3.config(CONCURRENCY));
     config.request_limits = Some(RequestLimits::new(limit, limit, limit).unwrap());
-    config.chunk_limit = Some(tower::limit::GlobalConcurrencyLimitLayer::new(CONCURRENCY));
+    config.chunk_limit = Some(crate::ChunkAdmission::new(CONCURRENCY));
     let node = AssetClass::register(config).await.unwrap();
     let baseline = resident_memory::anonymous_bytes();
     for round in 1..=ROUNDS {

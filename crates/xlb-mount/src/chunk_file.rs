@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use futures::future::try_join_all;
 use tokio::sync::OnceCell;
-use xlb::{AssetClass, BlakeHash, FetchReport};
+use xlb::{AssetClass, BlakeHash, FetchReport, TransferPriority};
 use xlb_core::chunks::{CAS_CHUNK_BYTES, ChunkIndex, positioned_value};
 
 #[derive(Clone)]
@@ -27,8 +27,12 @@ impl ChunkFile {
     }
 
     pub(crate) async fn read_chunk(&self, ordinal: u64) -> Result<(Bytes, FetchReport)> {
+        self.read_chunk_with(ordinal, TransferPriority::Demand).await
+    }
+
+    pub(crate) async fn read_chunk_with(&self, ordinal: u64, priority: TransferPriority) -> Result<(Bytes, FetchReport)> {
         let (hash, length) = self.index.chunk(ordinal).context("CAS index is truncated")?;
-        let (body, report) = self.class.indexed_chunk(hash, length).read_chunk_reported().await;
+        let (body, report) = self.class.indexed_chunk(hash, length).read_chunk_with(priority).await;
         let body = body?;
         ensure!(body.len() as u64 == length, "CAS chunk {hash} has an unexpected length");
         if let Some((expected, check)) = self.checks.get(ordinal as usize) {

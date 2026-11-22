@@ -22,7 +22,7 @@ use tonic::{Status, transport::Server};
 use xlb::AssetClass;
 use xlb_core::{BlakeHash, image::blake3_digest_hex, layer::{LAYER_INDEX_LABEL, LAYER_INDEX_LIMIT, LAYER_INDEX_PREFIX, LayerIndex}};
 
-use crate::{layer_mount::mount_layer, model_mount::close_sessions, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
+use crate::{chunk_file::ChunkFile, layer_mount::{mount_layer, prefetch_layer}, model_mount::close_sessions, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
 
 const SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
@@ -43,12 +43,15 @@ struct CasSnapshotter {
     store: SnapshotStore,
     state: Mutex<SnapshotState>,
     class: AssetClass,
+    /// Chunk fetches in flight for each new layer's prefetch.
+    concurrency: usize,
 }
 
 // [impl -> dsn~xlb-fuse-snapshots~1]
 pub async fn serve_snapshots(
     config: SnapshotSettings,
     class: AssetClass,
+    concurrency: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let (store, records) = SnapshotStore::open(config.root)?;
@@ -57,11 +60,11 @@ pub async fn serve_snapshots(
         if let Some(digest) = record.layer {
             let diff_id = record.info.labels.get(SNAPSHOT_DIFF_ID).context("snapshot has no diff ID")?;
             let index = load_layer_index(&store, &class, digest, diff_id).await.context("restore OCI layer index")?;
-            let session = start_layer(index, &store.upper(record), class.clone()).await?;
+            let (session, _) = start_layer(index, &store.upper(record), class.clone()).await?;
             sessions.insert(record.id.clone(), session);
         }
     }
-    let snapshots = Arc::new(CasSnapshotter { store, state: Mutex::new(SnapshotState { records, sessions }), class });
+    let snapshots = Arc::new(CasSnapshotter { store, state: Mutex::new(SnapshotState { records, sessions }), class, concurrency });
     let directory = config.socket.parent().context("snapshot socket needs a parent directory")?;
     tokio::fs::create_dir_all(directory).await?;
     match tokio::fs::remove_file(&config.socket).await {
@@ -115,7 +118,7 @@ async fn load_layer_index(store: &SnapshotStore, class: &AssetClass, digest: Bla
     Ok(index)
 }
 
-async fn start_layer(index: LayerIndex, path: &Path, class: AssetClass) -> Result<BackgroundSession> {
+async fn start_layer(index: LayerIndex, path: &Path, class: AssetClass) -> Result<(BackgroundSession, ChunkFile)> {
     let path = path.to_owned();
     let runtime = Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -217,8 +220,7 @@ impl CasSnapshotter {
         fs::create_dir_all(&upper).map_err(failure)?;
         let prepare = async {
             if let Some(index) = index {
-                let session = start_layer(index, &upper, self.class.clone()).await.map_err(failure)?;
-                Ok(Some(session))
+                Ok(Some(start_layer(index, &upper, self.class.clone()).await.map_err(failure)?))
             } else {
                 if kind == Kind::Active {
                     if !record.info.parent.is_empty() {
@@ -234,16 +236,28 @@ impl CasSnapshotter {
         }.await;
         let mut next = state.records.clone();
         next.insert(key, record.clone());
-        let result = prepare.and_then(|session| {
+        let mut archive = None;
+        let result = prepare.and_then(|layer| {
             let mounts = self.mounts_for(&record, &next)?;
             self.store.persist(&next).map_err(failure)?;
             state.records = next;
-            if let Some(session) = session { state.sessions.insert(record.id.clone(), session); }
+            if let Some((session, layer_archive)) = layer {
+                state.sessions.insert(record.id.clone(), session);
+                archive = Some(layer_archive);
+            }
             Ok(mounts)
         });
         if result.is_err() {
             let _ = fs::remove_dir_all(self.store.directory(&record));
-        } else if remote.is_some() {
+        } else if let Some((digest, _)) = remote {
+            if let Some(archive) = archive {
+                let concurrency = self.concurrency;
+                tokio::spawn(async move {
+                    if let Err(error) = prefetch_layer(archive, concurrency).await {
+                        tracing::warn!(%digest, %error, "prefetch OCI layer");
+                    }
+                });
+            }
             return Err(Status::already_exists("OCI FUSE layer is committed"));
         }
         result

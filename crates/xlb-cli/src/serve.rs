@@ -47,7 +47,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     )?);
 
     let concurrency = cfg.node.chunk_concurrency.get();
-    let chunk_limit = tower::limit::GlobalConcurrencyLimitLayer::new(concurrency);
+    let chunk_limit = xlb::ChunkAdmission::new(concurrency);
     tracing::info!(chunk_limit = concurrency, total_limit = cfg.node.total_request_concurrency.get(),
         s3_limit = cfg.node.s3_request_concurrency.get(), peer_limit = cfg.node.peer_request_concurrency.get(),
         "XLB download limits");
@@ -145,7 +145,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
             let entry = state.classes.iter().find(|entry| entry.name == config.class)
                 .context("snapshotter class is not registered")?;
             services.push(ServiceTask::new("containerd snapshotter", xlb_mount::serve_snapshots(
-                config, entry.class.clone(), cancel.clone().cancelled_owned(),
+                config, entry.class.clone(), concurrency, cancel.clone().cancelled_owned(),
             )));
         }
         if !model_sessions.is_empty() {

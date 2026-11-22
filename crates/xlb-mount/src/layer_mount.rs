@@ -14,8 +14,10 @@ use fuser::{
     INodeNo, IoctlFlags, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEntry, ReplyIoctl, ReplyXattr, Request, SessionACL,
 };
+use futures::{StreamExt, TryStreamExt, stream};
+use rand::seq::SliceRandom;
 use tokio::runtime::Handle;
-use xlb::AssetClass;
+use xlb::{AssetClass, TransferPriority};
 use xlb_core::layer::{LayerEntry, LayerEntryKind, LayerIndex};
 
 use crate::chunk_file::ChunkFile;
@@ -41,18 +43,35 @@ struct LayerMount {
     runtime: Handle,
 }
 
+/// Mount a layer and return its session with the archive it reads from.
 // [impl -> dsn~xlb-fuse-snapshots~1]
 pub(crate) fn mount_layer(
     index: LayerIndex, class: AssetClass, mountpoint: &Path, runtime: Handle,
-) -> Result<BackgroundSession> {
+) -> Result<(BackgroundSession, ChunkFile)> {
     let archive = ChunkFile::new(Arc::new(index.archive), class)?;
     let nodes = layer_nodes(index.entries, archive.index.size_bytes)?;
-    let layer = LayerMount { archive, nodes, runtime };
+    let layer = LayerMount { archive: archive.clone(), nodes, runtime };
     let mut config = Config::default();
     config.acl = SessionACL::All;
     config.mount_options = vec![MountOption::RO, MountOption::DefaultPermissions,
         MountOption::Exec, MountOption::NoAtime, MountOption::FSName("xlb-layer".into())];
-    fuser::spawn_mount(layer, mountpoint, &config).context("mount XLB OCI layer")
+    let session = fuser::spawn_mount(layer, mountpoint, &config).context("mount XLB OCI layer")?;
+    Ok((session, archive))
+}
+
+/// Fetch every archive chunk into the node cache, so container startup reads
+/// hit the cache instead of waiting for one chunk transfer at a time. The
+/// transfers are background transfers, so pending reads go first.
+// [impl -> dsn~xlb-fuse-snapshots~1]
+pub(crate) async fn prefetch_layer(archive: ChunkFile, concurrency: usize) -> Result<()> {
+    let mut ordinals: Vec<u64> = (0..archive.index.chunks.len() as u64).collect();
+    ordinals.shuffle(&mut rand::rng());
+    let archive = &archive;
+    stream::iter(ordinals)
+        .map(|ordinal| async move { archive.read_chunk_with(ordinal, TransferPriority::Background).await.map(drop) })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await
 }
 
 fn parent_and_name(path: &[u8]) -> (&[u8], &[u8]) {

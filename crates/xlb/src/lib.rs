@@ -3,6 +3,7 @@
 pub mod allocator;
 mod cache_checkpoint;
 pub mod cas_cache;
+mod chunk_admission;
 mod inventory_publication;
 pub mod metrics;
 pub mod origin;
@@ -19,6 +20,7 @@ mod transfer_policy;
 #[path = "swarm_tests.rs"]
 mod swarm_tests;
 
+pub use chunk_admission::{ChunkAdmission, TransferPriority};
 pub use metrics::{FetchObserver, FetchReport};
 pub use origin::{Credentials, OriginConfig, S3RequestEvent, S3RequestStats};
 pub use peer::{NodeId, PeerAddr, PeerConfig, RelaySetting, RelayUrl};
@@ -36,7 +38,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{cache_checkpoint::CacheCheckpoint, cas_cache::{CasCache, VerifiedChunk}, origin::Origin, panda_peers::PandaPeers};
@@ -91,7 +93,7 @@ pub struct AssetClassConfig {
     pub peer: Option<PeerConfig>,
     pub origin: Option<OriginConfig>,
     pub request_limits: Option<RequestLimits>,
-    pub chunk_limit: Option<tower::limit::GlobalConcurrencyLimitLayer>,
+    pub chunk_limit: Option<ChunkAdmission>,
     pub observer: Option<FetchObserver>,
 }
 
@@ -142,6 +144,9 @@ impl Fetched {
 
 type Flight = watch::Receiver<Option<Result<Fetched>>>;
 
+/// A transfer in progress, its size and the signal that promotes it to demand.
+type FlightEntry = (u64, Flight, Arc<Notify>);
+
 struct ClassInner {
     name: &'static str,
     observer: Option<FetchObserver>,
@@ -151,9 +156,9 @@ struct ClassInner {
     checkpoint: CacheCheckpoint,
     peers: Option<PandaPeers>,
     origin: Option<Origin>,
-    flights: Mutex<HashMap<BlakeHash, (u64, Flight)>>,
+    flights: Mutex<HashMap<BlakeHash, FlightEntry>>,
     transfers: TaskTracker,
-    chunk_limit: Option<tower::limit::GlobalConcurrencyLimitLayer>,
+    chunk_limit: Option<ChunkAdmission>,
     shutdown: CancellationToken,
 }
 
@@ -297,31 +302,36 @@ impl AssetClass {
         }
     }
 
-    fn join_flight(&self, hash: BlakeHash, size: u64) -> Result<(u64, Flight)> {
+    // A demand read that joins a transfer still waiting for admission
+    // promotes it.
+    // [impl -> dsn~xlb-fuse-snapshots~1]
+    fn join_flight(&self, hash: BlakeHash, size: u64, priority: TransferPriority) -> Result<(u64, Flight)> {
         let mut flights = self.0.flights.lock().unwrap();
         if self.0.shutdown.is_cancelled() {
             return Err(Error::FetchFailed { hash, detail: "XLB is shutting down".into() });
         }
-        if let Some((size, flight)) = flights.get(&hash) {
+        if let Some((size, flight, promotion)) = flights.get(&hash) {
             if flight.has_changed().is_ok() {
+                if priority == TransferPriority::Demand {
+                    promotion.notify_one();
+                }
                 return Ok((*size, flight.clone()));
             }
         }
         let (tx, rx) = watch::channel(None);
-        flights.insert(hash, (size, rx.clone()));
+        let promotion = Arc::new(Notify::new());
+        flights.insert(hash, (size, rx.clone(), promotion.clone()));
         let class = self.clone();
         use tracing::Instrument;
         self.0.transfers.spawn(async move {
-            use tower::{Layer, ServiceExt};
-            let limit = class.0.chunk_limit.clone();
+            let admission = class.0.chunk_limit.clone();
             let outcome = tokio::select! {
                 result = async {
-                    if let Some(limit) = limit {
-                        let transfer = tower::service_fn(|()| class.transfer_chunk(hash, size));
-                        limit.layer(transfer).oneshot(()).await
-                    } else {
-                        class.transfer_chunk(hash, size).await
-                    }
+                    let _slot = match &admission {
+                        Some(admission) => Some(admission.admit(priority, &promotion).await),
+                        None => None,
+                    };
+                    class.transfer_chunk(hash, size).await
                 } => result,
                 () = class.0.shutdown.cancelled() => Err(Error::FetchFailed {
                     hash, detail: "XLB is shutting down".into(),
@@ -418,12 +428,12 @@ impl AssetClass {
         }
     }
 
-    async fn fetch(&self, hash: BlakeHash, size: u64) -> Result<Fetched> {
+    async fn fetch(&self, hash: BlakeHash, size: u64, priority: TransferPriority) -> Result<Fetched> {
         if let Some(hit) = self.cached_chunk(hash, size).await? {
             return Ok(hit);
         }
         loop {
-            let (in_flight_size, mut flight) = self.join_flight(hash, size)?;
+            let (in_flight_size, mut flight) = self.join_flight(hash, size, priority)?;
             let outcome = flight.wait_for(Option::is_some).await.map_err(|_| Error::FetchFailed {
                 hash, detail: "the transfer task ended without an outcome".into(),
             })?.clone().expect("completed transfer");
@@ -453,10 +463,15 @@ impl Asset {
         self.read_chunk_reported().await.0
     }
 
-    #[tracing::instrument(name = "xlb.chunk.fetch", skip_all, fields(class = self.class.0.name, hash = %self.hash, source = tracing::field::Empty, peer = tracing::field::Empty, bytes = tracing::field::Empty, success = tracing::field::Empty, error = tracing::field::Empty))]
+    /// Read the chunk for a waiting reader.
     pub async fn read_chunk_reported(&self) -> (Result<Bytes>, FetchReport) {
+        self.read_chunk_with(TransferPriority::Demand).await
+    }
+
+    #[tracing::instrument(name = "xlb.chunk.fetch", skip_all, fields(class = self.class.0.name, hash = %self.hash, ?priority, source = tracing::field::Empty, peer = tracing::field::Empty, bytes = tracing::field::Empty, success = tracing::field::Empty, error = tracing::field::Empty))]
+    pub async fn read_chunk_with(&self, priority: TransferPriority) -> (Result<Bytes>, FetchReport) {
         let started = Instant::now();
-        let outcome = self.class.fetch(self.hash, self.size).await;
+        let outcome = self.class.fetch(self.hash, self.size, priority).await;
         let fetched = outcome.as_ref().ok();
         let report = FetchReport {
             class: self.class.0.name,
