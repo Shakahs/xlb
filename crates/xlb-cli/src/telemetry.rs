@@ -21,7 +21,9 @@ pub fn init(daemon: bool) -> Result<Telemetry> {
     let resource = Resource::builder().with_service_name("xlb").build();
     let traces = if enabled {
         let exporter = opentelemetry_otlp::SpanExporter::builder().with_http().build()?;
-        Some(SdkTracerProvider::builder().with_resource(resource.clone()).with_batch_exporter(exporter).build())
+        let provider = SdkTracerProvider::builder().with_resource(resource.clone()).with_batch_exporter(exporter).build();
+        global::set_tracer_provider(provider.clone());
+        Some(provider)
     } else { None };
     let metrics = if enabled {
         let exporter = opentelemetry_otlp::MetricExporter::builder().with_http().build()?;
@@ -37,7 +39,7 @@ pub fn init(daemon: bool) -> Result<Telemetry> {
     };
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
-        .with(tracing_subscriber::fmt::layer().with_writer(console))
+        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(console))
         .with(span_layer)
         .try_init()?;
     Ok(Telemetry { traces, metrics, _console: guard })

@@ -12,7 +12,7 @@ use iroh::{
 use p2panda_net::Endpoint;
 use tokio::sync::OnceCell;
 use tokio_util::task::AbortOnDropHandle;
-use opentelemetry::{KeyValue, global, metrics::Counter};
+use opentelemetry::{KeyValue, global, metrics::{Counter, UpDownCounter}};
 use tracing::Instrument;
 
 use crate::{
@@ -24,6 +24,31 @@ use crate::{
 pub(crate) const CHUNK_PROTOCOL: &[u8] = b"xlb/cas-chunk/1";
 const PEER_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PEER_READ_IDLE: Duration = Duration::from_secs(5);
+
+// [impl -> dsn~xlb-connection-transfer-metrics~1]
+fn record_peer_bytes(bytes: usize, direction: &'static str) {
+    static TRANSFERRED: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
+    TRANSFERRED.get_or_init(|| global::meter("imgcloud.xlb").u64_counter("xlb.transfer.bytes").with_unit("By").build())
+        .add(bytes as u64, &[KeyValue::new("source", "peer"), KeyValue::new("direction", direction)]);
+}
+
+struct PeerConnectionMetric(&'static str);
+
+impl PeerConnectionMetric {
+    fn new(direction: &'static str) -> Self {
+        peer_connections().add(1, &[KeyValue::new("direction", direction)]);
+        Self(direction)
+    }
+}
+
+impl Drop for PeerConnectionMetric {
+    fn drop(&mut self) { peer_connections().add(-1, &[KeyValue::new("direction", self.0)]); }
+}
+
+fn peer_connections() -> &'static UpDownCounter<i64> {
+    static CONNECTIONS: std::sync::OnceLock<UpDownCounter<i64>> = std::sync::OnceLock::new();
+    CONNECTIONS.get_or_init(|| global::meter("imgcloud.xlb").i64_up_down_counter("xlb.peer.connections.active").build())
+}
 
 fn record_upload_failure(cause: &'static str) {
     static FAILED: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
@@ -52,6 +77,7 @@ impl ProtocolHandler for ChunkProvider {
             connection.close(VarInt::from_u32(0), b"peer unavailable");
             return Ok(());
         }
+        let _connection_metric = PeerConnectionMetric::new("incoming");
         let _paths = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(close_when_relayed(connection.clone(), true)));
         stream::unfold(connection, |connection| async move {
             let streams = connection.accept_bi().await.ok()?;
@@ -92,7 +118,11 @@ impl ChunkProvider {
         }).await.map_err(|_| "peer request timed out".to_owned())??;
         tracing::Span::current().record("hash", tracing::field::display(BlakeHash::from_bytes(digest)));
         if let Some(chunk) = self.cache.get(BlakeHash::from_bytes(digest)).await.map_err(|error| error.to_string())? {
+            let bytes = chunk.body().len() as u64;
             send.write_chunk(chunk.body().clone()).await.map_err(|error| error.to_string())?;
+            record_peer_bytes(bytes as usize, "upload");
+            send.finish().map_err(|error| error.to_string())?;
+            return Ok(());
         }
         send.finish().map_err(|error| error.to_string())
     }
@@ -154,7 +184,11 @@ async fn connect(endpoint: &Endpoint, node: NodeId) -> Result<DirectConnection, 
         connection.close(VarInt::from_u32(0), b"no direct path");
         return Err("no direct path".into());
     }
-    let monitor = AbortOnDropHandle::new(tokio::spawn(close_when_relayed(connection.clone(), true)));
+    let monitored = connection.clone();
+    let monitor = AbortOnDropHandle::new(tokio::spawn(async move {
+        let _connection_metric = PeerConnectionMetric::new("outgoing");
+        close_when_relayed(monitored, true).await;
+    }));
     Ok(DirectConnection { connection, _monitor: monitor })
 }
 
@@ -200,8 +234,10 @@ async fn read_chunk(receive: &mut RecvStream, size: usize) -> Result<Bytes, Stri
 async fn read_with_idle_timeout(
     receive: &mut RecvStream, max_read: usize, received: usize, expected: usize,
 ) -> Result<Option<Bytes>, String> {
-    tokio::time::timeout(PEER_READ_IDLE, receive.read_chunk(max_read))
+    let chunk = tokio::time::timeout(PEER_READ_IDLE, receive.read_chunk(max_read))
         .await
         .map_err(|_| format!("peer response timed out after {PEER_READ_IDLE:?} without progress ({received}/{expected} bytes received)"))?
-        .map_err(|error| format!("peer response interrupted ({received}/{expected} bytes received): {error}"))
+        .map_err(|error| format!("peer response interrupted ({received}/{expected} bytes received): {error}"))?;
+    if let Some(bytes) = &chunk { record_peer_bytes(bytes.len(), "download"); }
+    Ok(chunk)
 }

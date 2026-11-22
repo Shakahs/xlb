@@ -13,6 +13,99 @@ use origin_server::{FirstGet, OriginServer, test_data};
 
 const BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
 
+#[derive(Clone, Debug, Default)]
+struct MetricCapture(std::sync::Arc<std::sync::Mutex<Vec<(String, std::collections::BTreeMap<String, String>, f64)>>>);
+
+impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for MetricCapture {
+    async fn export(&self, resource: &opentelemetry_sdk::metrics::data::ResourceMetrics) -> opentelemetry_sdk::error::OTelSdkResult {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        let mut captured = self.0.lock().unwrap();
+        captured.clear();
+        for metric in resource.scope_metrics().flat_map(|scope| scope.metrics()) {
+            let mut add = |attributes: Vec<_>, value| captured.push((metric.name().to_owned(), attributes.into_iter()
+                .map(|item: &opentelemetry::KeyValue| (item.key.as_str().to_owned(), item.value.as_str().into_owned())).collect(), value));
+            match metric.data() {
+                AggregatedMetrics::I64(MetricData::Sum(sum)) => for point in sum.data_points() { add(point.attributes().collect(), point.value() as f64); },
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => for point in sum.data_points() { add(point.attributes().collect(), point.value() as f64); },
+                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => for point in histogram.data_points() { add(point.attributes().collect(), point.count() as f64); },
+                _ => {},
+            }
+        }
+        Ok(())
+    }
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult { Ok(()) }
+    fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult { Ok(()) }
+    fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality { opentelemetry_sdk::metrics::Temporality::Cumulative }
+}
+
+fn metric_provider() -> (opentelemetry_sdk::metrics::SdkMeterProvider, MetricCapture) {
+    let capture = MetricCapture::default();
+    let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().with_periodic_exporter(capture.clone()).build();
+    opentelemetry::global::set_meter_provider(provider.clone());
+    (provider, capture)
+}
+
+impl MetricCapture {
+    fn has(&self, name: &str, labels: &[(&str, &str)], minimum: f64) -> bool {
+        self.0.lock().unwrap().iter().any(|(metric, attributes, value)| metric == name && *value >= minimum
+            && labels.iter().all(|(key, value)| attributes.get(*key).is_some_and(|actual| actual == value)))
+    }
+}
+
+// [itest -> dsn~xlb-connection-transfer-metrics~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "run as the separate s3_telemetry_test Bazel action"]
+async fn s3_metrics_report_active_requests_and_response_rates() {
+    let (provider, capture) = metric_provider();
+    let directory = tempfile::tempdir().unwrap();
+    let body = test_data(64 * 1024);
+    let hash = BlakeHash::hash(&body);
+    let origin = OriginServer::start(hash, body.clone()).await;
+    origin.pause(true);
+    let mut config = AssetClassConfig::new("metrics", directory.path());
+    config.origin = Some(origin.config(1));
+    let node = AssetClass::register(config).await.unwrap();
+    let asset = node.indexed_chunk(hash, body.len() as u64);
+    let read = tokio::spawn(async move { asset.read_chunk().await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while origin.gets() == 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    provider.force_flush().unwrap();
+    assert!(capture.has("opendal.http.executing", &[], 1.0), "OpenDAL must expose active S3 HTTP requests");
+    assert!(capture.has("xlb.s3.requests.active", &[], 1.0), "S3 requests must remain active through response streaming");
+    origin.pause(false);
+    assert_eq!(read.await.unwrap().unwrap().as_ref(), body);
+    provider.force_flush().unwrap();
+    assert!(capture.has("opendal.http.response.bytes_rate", &[], 1.0), "OpenDAL must report response throughput");
+    assert!(capture.has("xlb.transfer.bytes", &[("source", "s3"), ("direction", "download")], body.len() as f64));
+    node.shutdown().await.unwrap();
+}
+
+// [itest -> dsn~xlb-connection-transfer-metrics~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run as the separate peer_telemetry_test Bazel action"]
+async fn peer_metrics_report_connections_and_transferred_bytes() {
+    let (provider, capture) = metric_provider();
+    let directory = tempfile::tempdir().unwrap();
+    let holder = peer_node(&directory.path().join("holder"), "aws/region", PeerReach::Local, None).await;
+    let reader = peer_node(&directory.path().join("reader"), "aws/region", PeerReach::Local, None).await;
+    let body = Bytes::from_static(b"peer transfer metric payload");
+    let hash = BlakeHash::hash(&body);
+    cache_data(&holder, hash, body.clone()).await;
+    let holder_addr = cache_address(&holder).await;
+    holder.set_peers(vec![cache_address(&reader).await]);
+    reader.set_peers(vec![holder_addr.clone()]);
+    wait_for_records(&reader, hash, &[holder_addr.node_id]).await;
+    assert_eq!(reader.indexed_chunk(hash, body.len() as u64).read_chunk().await.unwrap(), body);
+    provider.force_flush().unwrap();
+    assert!(capture.has("xlb.peer.connections.active", &[("direction", "outgoing")], 1.0));
+    assert!(capture.has("xlb.peer.connections.active", &[("direction", "incoming")], 1.0));
+    for direction in ["download", "upload"] {
+        assert!(capture.has("xlb.transfer.bytes", &[("source", "peer"), ("direction", direction)], body.len() as f64));
+    }
+    tokio::try_join!(reader.shutdown(), holder.shutdown()).unwrap();
+}
+
 async fn wait_for_records(receiver: &AssetClass, hash: BlakeHash, expected: &[NodeId]) {
     let peers = receiver.0.peers.as_ref().unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {

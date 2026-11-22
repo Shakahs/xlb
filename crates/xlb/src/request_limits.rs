@@ -103,6 +103,7 @@ impl RequestLimits {
         if total.max(origin).max(peer) > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(Error::Config("XLB request limit exceeds Tower capacity".into()));
         }
+        // [impl -> dsn~xlb-connection-transfer-metrics~1]
         Ok(Self {
             total: GlobalConcurrencyLimitLayer::new(total),
             origin: GlobalConcurrencyLimitLayer::new(origin),

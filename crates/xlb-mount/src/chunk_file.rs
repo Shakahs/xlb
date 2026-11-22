@@ -8,7 +8,6 @@ use tokio::sync::OnceCell;
 use xlb::{AssetClass, BlakeHash, FetchReport};
 use xlb_core::chunks::{CAS_CHUNK_BYTES, ChunkIndex, positioned_value};
 
-
 #[derive(Clone)]
 pub(crate) struct ChunkFile {
     pub(crate) index: Arc<ChunkIndex>,

@@ -49,6 +49,7 @@ rust_test(
     edition = "2021",
     deps = [
         "@scheduler_crates//:hex",
+        "@scheduler_crates//:opentelemetry_sdk",
         "@scheduler_crates//:sha2",
         "@scheduler_crates//:tempfile",
         "@scheduler_crates//:tracing-subscriber",
@@ -64,7 +65,7 @@ rust_test(
     exec_properties = {"test.workload-isolation-type": "firecracker", "test.network-enable-ipv6": "true", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
     size = "large",
     tags = ["manual", "cpu:8"],
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 rust_test(
@@ -76,7 +77,25 @@ rust_test(
     exec_properties = {"test.workload-isolation-type": "firecracker", "test.network-enable-ipv6": "true", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
     size = "large",
     tags = ["manual", "cpu:8"],
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+)
+
+rust_test(
+    name = "s3_telemetry_test",
+    crate = ":xlb",
+    args = ["--ignored", "--exact", "swarm_tests::s3_metrics_report_active_requests_and_response_rates"],
+    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    edition = "2021",
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+)
+
+rust_test(
+    name = "peer_telemetry_test",
+    crate = ":xlb",
+    args = ["--ignored", "--exact", "swarm_tests::peer_metrics_report_connections_and_transferred_bytes"],
+    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    edition = "2021",
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])

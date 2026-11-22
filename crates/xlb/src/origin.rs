@@ -11,12 +11,24 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use opendal::{Buffer, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Operator, layers::TimeoutLayer};
 use opendal_http_transport_reqwest::ReqwestTransport;
+use opentelemetry::{KeyValue, global, metrics::{Counter, UpDownCounter}};
 use tokio::sync::mpsc;
 
 use crate::{BlakeHash, Error, RequestLimits, Result};
 
 const ORIGIN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HASH_TOKEN: &str = "{blake3}";
+
+fn active_s3_requests() -> &'static UpDownCounter<i64> {
+    static ACTIVE: OnceLock<UpDownCounter<i64>> = OnceLock::new();
+    ACTIVE.get_or_init(|| global::meter("imgcloud.xlb").i64_up_down_counter("xlb.s3.requests.active")
+        .with_description("S3 HTTP requests in flight, including streaming their response bodies").build())
+}
+
+fn s3_transfer_bytes() -> &'static Counter<u64> {
+    static TRANSFERRED: OnceLock<Counter<u64>> = OnceLock::new();
+    TRANSFERRED.get_or_init(|| global::meter("imgcloud.xlb").u64_counter("xlb.transfer.bytes").with_unit("By").build())
+}
 pub const DEFAULT_ORIGIN_CONCURRENCY: usize = 32;
 pub const DEFAULT_ORIGIN_RETRIES: u32 = 4;
 pub const DEFAULT_KEY_TEMPLATE: &str = "models/blake3/{blake3}";
@@ -102,6 +114,7 @@ struct RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
+        active_s3_requests().add(-1, &[]);
         if matches!(self.kind, S3RequestKind::ChunkRead) {
             self.counts.chunks.active.fetch_sub(1, Ordering::Relaxed);
         }
@@ -123,6 +136,7 @@ struct S3Transport {
 }
 
 impl HttpTransport for S3Transport {
+    // [impl -> dsn~xlb-connection-transfer-metrics~1]
     async fn fetch(&self, request: http::Request<Buffer>) -> opendal::Result<http::Response<HttpBody>> {
         let slot = self.limits.origin().await;
         let kind = if request.uri().path().contains(&self.chunk_prefix) {
@@ -132,6 +146,7 @@ impl HttpTransport for S3Transport {
         };
         let counts = &self.counts;
         counts.all.start();
+        active_s3_requests().add(1, &[]);
         if matches!(kind, S3RequestKind::ChunkRead) {
             counts.chunks.start();
         }
@@ -145,8 +160,11 @@ impl HttpTransport for S3Transport {
         guard.status = Some(response.status().as_u16());
         Ok(response.map(|body| body.map_inner(|stream| {
             let lease = (guard, slot);
-            Box::new(stream.inspect(move |_| {
+            Box::new(stream.inspect(move |result| {
                 let _lease = &lease;
+                if let Ok(buffer) = result {
+                    s3_transfer_bytes().add(buffer.len() as u64, &[KeyValue::new("source", "s3"), KeyValue::new("direction", "download")]);
+                }
             }))
         })))
     }
@@ -185,7 +203,10 @@ impl Origin {
             counts: requests.clone(),
             chunk_prefix: chunk_prefix.to_owned(),
         }));
-        let operator = operator.with_context(context).layer(TimeoutLayer::new().with_io_timeout(ORIGIN_IDLE_TIMEOUT));
+        let operator = operator.with_context(context)
+            .layer(TimeoutLayer::new().with_io_timeout(ORIGIN_IDLE_TIMEOUT))
+            .layer(opendal::layers::OtelTraceLayer::new())
+            .layer(opendal::layers::OtelMetricsLayer::builder().register(&opentelemetry::global::meter("opendal")));
         Ok(Self { operator, key_template: config.key_template, retries: config.retries, requests })
     }
 
