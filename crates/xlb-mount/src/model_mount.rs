@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    future::Future,
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -14,6 +15,7 @@ use fuser::{
     Request, SessionACL,
 };
 use futures::{StreamExt, TryStreamExt, stream};
+use rand::seq::SliceRandom;
 use tokio::runtime::Handle;
 use xlb::{AssetClass, BlakeHash, FetchProgress, FetchReport, FetchSources, FetchTier, ProgressSink};
 use xlb_core::chunks::{CAS_INDEX_LIMIT, ModelIndex, MODEL_INDEX_PREFIX};
@@ -21,6 +23,37 @@ use xlb_core::chunks::{CAS_INDEX_LIMIT, ModelIndex, MODEL_INDEX_PREFIX};
 use crate::{chunk_file::ChunkFile, snapshotter::clear_disconnected_mount};
 
 const ENTRY_TTL: Duration = Duration::from_secs(60);
+
+pub async fn serve_model_sessions(
+    sessions: Vec<BackgroundSession>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    let mut health = tokio::time::interval(Duration::from_secs(1));
+    tokio::pin!(shutdown);
+    let failed = loop {
+        tokio::select! {
+            () = &mut shutdown => break false,
+            _ = health.tick() => {
+                if sessions.iter().any(|session| session.guard.is_finished()) {
+                    break true;
+                }
+            }
+        }
+    };
+    close_sessions(sessions).await?;
+    anyhow::ensure!(!failed, "an XLB model FUSE session stopped");
+    Ok(())
+}
+
+pub(crate) async fn close_sessions(sessions: Vec<BackgroundSession>) -> Result<()> {
+    let results = futures::future::join_all(sessions.into_iter().map(|session| {
+        tokio::task::spawn_blocking(move || session.umount_and_join())
+    })).await;
+    for result in results {
+        result??;
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 struct ModelEntries {
@@ -70,7 +103,9 @@ impl ModelMount {
         let (ino, file) = self.resolve(hash).await?.context("model has no CAS index")?;
         let total = file.index.size_bytes;
         let file = &file;
-        let mut chunks = stream::iter(0..file.index.chunks.len() as u64)
+        let mut ordinals: Vec<_> = (0..file.index.chunks.len() as u64).collect();
+        ordinals.shuffle(&mut rand::rng());
+        let mut chunks = stream::iter(ordinals)
             .map(|ordinal| async move {
                 let (_, report) = file.read_chunk(ordinal).await.map_err(|error| self.check_read(ino, file, error))?;
                 Ok::<_, anyhow::Error>(report)

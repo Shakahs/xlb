@@ -27,15 +27,9 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration};
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use xlb::{
-    origin::{
-        DEFAULT_KEY_TEMPLATE, DEFAULT_ORIGIN_CONCURRENCY, DEFAULT_RANGE_BYTES,
-        DEFAULT_RANGE_RETRIES,
-    },
-    peer::{
-        DEFAULT_PEER_CONCURRENCY, DEFAULT_PEER_CONNECT_TIMEOUT, DEFAULT_PEER_PORT,
-        DEFAULT_PEER_SEGMENT_BYTES, DEFAULT_PEER_STALL_TIMEOUT,
-    },
-    Credentials, OriginConfig, OriginSource, PeerConfig, RelaySetting,
+    origin::{DEFAULT_KEY_TEMPLATE, DEFAULT_ORIGIN_CONCURRENCY, DEFAULT_ORIGIN_RETRIES},
+    peer::{DEFAULT_PEER_CONCURRENCY, DEFAULT_PEER_PORT},
+    Credentials, OriginConfig, PeerConfig, RelaySetting,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,23 +124,20 @@ pub struct ClassConfig {
     /// Derive the Talos CAS budget from the mounted scratch device and RAM.
     #[serde(default)]
     pub talos_scratch_cache: bool,
-    /// Whether the class serves and reads the peer set.
+    /// Whether the class runs a peer endpoint.
     #[serde(default = "yes")]
     pub peers: bool,
+    /// Skip peer downloads while continuing to serve verified chunks.
+    #[serde(default)]
+    pub disable_peer_sourcing: bool,
+    /// Maximum age of a node inventory record before treating it as stale.
+    #[serde(default = "default_inventory_expiry")]
+    pub peer_inventory_expiry_seconds: NonZeroUsize,
     /// UDP address of the peer endpoint.
     #[serde(default = "default_udp_bind")]
     pub udp_bind: String,
-    #[serde(default = "default_peer_segment")]
-    pub peer_segment_bytes: u64,
     #[serde(default = "default_peer_concurrency")]
-    pub peer_concurrency: usize,
-    #[serde(default = "default_peer_connect_timeout_ms")]
-    pub peer_connect_timeout_ms: u64,
-    /// How long a segment no peer holds may see no progress on any peer
-    /// before this node reads it from the origin in place of its assigned
-    /// reader.
-    #[serde(default = "default_peer_stall_timeout_ms")]
-    pub peer_stall_timeout_ms: u64,
+    pub peer_concurrency: NonZeroUsize,
     /// The relay servers of the peer endpoint: `"default"` for iroh's
     /// default relay map, `"disabled"` for none, or a list of relay URLs.
     /// Relays serve address discovery and hole punching only; blob requests
@@ -195,17 +186,12 @@ fn yes() -> bool {
 fn default_udp_bind() -> String {
     format!("0.0.0.0:{DEFAULT_PEER_PORT}")
 }
-fn default_peer_segment() -> u64 {
-    DEFAULT_PEER_SEGMENT_BYTES
+fn default_peer_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_PEER_CONCURRENCY).unwrap()
 }
-fn default_peer_concurrency() -> usize {
-    DEFAULT_PEER_CONCURRENCY
-}
-fn default_peer_connect_timeout_ms() -> u64 {
-    DEFAULT_PEER_CONNECT_TIMEOUT.as_millis() as u64
-}
-fn default_peer_stall_timeout_ms() -> u64 {
-    DEFAULT_PEER_STALL_TIMEOUT.as_millis() as u64
+
+fn default_inventory_expiry() -> NonZeroUsize {
+    NonZeroUsize::new(90).expect("positive inventory expiry")
 }
 
 impl ClassConfig {
@@ -228,10 +214,9 @@ impl ClassConfig {
         Ok(Some(PeerConfig {
             bind_addr,
             relay,
-            segment_bytes: self.peer_segment_bytes,
+            disable_sourcing: self.disable_peer_sourcing,
+            inventory_expiry: Duration::from_secs(self.peer_inventory_expiry_seconds.get() as u64),
             concurrency: self.peer_concurrency,
-            connect_timeout: Duration::from_millis(self.peer_connect_timeout_ms),
-            stall_timeout: Duration::from_millis(self.peer_stall_timeout_ms),
         }))
     }
 
@@ -247,26 +232,21 @@ impl ClassConfig {
     }
 }
 
-/// The origin of one class: either an S3-compatible bucket (`endpoint` and
-/// `bucket`) read with signed requests, or an unauthenticated `url_template`.
+/// An S3-compatible bucket holding the CAS.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OriginSettings {
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub bucket: Option<String>,
+    pub endpoint: String,
+    pub bucket: String,
     /// SigV4 region; Tigris uses `auto`.
     #[serde(default = "default_region")]
     pub region: String,
     /// Object key with a `{blake3}` token.
     #[serde(default = "default_key_template")]
     pub key_template: String,
-    #[serde(default = "default_range_bytes")]
-    pub range_bytes: u64,
     #[serde(default = "default_origin_concurrency")]
-    pub concurrency: usize,
-    #[serde(default = "default_range_retries")]
-    pub range_retries: u32,
+    pub concurrency: NonZeroUsize,
+    #[serde(default = "default_origin_retries")]
+    pub retries: u32,
     #[serde(default, skip_serializing)]
     pub access_key_id: Option<String>,
     #[serde(default, skip_serializing)]
@@ -277,9 +257,6 @@ pub struct OriginSettings {
     /// Environment variable holding the secret, when it is not inline.
     #[serde(default)]
     pub secret_access_key_env: Option<String>,
-    /// Full URL with a `{blake3}` token, read without credentials.
-    #[serde(default)]
-    pub url_template: Option<String>,
 }
 
 impl std::fmt::Debug for OriginSettings {
@@ -289,7 +266,6 @@ impl std::fmt::Debug for OriginSettings {
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("key_template", &self.key_template)
-            .field("url_template", &self.url_template)
             .finish_non_exhaustive()
     }
 }
@@ -300,14 +276,11 @@ fn default_region() -> String {
 fn default_key_template() -> String {
     DEFAULT_KEY_TEMPLATE.into()
 }
-fn default_range_bytes() -> u64 {
-    DEFAULT_RANGE_BYTES
+fn default_origin_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_ORIGIN_CONCURRENCY).unwrap()
 }
-fn default_origin_concurrency() -> usize {
-    DEFAULT_ORIGIN_CONCURRENCY
-}
-fn default_range_retries() -> u32 {
-    DEFAULT_RANGE_RETRIES
+fn default_origin_retries() -> u32 {
+    DEFAULT_ORIGIN_RETRIES
 }
 
 impl OriginSettings {
@@ -328,35 +301,17 @@ impl OriginSettings {
                 .filter(|v| !v.is_empty())
                 .with_context(|| format!("{what}_env names {variable}, which is not set"))
         };
-        let source = match (&self.url_template, &self.endpoint, &self.bucket) {
-            (Some(template), None, None) => OriginSource::Url {
-                template: template.clone(),
-            },
-            (None, Some(endpoint), Some(bucket)) => OriginSource::S3 {
-                endpoint: endpoint.clone(),
-                bucket: bucket.clone(),
-                region: self.region.clone(),
-                key_template: self.key_template.clone(),
-                credentials: Credentials {
-                    access_key_id: secret(
-                        &self.access_key_id,
-                        &self.access_key_id_env,
-                        "access_key_id",
-                    )?,
-                    secret_access_key: secret(
-                        &self.secret_access_key,
-                        &self.secret_access_key_env,
-                        "secret_access_key",
-                    )?,
-                },
-            },
-            _ => bail!("give either url_template, or endpoint and bucket"),
-        };
         Ok(OriginConfig {
-            source,
-            range_bytes: self.range_bytes,
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            key_template: self.key_template.clone(),
+            credentials: Credentials {
+                access_key_id: secret(&self.access_key_id, &self.access_key_id_env, "access_key_id")?,
+                secret_access_key: secret(&self.secret_access_key, &self.secret_access_key_env, "secret_access_key")?,
+            },
             concurrency: self.concurrency,
-            range_retries: self.range_retries,
+            retries: self.retries,
         })
     }
 }
@@ -406,7 +361,8 @@ mod tests {
         let peer = class.peer_config().unwrap().expect("peer tier on by default");
         assert_eq!(peer.bind_addr, "0.0.0.0:4433".parse().unwrap());
         assert_eq!(peer.relay, RelaySetting::Default);
-        assert_eq!(peer.stall_timeout, Duration::from_secs(10));
+        assert!(!peer.disable_sourcing);
+        assert_eq!(peer.inventory_expiry, Duration::from_secs(90));
         assert!(class.origin_config().unwrap().is_none());
     }
 
@@ -456,22 +412,11 @@ mod tests {
             _ => None,
         };
         let config = settings.resolve(env).unwrap();
-        assert_eq!(config.range_bytes, 8 * 1024 * 1024);
-        assert_eq!(config.concurrency, 32);
-        match config.source {
-            OriginSource::S3 {
-                region,
-                key_template,
-                credentials,
-                ..
-            } => {
-                assert_eq!(region, "auto");
-                assert_eq!(key_template, "models/blake3/{blake3}");
-                assert_eq!(credentials.access_key_id, "id");
-                assert_eq!(credentials.secret_access_key, "secret");
-            }
-            other => panic!("expected an S3 origin, got {other:?}"),
-        }
+        assert_eq!(config.concurrency.get(), 32);
+        assert_eq!(config.region, "auto");
+        assert_eq!(config.key_template, "models/blake3/{blake3}");
+        assert_eq!(config.credentials.access_key_id, "id");
+        assert_eq!(config.credentials.secret_access_key, "secret");
         assert!(settings.resolve(|_| None).is_err(), "unset variable");
     }
 
@@ -491,13 +436,4 @@ mod tests {
         assert!(!format!("{settings:?}").contains("inline-secret"));
     }
 
-    #[test]
-    fn a_url_template_origin_needs_no_credentials() {
-        let settings = origin(r#"{ "url_template": "https://cdn.example/{blake3}" }"#);
-        assert!(matches!(
-            settings.resolve(|_| None).unwrap().source,
-            OriginSource::Url { .. }
-        ));
-        assert!(origin("{}").resolve(|_| None).is_err());
-    }
 }

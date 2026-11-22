@@ -1,7 +1,7 @@
 //! Per-fetch observability — which tier actually served a blob, how many
 //! bytes, and how long it took.
 //!
-//! One report per completed [`crate::Asset::fetch_to_file`] call, hit or miss.
+//! One report per completed [`crate::Asset::read_chunk`] call, hit or miss.
 //! **A miss is a report too.** `tier: None` is the "no source had it" case; a
 //! hit rate built only from successes has no denominator.
 //!
@@ -16,7 +16,7 @@ use crate::{BlakeHash, FetchTier};
 ///
 /// Emitted through the [`FetchObserver`] registered on
 /// [`crate::AssetClassConfig::observer`], and returned directly by
-/// [`crate::Asset::fetch_to_file_reported`].
+/// [`crate::Asset::read_chunk_reported`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchReport {
     /// The [`crate::AssetClass`] this fetch belonged to.
@@ -26,8 +26,7 @@ pub struct FetchReport {
     /// Which tier served it: the peers when most bytes came from them, else
     /// the origin. `None` means no source had the blob.
     pub tier: Option<FetchTier>,
-    /// Always `None`: the peer tier reads one blob from several peers at once,
-    /// so there is no single serving peer to attribute.
+    /// Peer that supplied the complete chunk, for peer reads.
     pub peer_id: Option<String>,
     /// Size of the blob obtained. `0` on a miss.
     pub bytes_served: u64,

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     ffi::CString,
     fs,
+    future::Future,
     io::ErrorKind,
     mem::MaybeUninit,
     os::unix::fs::{MetadataExt, PermissionsExt, chown},
@@ -21,7 +22,7 @@ use tonic::{Status, transport::Server};
 use xlb::AssetClass;
 use xlb_core::{BlakeHash, image::blake3_digest_hex, layer::{LAYER_INDEX_LABEL, LAYER_INDEX_LIMIT, LAYER_INDEX_PREFIX, LayerIndex}};
 
-use crate::{layer_mount::mount_layer, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
+use crate::{layer_mount::mount_layer, model_mount::close_sessions, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
 
 const SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
@@ -45,7 +46,11 @@ struct CasSnapshotter {
 }
 
 // [impl -> dsn~xlb-fuse-snapshots~1]
-pub async fn serve_snapshots(config: SnapshotSettings, class: AssetClass) -> Result<()> {
+pub async fn serve_snapshots(
+    config: SnapshotSettings,
+    class: AssetClass,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let (store, records) = SnapshotStore::open(config.root)?;
     let mut sessions = HashMap::new();
     for record in records.values() {
@@ -66,9 +71,23 @@ pub async fn serve_snapshots(config: SnapshotSettings, class: AssetClass) -> Res
     }
     let socket = UnixListener::bind(&config.socket)?;
     tokio::fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600)).await?;
-    Server::builder().add_service(server(snapshots))
-        .serve_with_incoming(UnixListenerStream::new(socket)).await?;
-    Ok(())
+    let result = tokio::select! {
+        result = Server::builder().add_service(server(snapshots.clone()))
+            .serve_with_incoming_shutdown(UnixListenerStream::new(socket), shutdown) => result.map_err(anyhow::Error::from),
+        result = wait_for_mount_loss(&snapshots) => result,
+    };
+    let sessions = std::mem::take(&mut snapshots.state.lock().await.sessions);
+    close_sessions(sessions.into_values().collect()).await?;
+    result
+}
+
+async fn wait_for_mount_loss(snapshots: &CasSnapshotter) -> Result<()> {
+    let mut health = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        health.tick().await;
+        anyhow::ensure!(!snapshots.state.lock().await.sessions.values().any(|session| session.guard.is_finished()),
+            "an XLB snapshot FUSE session stopped");
+    }
 }
 
 fn verify_index(bytes: &[u8], digest: BlakeHash, diff_id: &str) -> Result<LayerIndex> {

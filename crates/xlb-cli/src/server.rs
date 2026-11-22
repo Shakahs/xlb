@@ -14,7 +14,7 @@ use tokio::{
 use xlb::{AssetClass, BlakeHash, FetchTier, NodeId, PeerAddr, ProgressSink};
 use xlb_client::{
     read_frame, write_frame, ClassInfo, ClassStats, Command, FetchProgress, FetchRecord,
-    FetchResult, NodeEvent, NodeInfo, NodeTopology, Peer, Response, SeedSummary, Tier, TreeInfo,
+    FetchResult, NodeEvent, NodeInfo, NodeTopology, Peer, Response, Tier,
 };
 
 /// How often a running fetch reports progress to its client. Progress is a
@@ -82,7 +82,7 @@ fn class_info(entry: &ClassEntry) -> ClassInfo {
 }
 
 /// Bind the control socket with `mode` and serve it until the task is dropped.
-pub async fn listen(state: NodeState, socket_path: &str, mode: u32) -> Result<()> {
+pub async fn listen(state: NodeState, socket_path: &str, mode: u32, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
     if let Some(directory) = std::path::Path::new(socket_path)
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -101,19 +101,24 @@ pub async fn listen(state: NodeState, socket_path: &str, mode: u32) -> Result<()
     let owner_only = mode & 0o077 == 0;
     tracing::info!(socket = socket_path, mode = %format!("{mode:04o}"), "xlb control socket listening");
 
+    let mut clients = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = clients.join_next(), if !clients.is_empty() => {},
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
                 let state = state.clone();
-                tokio::spawn(async move {
+                clients.spawn(async move {
                     if let Err(e) = handle_conn(state, stream, owner_only).await {
                         tracing::debug!("client closed: {e}");
                     }
                 });
             }
-            Err(e) => tracing::error!("accept: {e}"),
         }
     }
+    clients.shutdown().await;
+    Ok(())
 }
 
 fn same_user(stream: &UnixStream) -> bool {
@@ -194,41 +199,6 @@ async fn handle_conn(state: NodeState, mut stream: UnixStream, owner_only: bool)
                 write_frame(&mut writer, &resp).await?;
             }
 
-            Command::PinTree {
-                class,
-                name,
-                hashes,
-                from_dirs,
-            } => {
-                let resp = pin_tree(&state, &class, &name, &hashes, &from_dirs).await;
-                write_frame(&mut writer, &resp).await?;
-            }
-
-            Command::ListTrees { class } => {
-                let resp = match state.class(&class) {
-                    Some(entry) => Response::Trees {
-                        trees: entry
-                            .class
-                            .pinned_trees()
-                            .into_iter()
-                            .map(tree_info)
-                            .collect(),
-                    },
-                    None => unknown_class(&class),
-                };
-                write_frame(&mut writer, &resp).await?;
-            }
-
-            Command::UnpinTree { class, name } => {
-                let resp = match state.class(&class) {
-                    Some(entry) => match entry.class.unpin_tree(&name).await {
-                        Ok(()) => Response::Ok,
-                        Err(e) => error(e),
-                    },
-                    None => unknown_class(&class),
-                };
-                write_frame(&mut writer, &resp).await?;
-            }
         }
     }
 
@@ -260,7 +230,6 @@ fn build_stats(state: &NodeState, entry: &ClassEntry) -> ClassStats {
         peer_count: entry.class.peers().len() as u64,
         cache_bytes: cache.bytes,
         cache_entries: cache.entries,
-        cache_pinned_bytes: cache.pinned_bytes,
         cache_budget_bytes: cache.budget_bytes,
         fetches_total: totals.fetches,
         fetches_hit: totals.hits,
@@ -303,14 +272,12 @@ async fn do_fetch(
     let sink: ProgressSink = Arc::new(move |progress| {
         latest_tx.send_replace(Some(progress));
     });
+    let Some(mount) = &entry.model_mount else {
+        return Ok(error("this class has no model mount"));
+    };
     let fetch = async {
-        if let Some(mount) = &entry.model_mount {
-            let report = mount.prepare(hash, sink).await?;
-            Ok::<_, anyhow::Error>((mount.path(hash), report))
-        } else {
-            let (result, report) = entry.class.asset(hash).fetch_to_file_reported(Some(sink)).await;
-            Ok((result?, report))
-        }
+        let report = mount.prepare(hash, sink).await?;
+        Ok::<_, anyhow::Error>((mount.path(hash), report))
     };
     tokio::pin!(fetch);
     let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
@@ -441,65 +408,5 @@ fn unknown_class(class: &str) -> Response {
 fn error(e: impl std::fmt::Display) -> Response {
     Response::Error {
         message: e.to_string(),
-    }
-}
-
-fn tree_info(t: xlb::PinnedTreeInfo) -> TreeInfo {
-    TreeInfo {
-        name: t.name,
-        members: t.members,
-        present: t.present,
-        present_bytes: t.present_bytes,
-        durable: t.durable,
-    }
-}
-
-/// `PinTree`: declare the tree, then seed its bytes from `from_dirs`. A
-/// seeded blob is served to peers as soon as it is in the cache.
-async fn pin_tree(
-    state: &NodeState,
-    class: &str,
-    name: &str,
-    hashes: &[String],
-    from_dirs: &[String],
-) -> Response {
-    let Some(entry) = state.class(class) else {
-        return unknown_class(class);
-    };
-    let dirs: Vec<std::path::PathBuf> = from_dirs
-        .iter()
-        .map(|d| crate::config::expand_tilde(d).into())
-        .collect();
-    let members = match xlb::pinned::resolve_members(hashes, &dirs) {
-        Ok(v) => v,
-        Err(e) => return error(e),
-    };
-    let tree = match entry.class.pin_tree(name, members).await {
-        Ok(tree) => tree,
-        Err(e) => return error(e),
-    };
-    let report = match entry.class.seed_tree_from_dirs(name, &dirs).await {
-        Ok(r) => r,
-        Err(e) => return error(format!("tree pinned, seeding failed: {e}")),
-    };
-    // Seeding changed how much of the tree is present.
-    let tree = entry
-        .class
-        .pinned_trees()
-        .into_iter()
-        .find(|t| t.name == name)
-        .unwrap_or(tree);
-    Response::TreePinned {
-        tree: tree_info(tree),
-        seed: SeedSummary {
-            ingested: report.ingested,
-            already_cached: report.already_cached,
-            missing: report.missing.iter().map(BlakeHash::to_hex).collect(),
-            mismatched: report
-                .mismatched
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
-        },
     }
 }

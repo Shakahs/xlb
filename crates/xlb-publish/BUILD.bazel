@@ -9,7 +9,6 @@ rust_library(
     deps = [
         "//vendor/xlb/crates/xlb-core:xlb_core",
         "@scheduler_crates//:anyhow",
-        "@scheduler_crates//:bao-tree",
         "@scheduler_crates//:blake3",
         "@scheduler_crates//:bytes",
         "@scheduler_crates//:flate2",

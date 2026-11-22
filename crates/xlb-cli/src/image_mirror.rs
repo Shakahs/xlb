@@ -30,11 +30,12 @@ struct ImageMirror {
 }
 
 // [impl -> dsn~xlb-image-mirror~1]
-pub async fn serve(class: AssetClass, concurrency: usize) -> Result<()> {
+pub async fn serve(class: AssetClass, concurrency: usize, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 5477))
         .await
         .context("bind OCI image mirror")?;
-    axum::serve(listener, router(class, concurrency)).await?;
+    axum::serve(listener, router(class, concurrency))
+        .with_graceful_shutdown(cancel.cancelled_owned()).await?;
     Ok(())
 }
 

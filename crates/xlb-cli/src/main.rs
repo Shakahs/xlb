@@ -5,25 +5,22 @@ mod fetch_cmd;
 mod image_mirror;
 mod inspect;
 mod metrics_sink;
-mod pin_cmd;
 mod serve;
 mod server;
+mod supervisor;
 
 use anyhow::{bail, Context, Result};
 
 const USAGE: &str = "\
-xlb — serve a node, inspect it, fetch blobs, manage peers and pinned trees
+xlb — serve a node, inspect it, fetch models and manage peers
 
 usage: xlb [--socket PATH] <command>
 
 commands:
   serve [--config FILE]                 run the node daemon (default xlb-node.json)
   inspect                               node ID, UDP addresses, cache directory
-  fetch CLASS HASH                      fetch a blob; prints the cached file path
+  fetch CLASS HASH                      prepare a model; prints its mounted path
   set-peers [--class CLASS] [PEER...]   replace the peer set; PEER is NODE_ID@ADDR[,ADDR...]
-  pin add CLASS NAME [--from DIR]... [--manifest FILE] [--json]
-  pin list CLASS [--json]
-  pin rm CLASS NAME
 ";
 
 /// The command line after the program name, with flags pulled out.
@@ -33,9 +30,6 @@ struct Args {
     socket: Option<String>,
     config: Option<String>,
     class: Option<String>,
-    manifest: Option<String>,
-    from: Vec<String>,
-    json: bool,
     help: bool,
 }
 
@@ -51,9 +45,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "-s" | "--socket" => parsed.socket = Some(value("--socket")?),
             "-c" | "--config" => parsed.config = Some(value("--config")?),
             "--class" => parsed.class = Some(value("--class")?),
-            "--manifest" => parsed.manifest = Some(value("--manifest")?),
-            "--from" => parsed.from.push(value("--from")?),
-            "--json" => parsed.json = true,
             "-h" | "--help" => parsed.help = true,
             flag if flag.starts_with('-') => bail!("unknown flag {flag}\n\n{USAGE}"),
             _ => parsed.positional.push(arg),
@@ -104,19 +95,6 @@ async fn main() -> Result<()> {
         ["set-peers", peers @ ..] => {
             inspect::set_peers(&socket, args.class.as_deref(), peers).await
         }
-        ["pin", "add", class, name] => {
-            pin_cmd::add(
-                &socket,
-                class,
-                name,
-                &args.from,
-                args.manifest.as_deref(),
-                args.json,
-            )
-            .await
-        }
-        ["pin", "list", class] => pin_cmd::list(&socket, class, args.json).await,
-        ["pin", "rm", class, name] => pin_cmd::rm(&socket, class, name).await,
         _ => bail!("unrecognised command: {}\n\n{USAGE}", words.join(" ")),
     }
 }
@@ -131,11 +109,10 @@ mod tests {
 
     #[test]
     fn flags_are_accepted_before_and_after_the_command() {
-        let args = parse("--socket /s.sock pin add models keys --from /a --from /b --json");
-        assert_eq!(args.positional, ["pin", "add", "models", "keys"]);
+        let args = parse("--socket /s.sock serve --config /config.json");
+        assert_eq!(args.positional, ["serve"]);
         assert_eq!(args.socket.as_deref(), Some("/s.sock"));
-        assert_eq!(args.from, ["/a", "/b"]);
-        assert!(args.json);
+        assert_eq!(args.config.as_deref(), Some("/config.json"));
     }
 
     #[test]

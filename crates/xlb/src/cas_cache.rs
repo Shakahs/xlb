@@ -11,7 +11,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use bao_tree::{BlockSize, io::outboard::PreOrderMemOutboard};
 use bytes::Bytes;
 use dashmap::DashSet;
 use foyer::{
@@ -25,15 +24,12 @@ use crate::{Error, Result};
 
 const MIB: usize = 1024 * 1024;
 const CACHE_BLOCK_BYTES: usize = 32 * MIB;
-const MAX_OUTBOARD_BYTES: usize = 32_704;
 const MEMORY_SHARDS: usize = 8;
-const DEVICE_PATH: &str = ".foyer/chunks";
+const DEVICE_PATH: &str = ".foyer/whole-chunks";
 
 fn cache_directory(root: &Path) -> io::Result<PathBuf> {
     let path = root.join(DEVICE_PATH);
     match fs::symlink_metadata(&path) {
-        // The previous device stored its disposable cache in a regular file.
-        Ok(metadata) if metadata.is_file() => fs::remove_file(&path)?,
         Ok(metadata) if metadata.is_dir() => return Ok(path),
         Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Foyer cache path")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {},
@@ -76,8 +72,8 @@ impl Hasher for CasHasher {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifiedChunk {
+    digest: [u8; 32],
     body: Bytes,
-    outboard: Bytes,
 }
 
 impl VerifiedChunk {
@@ -85,8 +81,17 @@ impl VerifiedChunk {
         &self.body
     }
 
-    pub fn outboard(&self) -> &Bytes {
-        &self.outboard
+    pub(crate) async fn verify(hash: BlakeHash, length: u64, body: Bytes) -> Result<Self> {
+        if length == 0 || length > CAS_CHUNK_BYTES || length != body.len() as u64 {
+            return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length")));
+        }
+        tokio::task::spawn_blocking(move || {
+            let actual = BlakeHash::hash(&body);
+            if actual != hash {
+                return Err(Error::HashMismatch { expected: hash, actual });
+            }
+            Ok(Self { digest: *hash.as_bytes(), body })
+        }).await.map_err(|error| Error::Store(format!("verify CAS chunk: {error}")))?
     }
 }
 
@@ -99,7 +104,7 @@ enum CasValue {
 impl CasValue {
     fn weight(&self) -> usize {
         match self {
-            Self::Chunk(chunk) => chunk.body.len() + chunk.outboard.len(),
+            Self::Chunk(chunk) => chunk.body.len(),
             Self::RootManifest(digests) => digests.len(),
         }
     }
@@ -161,7 +166,7 @@ impl CasCache {
     ) -> Result<Self> {
         let queue_budget = memory / 8;
         let resident = memory.saturating_sub(2 * CACHE_BLOCK_BYTES + queue_budget);
-        if resident / MEMORY_SHARDS < CAS_CHUNK_BYTES as usize + MAX_OUTBOARD_BYTES {
+        if resident / MEMORY_SHARDS < CAS_CHUNK_BYTES as usize {
             return Err(Error::Config("Foyer memory budget must fit one complete CAS chunk per shard".into()));
         }
         if disk / CACHE_BLOCK_BYTES < 3 {
@@ -250,21 +255,15 @@ impl CasCache {
     }
 
     pub async fn insert(&self, hash: BlakeHash, length: u64, body: Bytes) -> Result<VerifiedChunk> {
-        if length == 0 || length > CAS_CHUNK_BYTES || length != body.len() as u64 {
-            return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length")));
-        }
-        let (chunk, actual) = tokio::task::spawn_blocking(move || {
-            let proof = PreOrderMemOutboard::create(&body, BlockSize::from_chunk_log(4));
-            let actual = BlakeHash::from_bytes(*proof.root.as_bytes());
-            (VerifiedChunk { body, outboard: proof.data.into() }, actual)
-        }).await.map_err(|error| Error::Store(format!("build CAS chunk outboard: {error}")))?;
-        if actual != hash {
-            return Err(Error::HashMismatch { expected: hash, actual });
-        }
-        let digest = *hash.as_bytes();
-        self.cache.insert(CasKey::Chunk(digest), CasValue::Chunk(chunk.clone()));
-        self.remember(digest);
+        let chunk = VerifiedChunk::verify(hash, length, body).await?;
+        self.insert_verified(chunk.clone());
         Ok(chunk)
+    }
+
+    pub(crate) fn insert_verified(&self, chunk: VerifiedChunk) {
+        let digest = chunk.digest;
+        self.cache.insert(CasKey::Chunk(digest), CasValue::Chunk(chunk));
+        self.remember(digest);
     }
 
     /// Return candidates without loading the chunk payloads from disk.
@@ -289,6 +288,11 @@ impl CasCache {
 
     pub(crate) fn may_hold(&self, hash: BlakeHash) -> bool {
         self.cache.contains(&CasKey::Chunk(*hash.as_bytes()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn evict_for_test(&self, hash: BlakeHash) {
+        self.cache.remove(&CasKey::Chunk(*hash.as_bytes()));
     }
 
     /// Checkpoint only on the discovery task or after it has stopped.
@@ -415,8 +419,6 @@ mod tests {
         for (memory, disk, chunk_count) in [(160 * MIB, 128 * MIB, 32u8), (256 * MIB, 256 * MIB, 56)] {
             let directory = tempfile::tempdir().unwrap();
             let device = directory.path().join(DEVICE_PATH);
-            fs::create_dir_all(device.parent().unwrap()).unwrap();
-            fs::write(&device, b"disposable legacy device").unwrap();
             let cache = CasCache::open(directory.path(), memory, disk).await.unwrap();
             assert!(device.is_dir());
             let chunk = |id| Bytes::from(vec![id; CAS_CHUNK_BYTES as usize]);

@@ -1,15 +1,13 @@
 use std::sync::Arc;
 
-/// Where a fetch got a blob from. A blob that is not in the local cache is
-/// read from the peers and the origin together; the fetch is then attributed
-/// to whichever of the two delivered more bytes.
+/// Source of a verified chunk or the dominant source of a model read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FetchTier {
-    /// The blob is already complete in the local cache directory.
+    /// The chunk is already in Foyer.
     Cache = 0,
-    /// Peers of the runtime peer set, read concurrently over iroh-blobs.
+    /// A peer supplied the chunk.
     Peer = 1,
-    /// The HTTP origin, read with concurrent ranged GETs.
+    /// The S3 backing store supplied the chunk.
     Origin = 2,
 }
 

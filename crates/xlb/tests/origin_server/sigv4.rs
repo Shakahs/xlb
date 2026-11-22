@@ -1,4 +1,4 @@
-//! AWS Signature Version 4 for S3-compatible object requests.
+//! AWS Signature Version 4 verification for the S3 test fixture.
 //!
 //! Only what a header-signed, empty-body object request needs: SHA-256,
 //! HMAC-SHA256 and the canonical request. No date or HMAC dependency.
@@ -9,20 +9,7 @@ use sha2::{Digest, Sha256};
 pub const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// A static access key pair.
-#[derive(Clone)]
-pub struct Credentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-}
-
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials")
-            .field("access_key_id", &self.access_key_id)
-            .finish_non_exhaustive()
-    }
-}
+use crate::Credentials;
 
 /// The parts of one request that the signature covers.
 #[derive(Debug, Clone, Copy)]
@@ -162,13 +149,6 @@ fn uri_encode_segment(segment: &str) -> String {
         }
     }
     out
-}
-
-pub(crate) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Format a Unix timestamp (UTC) as `("YYYYMMDDTHHMMSSZ", "YYYYMMDD")`, using

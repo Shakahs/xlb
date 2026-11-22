@@ -15,6 +15,8 @@ XLB_DEPS = [
         "@scheduler_crates//:futures",
         "@scheduler_crates//:libc",
         "@scheduler_crates//:rand",
+        "@scheduler_crates//:ractor",
+        "@scheduler_crates//:rust-fsm",
         "@scheduler_crates//:serde",
         "@scheduler_crates//:serde_json",
         "@scheduler_crates//:tokio",

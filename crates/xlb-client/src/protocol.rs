@@ -19,7 +19,7 @@ pub enum Command {
     ClassStats {
         class: String,
     },
-    /// Fetch a blob into the class's cache directory.
+    /// Prepare an indexed model and return its mounted path.
     Fetch {
         class: String,
         /// BLAKE3 hash, 64 hex characters.
@@ -42,24 +42,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         topology: Option<NodeTopology>,
     },
-    /// Declare (or replace) pinned tree `name` and seed its bytes from
-    /// `from_dirs`. With no `hashes`, the tree covers every hash-named file
-    /// in those directories.
-    PinTree {
-        class: String,
-        name: String,
-        #[serde(default)]
-        hashes: Vec<String>,
-        #[serde(default)]
-        from_dirs: Vec<String>,
-    },
-    ListTrees {
-        class: String,
-    },
-    UnpinTree {
-        class: String,
-        name: String,
-    },
+
 }
 
 /// One member of a peer set.
@@ -89,9 +72,6 @@ pub enum Response {
     FetchResult(FetchResult),
     /// Answer to `set_peers`: how many classes took the new set.
     PeersSet { classes: u64 },
-    Trees { trees: Vec<TreeInfo> },
-    TreePinned { tree: TreeInfo, seed: SeedSummary },
-    Ok,
     Error { message: String },
 }
 
@@ -120,7 +100,6 @@ pub struct ClassInfo {
     pub udp_addrs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
-    /// A complete blob is the plain file `<cache_dir>/<blake3-hex>`.
     pub cache_dir: String,
     pub cache_budget_bytes: u64,
     /// Whether the class has an origin tier.
@@ -135,7 +114,6 @@ pub struct ClassStats {
     pub peer_count: u64,
     pub cache_bytes: u64,
     pub cache_entries: u64,
-    pub cache_pinned_bytes: u64,
     pub cache_budget_bytes: u64,
     pub fetches_total: u64,
     pub fetches_hit: u64,
@@ -196,27 +174,6 @@ pub struct FetchResult {
     pub elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "FetchSources::is_empty")]
     pub sources: FetchSources,
-}
-
-/// What one pinned tree covers and how much of it the node holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeInfo {
-    pub name: String,
-    pub members: u64,
-    pub present: u64,
-    pub present_bytes: u64,
-    pub durable: bool,
-}
-
-/// What a `pin_tree` did when it seeded from `from_dirs`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SeedSummary {
-    pub ingested: u64,
-    pub already_cached: u64,
-    /// Members no directory held (hex); still pinned, arrive by fetch.
-    pub missing: Vec<String>,
-    /// Files whose bytes did not hash to their name; skipped.
-    pub mismatched: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,28 +335,6 @@ mod tests {
             serde_json::to_string(&resp).unwrap(),
             r#"{"type":"node_info","node_id":"abc","udp_addrs":["0.0.0.0:4433"],"cache_dir":"/cache","uptime_secs":1,"classes":[]}"#
         );
-    }
-
-    #[test]
-    fn the_tree_commands_are_on_the_wire_under_these_names() {
-        assert_eq!(
-            serde_json::to_string(&Command::ListTrees { class: "c".into() }).unwrap(),
-            r#"{"cmd":"list_trees","class":"c"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Command::UnpinTree {
-                class: "c".into(),
-                name: "t".into()
-            })
-            .unwrap(),
-            r#"{"cmd":"unpin_tree","class":"c","name":"t"}"#
-        );
-        let pin: Command = serde_json::from_str(
-            r#"{"cmd":"pin_tree","class":"c","name":"t","from_dirs":["/a"]}"#,
-        )
-        .unwrap();
-        assert!(matches!(pin, Command::PinTree { hashes, from_dirs, .. }
-            if hashes.is_empty() && from_dirs == ["/a"]));
     }
 
     #[test]

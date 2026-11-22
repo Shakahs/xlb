@@ -1,190 +1,55 @@
-//! Origin tier: ranged GETs verified against the blob's published outboard
-//! and imported into the blob store as they arrive.
-//!
-//! The origin is either an S3-compatible bucket read with SigV4-signed,
-//! path-style requests, or an unauthenticated URL template. The object is
-//! read as `Range` requests of up to [`OriginConfig::range_bytes`]. Bao
-//! verifies whole 16 KiB groups, reusing any verified local bytes in a group.
-//!
-//! ## Outboard
-//!
-//! Next to the object for a hash, at the object's key followed by
-//! [`OUTBOARD_KEY_SUFFIX`], the origin holds the blob's BLAKE3 outboard: a
-//! bao-tree pre-order outboard for 16 KiB chunk groups (iroh-blobs'
-//! `IROH_BLOCK_SIZE`) with no size prefix. It is the 64-byte hash pair (left
-//! child hash, right child hash) of every parent node of the tree, in
-//! pre-order, root first, and nothing else; a blob of at most one chunk
-//! group has an empty outboard, which is never requested.
-//!
-//! A range is turned into the bao encoding iroh-blobs exchanges between
-//! peers, the size, then parent hash pairs from the outboard and the range's
-//! chunk groups from the response body in pre-order, and handed to the
-//! store's `import_bao_reader`. The store verifies every hash pair and chunk
-//! group against the blob's hash before it writes it, so a range is servable
-//! to peers as soon as it is stored and wrong origin content is never
-//! stored.
+//! OpenDAL reads for the S3-backed chunk cache.
 
 use std::{
-    io,
-    os::unix::fs::FileExt,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    num::NonZeroUsize,
+    sync::{Arc, OnceLock, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::{Duration, Instant},
 };
 
-use bao_tree::{
-    io::round_up_to_chunks_groups,
-    iter::{BaoChunk, ResponseIter},
-    BaoTree,
-};
+use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
-use iroh::endpoint::VarInt;
-use iroh_blobs::{
-    api::Store,
-    protocol::{ChunkRanges, ChunkRangesExt},
-    store::IROH_BLOCK_SIZE,
-    util::RecvStream,
-};
-use tokio::io::AsyncWriteExt;
+use futures::{StreamExt, TryStreamExt};
+use opendal::{Buffer, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Operator, layers::TimeoutLayer};
+use opendal_http_transport_reqwest::ReqwestTransport;
 use tokio::sync::mpsc;
 
-use crate::{
-    request_limits::{RequestLimits, RequestSlot},
-    sigv4::{self, Credentials, SigningInput},
-    store::to_iroh,
-    stream_bytes::{ByteFragments, receive, receive_exact},
-    BlakeHash,
-};
+use crate::{BlakeHash, Error, RequestLimits, Result};
 
-/// Default size of one ranged GET.
-/// How long an origin connection may stay silent before its request fails.
-const ORIGIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-pub const DEFAULT_RANGE_BYTES: u64 = 8 * 1024 * 1024;
-/// Default number of ranged GETs in flight for one blob.
-pub const DEFAULT_ORIGIN_CONCURRENCY: usize = 32;
-/// Default number of retries of one range after its first attempt.
-pub const DEFAULT_RANGE_RETRIES: u32 = 4;
-/// Default object key layout.
-pub const DEFAULT_KEY_TEMPLATE: &str = "models/blake3/{blake3}";
-/// Appended to an object's key or URL to name its outboard.
-pub const OUTBOARD_KEY_SUFFIX: &str = ".obao";
-
-/// The origin outboard stores proofs down to 16 KiB groups.
-pub(crate) const CHUNK_GROUP_BYTES: u64 = 16 * 1024;
-
+const ORIGIN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HASH_TOKEN: &str = "{blake3}";
-/// One hash pair of the outboard.
-const HASH_PAIR_BYTES: usize = 64;
+pub const DEFAULT_ORIGIN_CONCURRENCY: usize = 32;
+pub const DEFAULT_ORIGIN_RETRIES: u32 = 4;
+pub const DEFAULT_KEY_TEMPLATE: &str = "models/blake3/{blake3}";
 
-/// Where the origin object for a hash lives.
-#[derive(Debug, Clone)]
-pub enum OriginSource {
-    /// An S3-compatible bucket, addressed path-style as
-    /// `{endpoint}/{bucket}/{key}` and read with SigV4-signed requests.
-    S3 {
-        /// e.g. `https://fly.storage.tigris.dev`.
-        endpoint: String,
-        bucket: String,
-        /// SigV4 region; Tigris and R2 use `auto`.
-        region: String,
-        /// Object key with a `{blake3}` token.
-        key_template: String,
-        credentials: Credentials,
-    },
-    /// An unauthenticated URL with a `{blake3}` token. The server must
-    /// answer `HEAD` with `Content-Length` and honour `Range`.
-    Url { template: String },
+#[derive(Clone)]
+pub struct Credentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
 }
 
-/// Configuration of the origin tier of one class.
-#[derive(Debug, Clone)]
 pub struct OriginConfig {
-    pub source: OriginSource,
-    /// Size of one ranged GET; rounded down to whole chunk groups.
-    pub range_bytes: u64,
-    /// Ranged GETs in flight for one blob.
-    pub concurrency: usize,
-    /// Retries of one range after its first attempt.
-    pub range_retries: u32,
-}
-
-impl OriginConfig {
-    /// `source` with the default range size, concurrency and retries.
-    pub fn new(source: OriginSource) -> Self {
-        Self {
-            source,
-            range_bytes: DEFAULT_RANGE_BYTES,
-            concurrency: DEFAULT_ORIGIN_CONCURRENCY,
-            range_retries: DEFAULT_RANGE_RETRIES,
-        }
-    }
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub key_template: String,
+    pub credentials: Credentials,
+    pub concurrency: NonZeroUsize,
+    pub retries: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OriginError {
-    #[error("origin configuration: {0}")]
-    Config(String),
-    #[error("origin has no object for this hash")]
-    NotFound,
-    #[error("origin has no outboard for this hash")]
-    NoOutboard,
-    #[error("origin outboard: {0}")]
-    Outboard(String),
-    #[error("origin answered {status} to {method}")]
-    Status { method: &'static str, status: u16 },
-    #[error("origin response: {0}")]
-    Protocol(String),
-    #[error("origin request: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("origin file: {0}")]
-    Io(#[from] std::io::Error),
-    /// The store refused a range: it does not verify against the blob's
-    /// hash, or the store could not write it.
-    #[error("origin range was not accepted: {0}")]
-    Rejected(String),
-}
-
-impl OriginError {
-    /// Whether a further attempt at the same request can succeed.
-    fn is_transient(&self) -> bool {
-        match self {
-            OriginError::Status { status, .. } => *status >= 500 || *status == 429,
-            OriginError::Http(_) | OriginError::Protocol(_) => true,
-            OriginError::Config(_)
-            | OriginError::NotFound
-            | OriginError::NoOutboard
-            | OriginError::Outboard(_)
-            | OriginError::Io(_)
-            | OriginError::Rejected(_) => false,
-        }
-    }
-}
-
-/// The resolved request target for one hash.
-struct Target {
-    url: String,
-    /// Host header and unencoded path, present when the request is signed.
-    signing: Option<(String, String)>,
-}
-
-struct OriginInner {
-    config: OriginConfig,
-    request_limits: RequestLimits,
-    client: reqwest::Client,
-    requests: RequestCounts,
+    #[error(transparent)]
+    Storage(#[from] opendal::Error),
+    #[error("object {key} exceeds the {limit}-byte read limit")]
+    TooLarge { key: String, limit: usize },
 }
 
 /// The type of one S3 request, without credentials or a signed URL.
 #[derive(Clone, Copy, Debug)]
 pub enum S3RequestKind {
-    ObjectSize,
     ObjectRead,
-    Outboard,
-    DataRange { start: u64, end: u64 },
+    ChunkRead,
 }
 
 /// One request from client dispatch through release of its response.
@@ -200,8 +65,8 @@ pub struct S3RequestEvent {
 pub struct S3RequestStats {
     pub active: usize,
     pub peak: usize,
-    pub active_ranges: usize,
-    pub peak_ranges: usize,
+    pub active_chunks: usize,
+    pub peak_chunks: usize,
     pub dropped_records: u64,
 }
 
@@ -223,22 +88,22 @@ impl RequestCounter {
 #[derive(Default)]
 struct RequestCounts {
     all: RequestCounter,
-    ranges: RequestCounter,
+    chunks: RequestCounter,
     events: OnceLock<mpsc::Sender<S3RequestEvent>>,
     dropped_records: AtomicU64,
 }
 
-struct RequestGuard<'a> {
-    counts: &'a RequestCounts,
+struct RequestGuard {
+    counts: Arc<RequestCounts>,
     kind: S3RequestKind,
     started: Option<Instant>,
     status: Option<u16>,
 }
 
-impl Drop for RequestGuard<'_> {
+impl Drop for RequestGuard {
     fn drop(&mut self) {
-        if matches!(self.kind, S3RequestKind::DataRange { .. }) {
-            self.counts.ranges.active.fetch_sub(1, Ordering::Relaxed);
+        if matches!(self.kind, S3RequestKind::ChunkRead) {
+            self.counts.chunks.active.fetch_sub(1, Ordering::Relaxed);
         }
         self.counts.all.active.fetch_sub(1, Ordering::Relaxed);
         if let (Some(started), Some(events)) = (self.started, self.counts.events.get()) {
@@ -250,732 +115,126 @@ impl Drop for RequestGuard<'_> {
     }
 }
 
-struct TrackedResponse<'a> {
-    body: reqwest::Response,
-    _request: RequestGuard<'a>,
-    _slot: RequestSlot,
+struct S3Transport {
+    inner: ReqwestTransport,
+    limits: RequestLimits,
+    counts: Arc<RequestCounts>,
+    chunk_prefix: String,
 }
 
-/// The origin tier of one class.
-#[derive(Clone)]
-pub(crate) struct Origin(Arc<OriginInner>);
-
-/// The outboard of one blob, fetched from the origin into a local file.
-pub(crate) struct OriginOutboard {
-    tree: BaoTree,
-    /// `None` for a blob of one chunk group, whose tree has no parents.
-    pairs: Option<Arc<std::fs::File>>,
-    path: PathBuf,
-}
-
-impl Drop for OriginOutboard {
-    fn drop(&mut self) {
-        if self.pairs.is_some() {
-            if let Err(e) = std::fs::remove_file(&self.path) {
-                tracing::warn!("removing {}: {e}", self.path.display());
-            }
-        }
-    }
-}
-
-impl OriginOutboard {
-    /// The hash pairs of the parent nodes the bao encoding of `ranges`
-    /// contains, concatenated in the order the encoding has them.
-    async fn parent_pairs(&self, ranges: &ChunkRanges) -> io::Result<Vec<u8>> {
-        let mut offsets = Vec::new();
-        for chunk in ResponseIter::new(self.tree, ranges.clone()) {
-            if let BaoChunk::Parent { node, .. } = chunk {
-                let position = self
-                    .tree
-                    .pre_order_offset(node)
-                    .ok_or_else(|| io::Error::other("the outboard has no such parent node"))?;
-                offsets.push(position * HASH_PAIR_BYTES as u64);
-            }
-        }
-        let Some(pairs) = self.pairs.clone() else {
-            return if offsets.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Err(io::Error::other("the blob has parent nodes but no outboard"))
-            };
-        };
-        // One blocking call per range; the reads are served by the page cache.
-        tokio::task::spawn_blocking(move || {
-            let mut loaded = vec![0u8; offsets.len() * HASH_PAIR_BYTES];
-            let (slots, _) = loaded.as_chunks_mut::<HASH_PAIR_BYTES>();
-            for (pair, offset) in slots.iter_mut().zip(offsets) {
-                pairs.read_exact_at(pair, offset)?;
-            }
-            Ok(loaded)
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
-}
-
-/// The whole verification groups that contain missing bytes in an aligned range.
-pub(crate) fn verification_ranges(missing: ChunkRanges, end: u64) -> Vec<(u64, u64)> {
-    round_up_to_chunks_groups(missing, IROH_BLOCK_SIZE)
-        .boundaries()
-        .as_chunks::<2>().0.iter()
-        .map(|[start, stop]| (start.to_bytes(), stop.to_bytes().min(end)))
-        .collect()
-}
-
-struct RangePart {
-    start: u64,
-    end: u64,
-    from_origin: bool,
-}
-
-fn range_parts((start, end): (u64, u64), missing: &ChunkRanges) -> Vec<RangePart> {
-    let missing = &ChunkRanges::bytes(start..end) & missing;
-    let mut parts = Vec::new();
-    let mut offset = start;
-    for [first, stop] in missing.boundaries().as_chunks::<2>().0 {
-        let first = first.to_bytes();
-        let stop = stop.to_bytes().min(end);
-        if offset < first {
-            parts.push(RangePart { start: offset, end: first, from_origin: false });
-        }
-        parts.push(RangePart { start: first, end: stop, from_origin: true });
-        offset = stop;
-    }
-    if offset < end {
-        parts.push(RangePart { start: offset, end, from_origin: false });
-    }
-    parts
-}
-
-struct OriginRead<'a> {
-    origin: &'a OriginInner,
-    store: &'a Store,
-    hash: BlakeHash,
-    received: &'a AtomicU64,
-}
-
-/// The bao encoding of one range of a blob, produced as the store reads it:
-/// the size, then for each node of the range's part of the tree in pre-order
-/// its hash pair from the outboard or its chunk group from local and origin data.
-struct RangeFeed<'a> {
-    /// Size prefix or hash pair not handed out yet.
-    pending: Bytes,
-    /// The range's hash pairs still to hand out, in encoding order.
-    parents: Bytes,
-    plan: ResponseIter,
-    /// Bytes of the current chunk group still to hand out.
-    leaf_remaining: usize,
-    /// Data received and not handed out yet.
-    body: Bytes,
-    source: &'a OriginRead<'a>,
-    parts: std::vec::IntoIter<RangePart>,
-    response: Option<(TrackedResponse<'a>, usize)>,
-    /// Why the response body ended early, when it did.
-    failure: &'a Mutex<Option<OriginError>>,
-}
-
-impl RangeFeed<'_> {
-    fn fail(&self, error: OriginError) -> io::Error {
-        *self.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
-        io::Error::other("could not read the Bao group data")
-    }
-
-    async fn fill_body(&mut self) -> Result<(), OriginError> {
-        if let Some((response, remaining)) = &mut self.response {
-            let body = response.body.chunk().await?
-                .ok_or_else(|| OriginError::Protocol("origin closed the range short".into()))?;
-            if body.len() > *remaining {
-                return Err(OriginError::Protocol("origin exceeded the requested range".into()));
-            }
-            self.body = body;
+impl HttpTransport for S3Transport {
+    async fn fetch(&self, request: http::Request<Buffer>) -> opendal::Result<http::Response<HttpBody>> {
+        let slot = self.limits.origin().await;
+        let kind = if request.uri().path().contains(&self.chunk_prefix) {
+            S3RequestKind::ChunkRead
         } else {
-            let part = self.parts.next()
-                .ok_or_else(|| OriginError::Protocol("missing data for a Bao group".into()))?;
-            let length = (part.end - part.start) as usize;
-            if part.from_origin {
-                let response = self.source.open_range(part.start, part.end).await?;
-                self.response = Some((response, length));
-            } else {
-                // Fully held groups are skipped by the plan. Only the local
-                // portions of the adjacent partial groups can appear here.
-                let bytes = self.source.store.blobs()
-                    .export_ranges(to_iroh(&self.source.hash), part.start..part.end)
-                    .concatenate().await.map_err(|err| OriginError::Rejected(err.to_string()))?;
-                if bytes.len() != length {
-                    return Err(OriginError::Rejected("verified local range is short".into()));
-                }
-                self.body = Bytes::from(bytes);
-            }
+            S3RequestKind::ObjectRead
+        };
+        let counts = &self.counts;
+        counts.all.start();
+        if matches!(kind, S3RequestKind::ChunkRead) {
+            counts.chunks.start();
         }
-        Ok(())
+        let mut guard = RequestGuard {
+            counts: counts.clone(),
+            kind,
+            started: counts.events.get().map(|_| Instant::now()),
+            status: None,
+        };
+        let response = self.inner.fetch(request).await?;
+        guard.status = Some(response.status().as_u16());
+        Ok(response.map(|body| body.map_inner(|stream| {
+            let lease = (guard, slot);
+            Box::new(stream.inspect(move |_| {
+                let _lease = &lease;
+            }))
+        })))
     }
 }
 
-impl ByteFragments for RangeFeed<'_> {
-    async fn next_bytes(&mut self, limit: usize) -> io::Result<Option<Bytes>> {
-        loop {
-            if !self.pending.is_empty() {
-                return Ok(Some(self.pending.split_to(self.pending.len().min(limit))));
-            }
-            if self.leaf_remaining != 0 {
-                if self.body.is_empty() {
-                    self.fill_body().await.map_err(|error| self.fail(error))?;
-                    continue;
-                }
-                let count = self.leaf_remaining.min(self.body.len()).min(limit);
-                self.leaf_remaining -= count;
-                if let Some((_, remaining)) = &mut self.response {
-                    self.source.received.fetch_add(count as u64, Ordering::Relaxed);
-                    *remaining -= count;
-                    if *remaining == 0 {
-                        self.response = None;
-                    }
-                }
-                return Ok(Some(self.body.split_to(count)));
-            }
-            match self.plan.next() {
-                Some(BaoChunk::Parent { .. }) => {
-                    if self.parents.len() < HASH_PAIR_BYTES {
-                        return Err(io::Error::other("the outboard is short of a hash pair"));
-                    }
-                    self.pending = self.parents.split_to(HASH_PAIR_BYTES);
-                }
-                Some(BaoChunk::Leaf { size, .. }) => self.leaf_remaining = size,
-                None => return Ok(None),
-            }
-        }
-    }
-}
-
-impl RecvStream for RangeFeed<'_> {
-    async fn recv_bytes(&mut self, len: usize) -> io::Result<Bytes> {
-        receive(self, len).await
-    }
-
-    async fn recv_bytes_exact(&mut self, len: usize) -> io::Result<Bytes> {
-        receive_exact(self, len).await
-    }
-
-    async fn recv_exact(&mut self, mut target: &mut [u8]) -> io::Result<()> {
-        while !target.is_empty() {
-            let fragment = self.next_bytes(target.len()).await?.ok_or(io::ErrorKind::UnexpectedEof)?;
-            let (head, rest) = target.split_at_mut(fragment.len());
-            head.copy_from_slice(&fragment);
-            target = rest;
-        }
-        Ok(())
-    }
-
-    fn stop(&mut self, _code: VarInt) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn id(&self) -> u64 {
-        0
-    }
+pub(crate) struct Origin {
+    operator: Operator,
+    key_template: String,
+    requests: Arc<RequestCounts>,
+    retries: u32,
 }
 
 impl Origin {
-    pub(crate) fn new(config: OriginConfig, request_limits: RequestLimits) -> Result<Self, OriginError> {
-        if config.range_bytes == 0 || config.concurrency == 0 {
-            return Err(OriginError::Config(
-                "range_bytes and concurrency must be at least 1".into(),
-            ));
-        }
-        let template = match &config.source {
-            OriginSource::S3 { key_template, .. } => key_template,
-            OriginSource::Url { template } => template,
-        };
-        if !template.contains(HASH_TOKEN) {
-            return Err(OriginError::Config(format!(
-                "template {template:?} has no {HASH_TOKEN} token"
-            )));
-        }
-        // Content is verified as it arrives, so a redirect is never needed;
-        // refusing them keeps signed requests on the configured host.
+    pub(crate) fn new(config: OriginConfig, limits: RequestLimits) -> Result<Self> {
+        let (chunk_prefix, _) = config.key_template.split_once(HASH_TOKEN)
+            .ok_or_else(|| Error::Config("CAS key template must include {blake3}".into()))?;
         let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            // A stalled origin connection fails its range instead of
-            // holding the fetch; the range's retries then apply.
             .connect_timeout(ORIGIN_IDLE_TIMEOUT)
             .read_timeout(ORIGIN_IDLE_TIMEOUT)
-            .build()?;
-        Ok(Self(Arc::new(OriginInner { config, request_limits, client, requests: RequestCounts::default() })))
+            .build().map_err(|error| Error::Config(format!("build S3 client: {error}")))?;
+        let requests = Arc::new(RequestCounts::default());
+        let backend = opendal::services::S3::default()
+            .endpoint(&config.endpoint)
+            .bucket(&config.bucket)
+            .region(&config.region)
+            .access_key_id(&config.credentials.access_key_id)
+            .secret_access_key(&config.credentials.secret_access_key)
+            .disable_config_load()
+            .disable_ec2_metadata();
+        let operator = Operator::new(backend)
+            .map_err(|error| Error::Config(format!("configure S3 origin: {error}")))?;
+        let context = operator.context().with_http_transport(HttpTransporter::new(S3Transport {
+            inner: ReqwestTransport::new(client),
+            limits,
+            counts: requests.clone(),
+            chunk_prefix: chunk_prefix.to_owned(),
+        }));
+        let operator = operator.with_context(context).layer(TimeoutLayer::new().with_io_timeout(ORIGIN_IDLE_TIMEOUT));
+        Ok(Self { operator, key_template: config.key_template, retries: config.retries, requests })
     }
 
-    pub(crate) fn s3_request_stats(&self) -> Option<S3RequestStats> {
-        let counts = &self.0.requests;
-        matches!(self.0.config.source, OriginSource::S3 { .. }).then(|| S3RequestStats {
+    pub(crate) fn s3_request_stats(&self) -> S3RequestStats {
+        let counts = &self.requests;
+        S3RequestStats {
             active: counts.all.active.load(Ordering::Relaxed),
             peak: counts.all.peak.load(Ordering::Relaxed),
-            active_ranges: counts.ranges.active.load(Ordering::Relaxed),
-            peak_ranges: counts.ranges.peak.load(Ordering::Relaxed),
+            active_chunks: counts.chunks.active.load(Ordering::Relaxed),
+            peak_chunks: counts.chunks.peak.load(Ordering::Relaxed),
             dropped_records: counts.dropped_records.load(Ordering::Relaxed),
-        })
+        }
     }
 
-    pub(crate) fn subscribe_s3_requests(&self, capacity: std::num::NonZeroUsize) -> Option<mpsc::Receiver<S3RequestEvent>> {
-        if !matches!(self.0.config.source, OriginSource::S3 { .. }) {
-            return None;
-        }
+    pub(crate) fn subscribe_s3_requests(&self, capacity: NonZeroUsize) -> Option<mpsc::Receiver<S3RequestEvent>> {
         let (sender, receiver) = mpsc::channel(capacity.get());
-        self.0.requests.events.set(sender).ok().map(|()| receiver)
+        self.requests.events.set(sender).ok().map(|()| receiver)
     }
 
-    /// The size of one ranged GET, in whole chunk groups.
-    pub(crate) fn range_bytes(&self) -> u64 {
-        (self.0.config.range_bytes / CHUNK_GROUP_BYTES).max(1) * CHUNK_GROUP_BYTES
+    pub(crate) async fn read_object(&self, key: &str, limit: usize) -> Result<Option<Vec<u8>>, OriginError> {
+        match self.read_whole(key, limit).await {
+            Ok(buffer) => Ok(Some(buffer.to_vec())),
+            Err(OriginError::Storage(error)) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
-    /// The size of the origin object for `hash`.
-    pub(crate) async fn object_size(&self, hash: &BlakeHash) -> Result<u64, OriginError> {
-        let response = self.0.send(S3RequestKind::ObjectSize, || {
-            self.0.request(reqwest::Method::HEAD, "HEAD", hash, "", None)
-        }).await?;
-        let status = response.body.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(OriginError::NotFound);
-        }
-        if !status.is_success() {
-            return Err(OriginError::Status {
-                method: "HEAD",
-                status: status.as_u16(),
-            });
-        }
-        response.body
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| OriginError::Protocol("HEAD carried no Content-Length".into()))
+    pub(crate) async fn read_chunk(&self, hash: BlakeHash, length: usize) -> Result<Bytes, OriginError> {
+        self.read_whole(&self.key_template.replace(HASH_TOKEN, &hash.to_hex()), length)
+            .await.map(|buffer| buffer.to_bytes())
     }
 
-    /// The whole object at `location`, a key of an S3 source's bucket or the
-    /// URL of a URL source, or `None` when the origin has none. An object
-    /// longer than `limit_bytes` is refused.
-    // [impl -> dsn~xlb-fork~1]
-    pub(crate) async fn read_object(
-        &self,
-        location: &str,
-        limit_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, OriginError> {
-        let target = self.0.object_target(location)?;
-        let mut response = self.0.send(S3RequestKind::ObjectRead, || {
-            self.0.target_request(reqwest::Method::GET, "GET", target, None)
-        }).await?;
-        let status = response.body.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if status != reqwest::StatusCode::OK {
-            return Err(OriginError::Status {
-                method: "GET",
-                status: status.as_u16(),
-            });
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.body.chunk().await? {
-            if body.len() + chunk.len() > limit_bytes {
-                return Err(OriginError::Protocol(format!(
-                    "{location} is longer than {limit_bytes} bytes"
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(Some(body))
-    }
-
-    /// Fetch the outboard of the `size`-byte blob `hash` into a new file at
-    /// `path`. The file is removed when the outboard is dropped.
+    // Keep retry outside the reader so an interrupted body starts a fresh GET.
     // [impl -> dsn~xlb-swarm-fetch~1]
-    pub(crate) async fn fetch_outboard(
-        &self,
-        hash: &BlakeHash,
-        size: u64,
-        path: PathBuf,
-    ) -> Result<OriginOutboard, OriginError> {
-        let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
-        let expected = tree.outboard_size();
-        if expected == 0 {
-            return Ok(OriginOutboard {
-                tree,
-                pairs: None,
-                path,
-            });
-        }
-        let mut failures = 0u32;
-        loop {
-            match self.0.download_outboard(hash, &path, expected).await {
-                Ok(()) => break,
-                Err(e) if e.is_transient() && failures < self.0.config.range_retries => {
-                    failures += 1;
-                    tracing::warn!(%hash, failures, "origin outboard retry: {e}");
-                    tokio::time::sleep(retry_delay(failures)).await;
+    async fn read_whole(&self, key: &str, limit: usize) -> Result<Buffer, OriginError> {
+        (|| async {
+            let mut stream = self.operator.reader(key).await?.into_stream(..).await?;
+            let mut length = 0;
+            let mut parts = Vec::new();
+            while let Some(buffer) = stream.try_next().await? {
+                length += buffer.len();
+                if length > limit {
+                    return Err(OriginError::TooLarge { key: key.to_owned(), limit });
                 }
-                Err(e) => {
-                    if let Err(remove) = tokio::fs::remove_file(&path).await {
-                        if remove.kind() != io::ErrorKind::NotFound {
-                            tracing::warn!(%hash, "removing {}: {remove}", path.display());
-                        }
-                    }
-                    return Err(e);
-                }
+                parts.extend(buffer);
             }
-        }
-        let pairs = tokio::fs::File::open(&path).await?.into_std().await;
-        Ok(OriginOutboard {
-            tree,
-            pairs: Some(Arc::new(pairs)),
-            path,
+            Ok(parts.into_iter().collect())
         })
-    }
-
-    /// Complete the verification groups in `[start, end)` and store them.
-    /// The range must be group-aligned, except at the end of the blob.
-    ///
-    /// `received` counts the body bytes handed to the store. Retry only
-    /// ranges whose chunk groups have yet to be verified and stored.
-    // [impl -> dsn~xlb-swarm-fetch~1]
-    pub(crate) async fn import_range(
-        &self,
-        store: &Store,
-        hash: BlakeHash,
-        outboard: &OriginOutboard,
-        (start, end): (u64, u64),
-        received: &AtomicU64,
-    ) -> Result<(), OriginError> {
-        let source = OriginRead { origin: &self.0, store, hash, received };
-        let wanted = ChunkRanges::bytes(start..end);
-        let mut failures = 0u32;
-        loop {
-            let held = store.blobs().observe(to_iroh(&hash)).await
-                .map_err(|err| OriginError::Rejected(err.to_string()))?;
-            let missing = &wanted - &held.ranges;
-            let mut outcome = Ok(());
-            for range in verification_ranges(missing.clone(), end) {
-                outcome = source.import_attempt(outboard, range, &missing).await;
-                if outcome.is_err() {
-                    break;
-                }
-            }
-            match outcome {
-                Ok(()) => return Ok(()),
-                Err(e) if e.is_transient() && failures < self.0.config.range_retries => {
-                    failures += 1;
-                    tracing::warn!(%hash, start, end, failures, "origin range retry: {e}");
-                    tokio::time::sleep(retry_delay(failures)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-fn retry_delay(failures: u32) -> Duration {
-    Duration::from_millis(200u64 << failures.min(6))
-}
-
-impl OriginInner {
-    async fn send(
-        &self,
-        kind: S3RequestKind,
-        build: impl FnOnce() -> Result<reqwest::RequestBuilder, OriginError>,
-    ) -> Result<TrackedResponse<'_>, OriginError> {
-        let slot = self.request_limits.origin().await;
-        let request = build()?;
-        let counts = &self.requests;
-        counts.all.start();
-        if matches!(kind, S3RequestKind::DataRange { .. }) {
-            counts.ranges.start();
-        }
-        let mut guard = RequestGuard {
-            counts, kind, started: counts.events.get().map(|_| Instant::now()), status: None,
-        };
-        let body = request.send().await?;
-        guard.status = Some(body.status().as_u16());
-        Ok(TrackedResponse { body, _request: guard, _slot: slot })
-    }
-
-    /// The request target of the object for `hash`, or with
-    /// [`OUTBOARD_KEY_SUFFIX`] as `suffix` of its outboard.
-    fn target(&self, hash: &BlakeHash, suffix: &str) -> Result<Target, OriginError> {
-        let template = match &self.config.source {
-            OriginSource::Url { template } => template,
-            OriginSource::S3 { key_template, .. } => key_template,
-        };
-        self.object_target(&format!(
-            "{}{suffix}",
-            template.replace(HASH_TOKEN, &hash.to_hex())
-        ))
-    }
-
-    /// The request target of the object at `location`: a key of an S3
-    /// source's bucket, or the whole URL of a URL source.
-    fn object_target(&self, location: &str) -> Result<Target, OriginError> {
-        match &self.config.source {
-            OriginSource::Url { .. } => Ok(Target {
-                url: location.to_string(),
-                signing: None,
-            }),
-            OriginSource::S3 {
-                endpoint, bucket, ..
-            } => {
-                let endpoint = endpoint.trim_end_matches('/');
-                let (scheme, rest) = endpoint.split_once("://").ok_or_else(|| {
-                    OriginError::Config(format!("endpoint {endpoint:?} has no scheme"))
-                })?;
-                let (host, base_path) = match rest.split_once('/') {
-                    Some((host, path)) => (host, format!("/{path}")),
-                    None => (rest, String::new()),
-                };
-                let path = format!(
-                    "{base_path}/{bucket}/{}",
-                    location.trim_start_matches('/')
-                );
-                Ok(Target {
-                    url: format!("{scheme}://{host}{}", sigv4::canonical_uri(&path)),
-                    signing: Some((host.to_string(), path)),
-                })
-            }
-        }
-    }
-
-    /// Build one request, signed when the source has credentials. `range` is
-    /// a half-open byte range.
-    // [impl -> dsn~xlb-fork~1]
-    fn request(
-        &self,
-        method: reqwest::Method,
-        method_name: &'static str,
-        hash: &BlakeHash,
-        suffix: &str,
-        range: Option<(u64, u64)>,
-    ) -> Result<reqwest::RequestBuilder, OriginError> {
-        self.target_request(method, method_name, self.target(hash, suffix)?, range)
-    }
-
-    /// Build one request to `target`, signed when the source has credentials.
-    fn target_request(
-        &self,
-        method: reqwest::Method,
-        method_name: &'static str,
-        target: Target,
-        range: Option<(u64, u64)>,
-    ) -> Result<reqwest::RequestBuilder, OriginError> {
-        let range_value = range.map(|(start, end)| format!("bytes={start}-{}", end - 1));
-        let mut request = self.client.request(method, &target.url);
-        if let Some(value) = &range_value {
-            request = request.header(reqwest::header::RANGE, value);
-        }
-        if let (
-            Some((host, path)),
-            OriginSource::S3 {
-                region,
-                credentials,
-                ..
-            },
-        ) = (&target.signing, &self.config.source)
-        {
-            let range_header = range_value.as_deref().map(|value| ("range", value));
-            let signed = sigv4::sign(
-                credentials,
-                &SigningInput {
-                    method: method_name,
-                    host,
-                    path,
-                    headers: range_header.as_slice(),
-                    payload_sha256: sigv4::EMPTY_PAYLOAD_SHA256,
-                    region,
-                    unix_secs: sigv4::now_unix(),
-                },
-            );
-            request = request
-                .header("x-amz-content-sha256", sigv4::EMPTY_PAYLOAD_SHA256)
-                .header("x-amz-date", signed.amz_date)
-                .header(reqwest::header::AUTHORIZATION, signed.authorization);
-        }
-        Ok(request)
-    }
-
-    /// One attempt at the whole outboard object, which must be `expected`
-    /// bytes long.
-    async fn download_outboard(
-        &self,
-        hash: &BlakeHash,
-        path: &Path,
-        expected: u64,
-    ) -> Result<(), OriginError> {
-        let mut response = self.send(S3RequestKind::Outboard, || {
-            self.request(reqwest::Method::GET, "GET", hash, OUTBOARD_KEY_SUFFIX, None)
-        }).await?;
-        let status = response.body.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(OriginError::NoOutboard);
-        }
-        if status != reqwest::StatusCode::OK {
-            return Err(OriginError::Status {
-                method: "GET",
-                status: status.as_u16(),
-            });
-        }
-        let mut file = tokio::fs::File::create(path).await?;
-        let mut written = 0u64;
-        while let Some(chunk) = response.body.chunk().await? {
-            written += chunk.len() as u64;
-            if written > expected {
-                break;
-            }
-            file.write_all(&chunk).await?;
-        }
-        // tokio's file completes a write in the background; flush surfaces
-        // its error and makes the bytes visible to the readers.
-        file.flush().await?;
-        if written != expected {
-            return Err(OriginError::Outboard(format!(
-                "the object is not the {expected} bytes a blob of this size has"
-            )));
-        }
-        Ok(())
-    }
-
-}
-
-impl<'a> OriginRead<'a> {
-    async fn open_range(&self, start: u64, end: u64) -> Result<TrackedResponse<'a>, OriginError> {
-        let response = self.origin.send(S3RequestKind::DataRange { start, end }, || {
-            self.origin.request(reqwest::Method::GET, "GET", &self.hash, "", Some((start, end)))
-        }).await?;
-        let status = response.body.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(OriginError::NotFound);
-        }
-        if status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(OriginError::Status {
-                method: "GET",
-                status: status.as_u16(),
-            });
-        }
-        Ok(response)
-    }
-
-    /// Assemble and verify whole groups, streaming in only their missing spans.
-    async fn import_attempt(
-        &self,
-        outboard: &OriginOutboard,
-        (start, end): (u64, u64),
-        missing: &ChunkRanges,
-    ) -> Result<(), OriginError> {
-        // Bao represents a range covering the last group as open-ended so it
-        // does not descend below the last node stored in the outboard.
-        let ranges = if end == outboard.tree.size() {
-            ChunkRanges::bytes(start..)
-        } else {
-            ChunkRanges::bytes(start..end)
-        };
-        let parents = outboard.parent_pairs(&ranges).await?;
-        let failure = Mutex::new(None);
-        let mut feed = RangeFeed {
-            pending: Bytes::copy_from_slice(&outboard.tree.size().to_le_bytes()),
-            parents: Bytes::from(parents),
-            plan: ResponseIter::new(outboard.tree, ranges.clone()),
-            leaf_remaining: 0,
-            body: Bytes::new(),
-            source: self,
-            parts: range_parts((start, end), missing).into_iter(),
-            response: None,
-            failure: &failure,
-        };
-        feed.fill_body().await?;
-        let imported = self.store
-            .blobs()
-            .import_bao_reader(to_iroh(&self.hash), ranges, feed)
-            .await
-            .map(drop);
-        match imported {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let ended_early = failure.into_inner().unwrap_or_else(|e| e.into_inner());
-                Err(ended_early
-                    .unwrap_or_else(|| OriginError::Rejected(format!("bytes {start}-{end}: {e}"))))
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn s3(endpoint: &str) -> OriginInner {
-        let one = std::num::NonZeroUsize::MIN;
-        OriginInner {
-            config: OriginConfig::new(OriginSource::S3 {
-                endpoint: endpoint.into(),
-                bucket: "artifacts".into(),
-                region: "auto".into(),
-                key_template: DEFAULT_KEY_TEMPLATE.into(),
-                credentials: Credentials {
-                    access_key_id: "id".into(),
-                    secret_access_key: "secret".into(),
-                },
-            }),
-            request_limits: RequestLimits::new(one, one, one).unwrap(),
-            client: reqwest::Client::new(),
-            requests: RequestCounts::default(),
-        }
-    }
-
-    #[test]
-    fn s3_target_is_path_style_under_the_key_template() {
-        let hash = BlakeHash::hash(b"x");
-        let target = s3("https://fly.storage.tigris.dev/")
-            .target(&hash, "")
-            .unwrap();
-        assert_eq!(
-            target.url,
-            format!(
-                "https://fly.storage.tigris.dev/artifacts/models/blake3/{}",
-                hash.to_hex()
-            )
-        );
-        let (host, path) = target.signing.unwrap();
-        assert_eq!(host, "fly.storage.tigris.dev");
-        assert_eq!(path, format!("/artifacts/models/blake3/{}", hash.to_hex()));
-    }
-
-    // [utest -> dsn~xlb-swarm-fetch~1]
-    #[test]
-    fn the_outboard_is_the_object_key_with_a_suffix() {
-        let hash = BlakeHash::hash(b"x");
-        let (_, path) = s3("https://fly.storage.tigris.dev")
-            .target(&hash, OUTBOARD_KEY_SUFFIX)
-            .unwrap()
-            .signing
-            .unwrap();
-        assert_eq!(
-            path,
-            format!("/artifacts/models/blake3/{}.obao", hash.to_hex())
-        );
-    }
-
-    #[test]
-    fn s3_target_keeps_the_port_in_the_signed_host() {
-        let hash = BlakeHash::hash(b"x");
-        let (host, _) = s3("http://127.0.0.1:9000")
-            .target(&hash, "")
-            .unwrap()
-            .signing
-            .unwrap();
-        assert_eq!(host, "127.0.0.1:9000");
-    }
-
-    #[test]
-    fn a_template_without_the_hash_token_is_rejected() {
-        let config = OriginConfig::new(OriginSource::Url {
-            template: "http://127.0.0.1/static.bin".into(),
-        });
-        let one = std::num::NonZeroUsize::MIN;
-        let limits = RequestLimits::new(one, one, one).unwrap();
-        assert!(matches!(Origin::new(config, limits), Err(OriginError::Config(_))));
+        .retry(ExponentialBuilder::default().with_jitter().with_max_times(self.retries as usize))
+        .when(|error| matches!(error, OriginError::Storage(error) if error.is_temporary()))
+        .await
     }
 }

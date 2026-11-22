@@ -29,7 +29,7 @@ use tokio::{
 
 pub use protocol::{
     ClassInfo, ClassStats, ClassTotals, Command, FetchMetric, FetchProgress, FetchRecord,
-    FetchResult, NodeEvent, NodeInfo, Peer, Response, SeedSummary, Tier, TreeInfo,
+    FetchResult, NodeEvent, NodeInfo, Peer, Response, Tier,
 };
 pub use xlb_core::NodeTopology;
 

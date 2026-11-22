@@ -15,7 +15,6 @@ pub struct RequestLimits {
     total: GlobalConcurrencyLimitLayer,
     origin: GlobalConcurrencyLimitLayer,
     peer: GlobalConcurrencyLimitLayer,
-    total_capacity: usize,
 }
 
 #[cfg(test)]
@@ -70,12 +69,7 @@ impl RequestLimits {
             total: GlobalConcurrencyLimitLayer::new(total),
             origin: GlobalConcurrencyLimitLayer::new(origin),
             peer: GlobalConcurrencyLimitLayer::new(peer),
-            total_capacity: total,
         })
-    }
-
-    pub(crate) fn total_capacity(&self) -> usize {
-        self.total_capacity
     }
 
     pub(crate) async fn origin(&self) -> RequestSlot {

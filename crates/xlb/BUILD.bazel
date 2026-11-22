@@ -9,24 +9,26 @@ rust_library(
     visibility = ["//visibility:public"],
     deps = [
         "//vendor/xlb/crates/xlb-core:xlb_core",
-        "@scheduler_crates//:bao-tree",
+        "@scheduler_crates//:backon",
         "@scheduler_crates//:blake3",
         "@scheduler_crates//:bytes",
         "@scheduler_crates//:dashmap",
         "@scheduler_crates//:foyer",
         "@scheduler_crates//:futures",
-        "@scheduler_crates//:hex",
+        "@scheduler_crates//:http",
         "@scheduler_crates//:iroh",
-        "@scheduler_crates//:iroh-blobs",
-        "@scheduler_crates//:iroh-gossip",
-        "@scheduler_crates//:iroh-smol-kv",
-        "@scheduler_crates//irpc",
         "@scheduler_crates//:libc",
+        "@scheduler_crates//:opendal",
+        "@scheduler_crates//:opendal-http-transport-reqwest",
+        "@scheduler_crates//:p2panda-core",
+        "@scheduler_crates//:p2panda-net",
+        "@scheduler_crates//:p2panda-store",
+        "@scheduler_crates//:p2panda-sync",
+        "@scheduler_crates//:ractor",
         "@scheduler_crates//:rand",
         "@scheduler_crates//:reqwest",
+        "@scheduler_crates//:rust-fsm",
         "@scheduler_crates//:serde",
-        "@scheduler_crates//:serde_json",
-        "@scheduler_crates//:sha2",
         "@scheduler_crates//:thiserror",
         "@scheduler_crates//:tokio",
         "@scheduler_crates//:tokio-util",
@@ -38,59 +40,15 @@ rust_library(
 rust_test(
     name = "xlb_tests",
     crate = ":xlb",
-    compile_data = ["tests/origin_server/mod.rs"],
-    edition = "2021",
-    deps = ["@scheduler_crates//:tempfile"],
-)
-
-# Two in-process nodes on loopback UDP: peer fetch into a plain file and
-# refusal of a node outside the peer set.
-rust_test(
-    name = "peer_fetch_tests",
-    srcs = ["tests/peer_fetch.rs"],
-    edition = "2021",
-    deps = [
-        ":xlb",
-        "//vendor/xlb/crates/xlb-core:xlb_core",
-        "@scheduler_crates//:tempfile",
-        "@scheduler_crates//:tokio",
-    ],
-)
-
-# Origin fetch against an in-process HTTP server that checks the SigV4
-# signature of every ranged request.
-rust_test(
-    name = "origin_fetch_tests",
-    srcs = [
-        "tests/origin_fetch.rs",
+    compile_data = [
         "tests/origin_server/mod.rs",
+        "tests/origin_server/sigv4.rs",
     ],
-    crate_root = "tests/origin_fetch.rs",
     edition = "2021",
     deps = [
-        ":xlb",
-        "@scheduler_crates//:bao-tree",
+        "@scheduler_crates//:hex",
+        "@scheduler_crates//:sha2",
         "@scheduler_crates//:tempfile",
-        "@scheduler_crates//:tokio",
-    ],
-)
-
-# Swarm fetch: nodes with a peer tier and an in-process origin each share
-# partial blobs, divide the origin reads and take over stalled segments.
-rust_test(
-    name = "swarm_fetch_tests",
-    srcs = [
-        "tests/origin_server/mod.rs",
-        "tests/swarm_fetch.rs",
-    ],
-    crate_root = "tests/swarm_fetch.rs",
-    edition = "2021",
-    deps = [
-        ":xlb",
-        "//vendor/xlb/crates/xlb-core:xlb_core",
-        "@scheduler_crates//:bao-tree",
-        "@scheduler_crates//:tempfile",
-        "@scheduler_crates//:tokio",
     ],
 )
 

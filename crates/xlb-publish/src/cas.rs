@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, ensure};
-use bao_tree::{BaoTree, BlockSize, io::outboard::PreOrderMemOutboard};
 use bytes::Bytes;
 use futures::{TryStreamExt, future::BoxFuture, stream};
 use opendal::{Error, ErrorKind, Operator};
@@ -11,20 +10,10 @@ use xlb_core::{
 };
 
 pub const ORIGIN_OBJECT_PREFIX: &str = "models/blake3/";
-pub const ORIGIN_OUTBOARD_SUFFIX: &str = ".obao";
-pub const OUTBOARD_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
 
 pub fn origin_object_key(blake3: &str) -> Result<String> {
     ensure!(is_digest_hex(blake3), "CAS origin requires a lowercase BLAKE3 content hash");
     Ok(format!("{ORIGIN_OBJECT_PREFIX}{blake3}"))
-}
-
-pub fn origin_outboard_key(blake3: &str) -> Result<String> {
-    Ok(format!("{}{ORIGIN_OUTBOARD_SUFFIX}", origin_object_key(blake3)?))
-}
-
-pub fn origin_outboard_bytes(size: u64) -> u64 {
-    BaoTree::new(size, OUTBOARD_BLOCK_SIZE).outboard_size()
 }
 
 pub async fn object_stored(origin: &Operator, key: &str, size: u64) -> Result<bool> {
@@ -36,27 +25,15 @@ pub async fn object_stored(origin: &Operator, key: &str, size: u64) -> Result<bo
 }
 
 pub(crate) async fn cas_chunk_stored(origin: &Operator, hash: BlakeHash, size: u64) -> Result<bool> {
-    let hash = hash.to_hex();
-    let data_key = origin_object_key(&hash)?;
-    let outboard_key = origin_outboard_key(&hash)?;
-    let (data, outboard) = tokio::try_join!(
-        object_stored(origin, &data_key, size),
-        object_stored(origin, &outboard_key, origin_outboard_bytes(size)),
-    )?;
-    Ok(data && outboard)
+    object_stored(origin, &origin_object_key(&hash.to_hex())?, size).await
 }
 
 pub async fn publish_cas_chunk(origin: &Operator, bytes: Bytes) -> Result<BlakeHash> {
-    let (bytes, hashes) = tokio::task::spawn_blocking(move || {
-        let hashes = PreOrderMemOutboard::create(&bytes, OUTBOARD_BLOCK_SIZE);
-        (bytes, hashes)
+    let (bytes, hash) = tokio::task::spawn_blocking(move || {
+        let hash = BlakeHash::hash(&bytes);
+        (bytes, hash)
     }).await?;
-    let hash = BlakeHash::from_bytes(*hashes.root.as_bytes());
-    let encoded = hash.to_hex();
-    tokio::try_join!(
-        store_cas_object(origin, origin_object_key(&encoded)?, bytes),
-        store_cas_object(origin, origin_outboard_key(&encoded)?, hashes.data.into()),
-    )?;
+    store_cas_object(origin, origin_object_key(&hash.to_hex())?, bytes).await?;
     Ok(hash)
 }
 

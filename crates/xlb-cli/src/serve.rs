@@ -4,13 +4,14 @@ use std::{num::NonZeroUsize, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use xlb::{AssetClass, AssetClassConfig, RequestLimits};
 
 use crate::{
     config::NodeConfig,
     metrics_sink::MetricsSink,
     server::{ClassEntry, NodeState},
+    supervisor::{ServiceTask, supervise},
 };
 
 pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
@@ -41,18 +42,13 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         let name: &'static str = Box::leak(cc.name.clone().into_boxed_str());
         let mut config = AssetClassConfig::new(name, cc.cache_dir());
         config.cache_budget_bytes = cc.cache_budget_bytes;
-        if cc.model_mount.is_some()
-            || cfg.node.image_mirror_class.as_deref() == Some(cc.name.as_str())
-            || cfg.node.snapshotter.as_ref().is_some_and(|settings| settings.class == cc.name)
-        {
-            if cc.talos_scratch_cache {
-                let (memory, disk) = xlb::cas_cache::CasCache::talos_budgets(&cc.cache_dir())?;
-                config.cas_memory_bytes = Some(memory);
-                config.cache_budget_bytes = disk;
-                tracing::info!(class = %cc.name, memory, disk, "size XLB CAS from Talos scratch and RAM");
-            } else {
-                config.cas_memory_bytes = Some(cc.cas_memory_bytes.unwrap_or(512 * 1024 * 1024));
-            }
+        if cc.talos_scratch_cache {
+            let (memory, disk) = xlb::cas_cache::CasCache::talos_budgets(&cc.cache_dir())?;
+            config.cas_memory_bytes = memory;
+            config.cache_budget_bytes = disk;
+            tracing::info!(class = %cc.name, memory, disk, "size XLB CAS from Talos scratch and RAM");
+        } else if let Some(memory) = cc.cas_memory_bytes {
+            config.cas_memory_bytes = memory;
         }
         config.peer = cc.peer_config()?;
         config.origin = cc.origin_config()?;
@@ -102,31 +98,6 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
             }
         })))
     }).collect();
-    let listener_state = state.clone();
-    let listener_socket = socket.clone();
-    let mut listener = tokio::spawn(async move {
-        crate::server::listen(listener_state, &listener_socket, socket_mode).await
-    });
-    let mirror = async {
-        let Some(name) = cfg.node.image_mirror_class.as_deref() else {
-            return std::future::pending().await;
-        };
-        cfg.classes.iter().find(|class| class.name == name)
-            .and_then(|class| class.origin.as_ref()).filter(|origin| origin.bucket.is_some())
-            .with_context(|| format!("image mirror requires an S3 origin for class {name}"))?;
-        let class = state.classes.iter().find(|entry| entry.name == name)
-            .context("image mirror class is not registered")?;
-        crate::image_mirror::serve(class.class.clone(), concurrency).await
-    };
-    let snapshotter = async {
-        let Some(config) = cfg.node.snapshotter.clone() else {
-            return std::future::pending().await;
-        };
-        let class = state.classes.iter().find(|entry| entry.name == config.class)
-            .context("snapshotter class is not registered")?;
-        xlb_mount::serve_snapshots(config, class.class.clone()).await
-    };
-
     // The full node ID and the bound addresses are what a peer needs.
     println!(
         "xlb node · {} · udp {} · {} class(es) · socket {}",
@@ -136,20 +107,62 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         socket
     );
 
-    tokio::select! {
-        signal = shutdown_signal() => signal?,
-        result = mirror => result?,
-        result = snapshotter => result?,
-        // The listener only returns when it could not bind.
-        listener = &mut listener => listener.context("socket task")??,
+    let services = async {
+        let cancel = CancellationToken::new();
+        let listener = state.clone();
+        let socket_stop = cancel.clone();
+        let mut services = vec![ServiceTask::new("control socket", async move {
+            crate::server::listen(listener, &socket, socket_mode, socket_stop).await
+        })];
+        if let Some(name) = cfg.node.image_mirror_class.as_deref() {
+            cfg.classes.iter().find(|class| class.name == name)
+                .and_then(|class| class.origin.as_ref())
+                .with_context(|| format!("image mirror requires an S3 origin for class {name}"))?;
+            let entry = state.classes.iter().find(|entry| entry.name == name)
+                .context("image mirror class is not registered")?;
+            services.push(ServiceTask::new("OCI mirror", crate::image_mirror::serve(
+                entry.class.clone(), concurrency, cancel.clone(),
+            )));
+        }
+        if let Some(config) = cfg.node.snapshotter {
+            let entry = state.classes.iter().find(|entry| entry.name == config.class)
+                .context("snapshotter class is not registered")?;
+            services.push(ServiceTask::new("containerd snapshotter", xlb_mount::serve_snapshots(
+                config, entry.class.clone(), cancel.clone().cancelled_owned(),
+            )));
+        }
+        if !model_sessions.is_empty() {
+            services.push(ServiceTask::new("model mounts", xlb_mount::serve_model_sessions(
+                model_sessions, cancel.clone().cancelled_owned(),
+            )));
+        }
+        for entry in state.classes.iter() {
+            let class = entry.class.clone();
+            let stop = cancel.clone();
+            services.push(ServiceTask::new(format!("{} cache", entry.name), async move {
+                tokio::select! {
+                    result = class.watch_cache() => Ok(result?),
+                    () = stop.cancelled() => Ok(()),
+                }
+            }));
+        }
+        Ok::<_, anyhow::Error>((services, cancel))
+    }.await;
+    match services {
+        Ok((services, cancel)) => {
+            supervise(services, cancel, shutdown_signal(), close_storage(&state.classes)).await
+        }
+        Err(error) => {
+            let _ = close_storage(&state.classes).await;
+            Err(error)
+        }
     }
-    listener.abort();
+}
+
+async fn close_storage(classes: &[ClassEntry]) -> Result<()> {
     println!("shutting down");
-    drop(model_sessions);
-    // Close the endpoints before they drop, so peers see a clean close.
-    for entry in state.classes.iter() {
-        entry.class.shutdown().await;
-    }
+    futures::future::join_all(classes.iter().map(|entry| entry.class.shutdown()))
+        .await.into_iter().collect::<xlb::Result<()>>()?;
     Ok(())
 }
 
@@ -162,7 +175,7 @@ async fn report_s3_requests(classes: Arc<Vec<ClassEntry>>) {
         for (entry, previous) in classes.iter().zip(&mut previous) {
             if let Some(stats) = entry.class.s3_request_stats().filter(|stats| *stats != *previous) {
                 tracing::info!(class = %entry.name, active = stats.active, peak = stats.peak,
-                    active_ranges = stats.active_ranges, peak_ranges = stats.peak_ranges,
+                    active_chunks = stats.active_chunks, peak_chunks = stats.peak_chunks,
                     dropped_records = stats.dropped_records,
                     "XLB S3 request concurrency");
                 *previous = stats;

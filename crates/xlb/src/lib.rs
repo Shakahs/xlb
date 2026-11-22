@@ -1,1051 +1,450 @@
-//! # xlb — BLAKE3-verified blob distribution
-//!
-//! An [`AssetClass`] is a namespace of content-addressed blobs with one cache
-//! directory. [`Asset::fetch_to_file`] returns the path of a plain file
-//! `<cache_dir>/<blake3-hex>` holding the verified blob. A blob already in
-//! the local cache is returned at once ([`FetchTier::Cache`]). Otherwise the
-//! blob is cut into segments and each segment is read from the peers that
-//! hold it ([`FetchTier::Peer`]) or, when no peer does, from the HTTP origin
-//! ([`FetchTier::Origin`]); nodes fetching the same blob divide the origin
-//! reads between them (see [`swarm`]).
-//!
-//! The file asset path does not hold a whole blob in memory. Peer and origin data are verified
-//! chunk group by chunk group against the BLAKE3 tree as they arrive and
-//! stored at once, so a blob is served to the admitted peers while it is
-//! still downloading, and from its plain file once it is complete.
-//!
-//! Indexed CAS classes use Foyer for completed chunks and stage verified
-//! ranges in iroh-blobs memory while the download is in progress.
+//! BLAKE3-verified chunks for the model mount, OCI mirror and snapshotter.
 
-pub(crate) mod cache;
+mod cache_checkpoint;
 pub mod cas_cache;
-mod cas_peer;
+mod inventory_publication;
 pub mod metrics;
-mod discovery;
-#[cfg(test)]
-extern crate self as xlb;
 pub mod origin;
+mod panda_chunks;
+mod panda_inventory;
+mod panda_network;
+mod panda_peers;
 pub mod peer;
-pub mod pinned;
 mod request_limits;
-pub mod sigv4;
-pub(crate) mod source;
-pub(crate) mod store;
-mod stream_bytes;
-pub(crate) mod swarm;
+mod source;
+mod transfer_policy;
 
-pub use cache::CacheStats;
+#[cfg(test)]
+#[path = "swarm_tests.rs"]
+mod swarm_tests;
+
 pub use metrics::{FetchObserver, FetchReport};
-pub use origin::{OriginConfig, OriginSource, S3RequestEvent, S3RequestStats};
+pub use origin::{Credentials, OriginConfig, S3RequestEvent, S3RequestStats};
 pub use peer::{NodeId, PeerAddr, PeerConfig, RelaySetting, RelayUrl};
-pub use pinned::{PinError, PinnedTreeInfo, SeedReport};
 pub use request_limits::RequestLimits;
-pub use sigv4::Credentials;
 pub use source::{FetchProgress, FetchTier, ProgressSink};
-pub use xlb_core::retention;
-pub use xlb_core::{BlakeHash, FetchSources, InvalidHash, NodeTopology, RetentionIndex, RetentionPolicy};
+pub use xlb_core::{BlakeHash, FetchSources, InvalidHash, NodeTopology};
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::Instant,
 };
 
+use bytes::Bytes;
 use tokio::sync::watch;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::{
-    cache::Cache,
-    cas_cache::CasCache,
-    cas_peer::StagedChunk,
-    origin::Origin,
-    peer::PeerTransport,
-    store::{BlobStore, to_iroh},
-    swarm::{SwarmFailure, SwarmProgress, SwarmSources},
-};
-
-/// Subdirectory of a class's `cache_dir` for files that are not verified yet.
-const INCOMING_DIR: &str = ".incoming";
-
-/// Default interval of the blob store's garbage collection.
-pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(5);
-
-// ─── Error ────────────────────────────────────────────────────────────────────
+use crate::{cache_checkpoint::CacheCheckpoint, cas_cache::{CasCache, VerifiedChunk}, origin::Origin, panda_peers::PandaPeers};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     #[error("invalid hash: {0}")]
     InvalidHash(#[from] InvalidHash),
-
-    /// No tier produced the blob. `detail` says what each tier answered.
     #[error("all sources exhausted for {hash}: {detail}")]
     FetchFailed { hash: BlakeHash, detail: String },
-
-    /// A file's content has a different BLAKE3 root than its name.
     #[error("hash mismatch: expected {expected}, got {actual}")]
-    HashMismatch {
-        expected: BlakeHash,
-        actual: BlakeHash,
-    },
-
-    /// The origin served a range or an outboard that does not verify
-    /// against the blob's hash, or the store could not take the range.
+    HashMismatch { expected: BlakeHash, actual: BlakeHash },
     #[error("origin content for {hash} was not accepted: {detail}")]
     OriginRejected { hash: BlakeHash, detail: String },
-
-    /// The blob is larger than the class's whole cache budget.
-    #[error("{hash} is {size} bytes, larger than the cache budget of {budget_bytes} bytes")]
-    ExceedsBudget {
-        hash: BlakeHash,
-        size: u64,
-        budget_bytes: u64,
-    },
-
     #[error("configuration: {0}")]
     Config(String),
-
-    #[error("blob store: {0}")]
+    #[error("CAS storage: {0}")]
     Store(String),
-
     #[error("io: {0}")]
     Io(Arc<std::io::Error>),
 }
 
 impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(Arc::new(e))
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(Arc::new(error))
     }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// ─── AssetClassConfig ─────────────────────────────────────────────────────────
-
-/// Configuration for an [`AssetClass`].
+/// Configuration for one indexed CAS namespace.
 pub struct AssetClassConfig {
-    /// Stable name for this class; a log and metric identifier.
     pub name: &'static str,
-    /// Directory holding one plain file per complete blob, named by its
-    /// BLAKE3 hex, and the blob store under `.store`.
     pub cache_dir: PathBuf,
-    /// LRU eviction budget for unpinned blobs, in bytes.
     pub cache_budget_bytes: u64,
-    /// Memory budget for the indexed CAS class. File asset classes leave this unset.
-    pub cas_memory_bytes: Option<usize>,
-    /// The peer tier. `None` = this class neither serves nor reads peers.
+    pub cas_memory_bytes: usize,
     pub peer: Option<PeerConfig>,
-    /// The origin tier. `None` = no origin.
     pub origin: Option<OriginConfig>,
-    /// Shared outgoing limits. Classes registered independently use their own limits.
     pub request_limits: Option<RequestLimits>,
-    /// How often the blob store drops entries the cache no longer holds.
-    pub gc_interval: Duration,
-    /// Called once per completed fetch with a [`FetchReport`].
     pub observer: Option<FetchObserver>,
 }
 
 impl AssetClassConfig {
-    /// A class with a 1 GiB budget and neither peers nor an origin.
     pub fn new(name: &'static str, cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             name,
             cache_dir: cache_dir.into(),
             cache_budget_bytes: 1024 * 1024 * 1024,
-            cas_memory_bytes: None,
+            cas_memory_bytes: 512 * 1024 * 1024,
             peer: None,
             origin: None,
             request_limits: None,
-            gc_interval: DEFAULT_GC_INTERVAL,
             observer: None,
         }
     }
 }
 
-// ─── AssetClass ───────────────────────────────────────────────────────────────
+pub struct CacheStats {
+    pub entries: u64,
+    pub bytes: u64,
+    pub budget_bytes: u64,
+}
 
-/// What a finished transfer produced.
 #[derive(Debug, Clone)]
 struct Fetched {
-    content: FetchedContent,
+    content: Bytes,
     size: u64,
     tier: FetchTier,
     peer_bytes: u64,
     origin_bytes: u64,
-    peers: std::collections::BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone)]
-enum FetchedContent {
-    File(PathBuf),
-    Chunk(bytes::Bytes),
+    peers: BTreeMap<String, u64>,
 }
 
 impl Fetched {
-    fn cached(content: FetchedContent, size: u64) -> Self {
+    fn cached(content: Bytes) -> Self {
         Self {
+            size: content.len() as u64,
             content,
-            size,
             tier: FetchTier::Cache,
             peer_bytes: 0,
             origin_bytes: 0,
-            peers: Default::default(),
+            peers: BTreeMap::new(),
         }
     }
 }
 
-/// The shared view of one transfer in flight.
-#[derive(Debug, Clone, Default)]
-struct FlightState {
-    indexed_size: Option<u64>,
-    progress: Option<FetchProgress>,
-    outcome: Option<Result<Fetched>>,
-    stage: Option<Arc<StagedChunk>>,
-}
-
-type FlightSender = Arc<watch::Sender<FlightState>>;
-type Flights = Arc<Mutex<HashMap<BlakeHash, watch::Receiver<FlightState>>>>;
-
-struct ChunkClass {
-    cache: Arc<CasCache>,
-    transfers: Arc<tokio::sync::Semaphore>,
-    checkpoint: tokio_util::task::AbortOnDropHandle<()>,
-}
+type Flight = watch::Receiver<Option<Result<Fetched>>>;
 
 struct ClassInner {
     name: &'static str,
     observer: Option<FetchObserver>,
-    cache: Arc<Cache>,
-    store: Option<BlobStore>,
-    cas: Option<ChunkClass>,
-    peers: Option<Arc<PeerTransport>>,
+    cache_dir: PathBuf,
+    cache_budget_bytes: u64,
+    cache: Arc<CasCache>,
+    checkpoint: CacheCheckpoint,
+    peers: Option<PandaPeers>,
     origin: Option<Origin>,
-    range_concurrency: usize,
-    trees: pinned::TreeStore,
-    /// Names of the declared pinned trees.
-    tree_names: Mutex<std::collections::BTreeSet<String>>,
-    /// Transfers in flight by hash, so concurrent fetches share one.
-    flights: Flights,
+    flights: Mutex<HashMap<BlakeHash, (u64, Flight)>>,
+    transfers: TaskTracker,
+    shutdown: CancellationToken,
 }
 
-/// A registered asset class — a namespace for content-addressed blobs.
-///
-/// `AssetClass` is `Clone + Send + Sync`; clone it freely to share across
-/// tasks. Call [`AssetClass::shutdown`] before dropping the last clone.
+/// A namespace of verified indexed chunks with local storage and optional peers.
 #[derive(Clone)]
 pub struct AssetClass(Arc<ClassInner>);
 
 impl AssetClass {
-    /// Register a class: open its blob store, reconcile the plain files
-    /// already in the cache directory, and bind the peer endpoint if
-    /// configured.
-    ///
-    /// A plain file the store does not know is re-imported in place and
-    /// kept only when its content hashes to its name.
     pub async fn register(config: AssetClassConfig) -> Result<Self> {
-        let cache_dir = std::path::absolute(&config.cache_dir)?;
-        tokio::fs::create_dir_all(&cache_dir).await?;
-        let incoming = cache_dir.join(INCOMING_DIR);
-        match tokio::fs::remove_dir_all(&incoming).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        tokio::fs::create_dir_all(&incoming).await?;
-
-        // Pinned trees are declared on the index first, so replaying what is
-        // already on disk cannot evict them.
-        let trees = pinned::TreeStore::under(&cache_dir);
-        let mut index = RetentionIndex::new(RetentionPolicy::new(config.cache_budget_bytes, 0));
-        let mut tree_names = std::collections::BTreeSet::new();
-        for (name, hashes) in trees.load_all().map_err(std::io::Error::other)? {
-            tree_names.insert(name.clone());
-            index.pin_set(name, hashes);
-        }
-        let cache = Arc::new(Cache::new(&cache_dir, index));
-
-        let request_limits = match config.request_limits {
+        let limits = match config.request_limits {
             Some(limits) => limits,
             None => {
-                let origin = config.origin.as_ref().and_then(|origin| NonZeroUsize::new(origin.concurrency));
-                let peer = config.peer.as_ref().and_then(|peer| NonZeroUsize::new(peer.concurrency));
+                let origin = config.origin.as_ref().map(|origin| origin.concurrency);
+                let peer = config.peer.as_ref().map(|peer| peer.concurrency);
                 let total = origin.or(peer).unwrap_or(NonZeroUsize::MIN);
                 RequestLimits::new(total, origin.unwrap_or(total), peer.unwrap_or(total))?
             }
         };
-        let range_concurrency = request_limits.total_capacity();
-        let flights = Flights::default();
-        let (store, cas) = if let Some(memory) = config.cas_memory_bytes {
-            if !tree_names.is_empty() {
-                return Err(Error::Config("the CAS class contains durable file pins".into()));
-            }
-            let disk = usize::try_from(config.cache_budget_bytes)
-                .map_err(|_| Error::Config("CAS disk budget exceeds the platform limit".into()))?;
-            let chunks = Arc::new(CasCache::open(&cache_dir, memory, disk).await?);
-            let transfers = (memory / cas_peer::STAGING_BYTES).min(range_concurrency);
-            let checkpoint = chunks.clone();
-            let checkpoint = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-                let mut timer = tokio::time::interval(Duration::from_secs(5));
-                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    timer.tick().await;
-                    if let Err(error) = checkpoint.checkpoint().await {
-                        tracing::warn!(%error, "checkpoint XLB CAS discovery");
-                    }
-                }
-            }));
-            (None, Some(ChunkClass {
-                cache: chunks,
-                transfers: Arc::new(tokio::sync::Semaphore::new(transfers)),
-                checkpoint,
-            }))
-        } else {
-            let store = BlobStore::open(&cache_dir, cache.clone(), config.gc_interval, range_concurrency)
-                .await.map_err(Error::Store)?;
-            reconcile(&cache, &store).await?;
-            store.mark_ready();
-            (Some(store), None)
-        };
-
+        let origin = config.origin.map(|origin| Origin::new(origin, limits.clone())).transpose()?;
+        let cache_dir = std::path::absolute(&config.cache_dir)?;
+        let disk = usize::try_from(config.cache_budget_bytes)
+            .map_err(|_| Error::Config("CAS disk budget exceeds the platform limit".into()))?;
+        let cache = Arc::new(CasCache::open(&cache_dir, config.cas_memory_bytes, disk).await?);
         let peers = match config.peer {
-            Some(peer) => {
-                let transport = if let Some(cas) = &cas {
-                    let chunks = cas.cache.clone();
-                    let provider = cas_peer::provider(chunks.clone(), flights.clone());
-                    PeerTransport::bind(peer, &provider, move || {
-                        chunks.complete_hashes().iter().map(to_iroh).collect()
-                    }, request_limits.clone()).await
-                } else {
-                    let store = store.as_ref().expect("file class");
-                    let live = store.live_set();
-                    PeerTransport::bind(peer, store.api(), move || {
-                        live.complete_hashes().collect()
-                    }, request_limits.clone()).await
-                };
-                Some(Arc::new(transport.map_err(Error::Config)?))
-            }
+            Some(peer) => Some(PandaPeers::start(peer, cache.clone(), limits, config.name).await?),
             None => None,
         };
-        let origin = match config.origin {
-            Some(origin) => Some(Origin::new(origin, request_limits).map_err(|e| Error::Config(e.to_string()))?),
-            None => None,
-        };
-
+        let checkpoint = CacheCheckpoint::start(cache.clone()).await?;
         Ok(Self(Arc::new(ClassInner {
             name: config.name,
             observer: config.observer,
+            cache_dir,
+            cache_budget_bytes: config.cache_budget_bytes,
             cache,
-            store,
-            cas,
+            checkpoint,
             peers,
             origin,
-            range_concurrency,
-            trees,
-            tree_names: Mutex::new(tree_names),
-            flights,
+            flights: Mutex::default(),
+            transfers: TaskTracker::new(),
+            shutdown: CancellationToken::new(),
         })))
     }
 
-    /// Stop serving peers, close the endpoint and shut the blob store down.
-    pub async fn shutdown(&self) {
-        match &self.0.peers {
-            // The router shuts the protocol handler down, which shuts the store.
-            Some(peers) => peers.shutdown().await,
-            None => if let Some(store) = &self.0.store { store.shutdown().await; },
+    pub async fn shutdown(&self) -> Result<()> {
+        {
+            let _flights = self.0.flights.lock().unwrap();
+            self.0.shutdown.cancel();
+            self.0.transfers.close();
         }
-        if let Some(cas) = &self.0.cas {
-            cas.transfers.close();
-            let active: Vec<_> = self.0.flights.lock()
-                .unwrap_or_else(|error| error.into_inner()).values().cloned().collect();
-            for mut flight in active {
-                let _ = flight.wait_for(|state| state.outcome.is_some()).await;
-            }
-            cas.checkpoint.abort();
-            if let Err(error) = cas.cache.close().await {
-                tracing::warn!(%error, "close XLB CAS");
-            }
+        if let Some(peers) = &self.0.peers {
+            peers.shutdown().await;
         }
+        self.0.transfers.wait().await;
+        self.0.checkpoint.stop().await;
+        self.0.cache.close().await
     }
 
-    /// Return a handle to a specific asset within this class.
-    pub fn asset(&self, hash: BlakeHash) -> Asset {
-        Asset {
-            class: self.clone(),
-            hash,
-            indexed_size: None,
-        }
+    pub async fn watch_cache(&self) -> Result<()> {
+        self.0.checkpoint.stopped().await;
+        Err(Error::Store("XLB CAS checkpoint actor stopped".into()))
     }
 
-    /// Fetch a CAS chunk whose length is supplied by the OCI index.
     pub fn indexed_chunk(&self, hash: BlakeHash, size: u64) -> Asset {
-        Asset { indexed_size: Some(size), ..self.asset(hash) }
+        Asset { class: self.clone(), hash, size }
     }
 
-    /// The configured name of this class.
     pub fn name(&self) -> &'static str {
         self.0.name
     }
 
-    /// The absolute cache directory; a complete blob is the plain file
-    /// `<cache_dir>/<blake3-hex>`.
     pub fn cache_dir(&self) -> &Path {
-        self.0.cache.dir()
+        &self.0.cache_dir
     }
 
-    /// Current cache occupancy. Reads an in-memory index.
-    /// On Foyer classes, reports the resident memory tier.
     pub fn cache_stats(&self) -> CacheStats {
-        let mut stats = self.0.cache.stats();
-        if let Some(cas) = &self.0.cas {
-            (stats.entries, stats.bytes) = cas.cache.occupancy();
-        }
-        stats
+        let (entries, bytes) = self.0.cache.occupancy();
+        CacheStats { entries, bytes, budget_bytes: self.0.cache_budget_bytes }
     }
 
-    /// Request overlap measured by the S3 client for this class.
     pub fn s3_request_stats(&self) -> Option<S3RequestStats> {
-        self.0.origin.as_ref().and_then(Origin::s3_request_stats)
+        self.0.origin.as_ref().map(Origin::s3_request_stats)
     }
 
-    /// Subscribe once to request records for this S3 class. The client drops
-    /// records if the subscriber falls behind and the queue fills.
-    pub fn subscribe_s3_requests(&self, capacity: std::num::NonZeroUsize) -> Option<tokio::sync::mpsc::Receiver<S3RequestEvent>> {
+    pub fn subscribe_s3_requests(&self, capacity: NonZeroUsize) -> Option<tokio::sync::mpsc::Receiver<S3RequestEvent>> {
         self.0.origin.as_ref()?.subscribe_s3_requests(capacity)
     }
 
-    /// Read one small whole object from the class's origin: `location` is a
-    /// key of an S3 origin's bucket or the URL of a URL origin. `None` when
-    /// the origin has no such object.
+    /// Read a bounded index or manifest from the CAS bucket.
     // [impl -> dsn~xlb-fork~1]
-    pub async fn read_origin_object(
-        &self,
-        location: &str,
-        limit_bytes: usize,
-    ) -> Result<Option<Vec<u8>>> {
-        let origin = self
-            .0
-            .origin
-            .as_ref()
+    pub async fn read_origin_object(&self, key: &str, limit_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let origin = self.0.origin.as_ref()
             .ok_or_else(|| Error::Config(format!("class {} has no origin", self.0.name)))?;
-        origin
-            .read_object(location, limit_bytes)
-            .await
-            .map_err(|e| Error::Config(format!("origin object {location}: {e}")))
+        origin.read_object(key, limit_bytes).await
+            .map_err(|error| Error::Store(format!("origin object {key}: {error}")))
     }
 
-    // ─── Peers ─────────────────────────────────────────────────────────────
-
-    /// This node's ID on the peer tier, if the class has one.
     pub fn node_id(&self) -> Option<NodeId> {
-        self.0.peers.as_deref().map(PeerTransport::node_id)
+        self.0.peers.as_ref().map(PandaPeers::node_id)
     }
 
-    /// The UDP addresses the peer endpoint is bound to.
     pub fn bound_addrs(&self) -> Vec<SocketAddr> {
-        self.0
-            .peers
-            .as_ref()
-            .map(|transport| transport.bound_addrs())
-            .unwrap_or_default()
+        self.0.peers.as_ref().map(PandaPeers::bound_addrs).unwrap_or_default()
     }
 
-    /// Replace the peer set. Later fetches read only from these peers and
-    /// only these peers are served. A no-op on a class without a peer tier.
     pub fn set_peers(&self, peers: Vec<PeerAddr>) {
         let admit = peers.iter().map(|peer| peer.node_id).collect();
         self.set_peer_sets(peers, admit);
     }
 
-    /// Replace the peer set and, separately, the nodes this node serves.
-    /// Later fetches dial, observe and read only `peers`; get and observe
-    /// requests are answered only for the node IDs in `admit`, which need
-    /// not be in `peers`. A no-op on a class without a peer tier.
     // [impl -> dsn~xlb-peer-reach~1]
     pub fn set_peer_sets(&self, peers: Vec<PeerAddr>, admit: Vec<NodeId>) {
         if let Some(transport) = &self.0.peers {
-            transport.set_peer_sets(peers, admit);
+            transport.set_peers(peers, admit);
         }
     }
 
-    /// Set the topology published by the peer endpoint in the node directory.
     pub fn set_node_topology(&self, topology: Option<NodeTopology>) {
         if let Some(transport) = &self.0.peers {
-            transport.set_node_topology(topology);
+            transport.set_topology(topology);
         }
     }
 
-    /// The relay the peer endpoint is reachable through, once it has
-    /// connected to one.
     pub fn relay_url(&self) -> Option<RelayUrl> {
-        self.0.peers.as_deref().and_then(PeerTransport::relay_url)
+        self.0.peers.as_ref().and_then(PandaPeers::relay_url)
     }
 
-    /// The current peer set.
     pub fn peers(&self) -> Vec<PeerAddr> {
-        self.0
-            .peers
-            .as_ref()
-            .map(|transport| transport.peers())
-            .unwrap_or_default()
+        self.0.peers.as_ref().map(PandaPeers::peers).unwrap_or_default()
     }
 
-    // ─── Pins ──────────────────────────────────────────────────────────────
-
-    /// Pin one blob: never evicted, outside the byte budget. May be called
-    /// before the blob has been fetched.
-    pub fn pin(&self, hash: BlakeHash) {
-        self.0.cache.pin(hash);
-    }
-
-    /// Drop a hash pin; the blob rejoins the LRU (and may be evicted at once
-    /// if the unpinned footprint is over budget).
-    pub fn unpin(&self, hash: &BlakeHash) {
-        self.0.cache.unpin(hash);
-    }
-
-    /// Whether `hash` is currently protected from eviction.
-    pub fn is_pinned(&self, hash: &BlakeHash) -> bool {
-        self.0.cache.is_pinned(hash)
-    }
-
-    fn tree_names(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<String>> {
-        self.0.tree_names.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Declare (or replace) the pinned tree `name` covering `hashes`. It is
-    /// persisted first, then pinned, so it survives a restart and its members
-    /// are never evicted. The bytes need not be present: seed them with
-    /// [`Self::seed_tree_from_dirs`] or let fetches fill them in.
-    pub async fn pin_tree(
-        &self,
-        name: &str,
-        hashes: impl IntoIterator<Item = BlakeHash>,
-    ) -> std::result::Result<PinnedTreeInfo, PinError> {
-        if self.0.cas.is_some() {
-            return Err(std::io::Error::other("durable pins require a file asset class").into());
-        }
-        pinned::validate_tree_name(name)?;
-        let mut hashes: Vec<BlakeHash> = hashes.into_iter().collect();
-        hashes.sort_by_key(BlakeHash::to_hex);
-        hashes.dedup();
-        self.0.trees.save(name, &hashes).await?;
-        // Replacing a tree can drop members; unpin first so the evictions
-        // that frees are deleted, then pin the new membership.
-        if self.tree_names().contains(name) {
-            self.0.cache.unpin_set(name);
-        }
-        self.0.cache.pin_set(name, hashes);
-        self.tree_names().insert(name.to_string());
-        self.tree_info(name)
-            .ok_or_else(|| PinError::NotFound(name.to_string()))
-    }
-
-    /// Remove the pinned tree `name`; its members rejoin the LRU and may be
-    /// evicted at once if the unpinned footprint is over budget.
-    pub async fn unpin_tree(&self, name: &str) -> std::result::Result<(), PinError> {
-        if !self.tree_names().remove(name) {
-            return Err(PinError::NotFound(name.to_string()));
-        }
-        self.0.trees.remove(name).await?;
-        self.0.cache.unpin_set(name);
-        Ok(())
-    }
-
-    /// Every pinned tree on this class, by name.
-    pub fn pinned_trees(&self) -> Vec<PinnedTreeInfo> {
-        let names: Vec<String> = self.tree_names().iter().cloned().collect();
-        names.iter().filter_map(|n| self.tree_info(n)).collect()
-    }
-
-    /// The members of pinned tree `name`, or `None` if there is no such tree.
-    pub fn tree_members(&self, name: &str) -> Option<Vec<BlakeHash>> {
-        if !self.tree_names().contains(name) {
-            return None;
-        }
-        Some(self.0.cache.pin_set_members(name))
-    }
-
-    fn tree_info(&self, name: &str) -> Option<PinnedTreeInfo> {
-        let usage = self.0.cache.pin_set_usage(name)?;
-        Some(PinnedTreeInfo {
-            name: name.to_string(),
-            members: usage.members,
-            present: usage.present,
-            present_bytes: usage.present_bytes,
-            durable: true,
-        })
-    }
-
-    /// Fill pinned tree `name` from local directories holding blobs at
-    /// `<dir>/<blake3-hex>`. Each file is copied into the cache directory and
-    /// admitted only when its content hashes to its name; members already
-    /// cached are not re-read. No network.
-    pub async fn seed_tree_from_dirs(
-        &self,
-        name: &str,
-        dirs: &[PathBuf],
-    ) -> std::result::Result<SeedReport, PinError> {
-        let members = self
-            .tree_members(name)
-            .ok_or_else(|| PinError::NotFound(name.to_string()))?;
-        let mut report = SeedReport::default();
-        'member: for hash in members {
-            if self.0.cache.contains(&hash) {
-                report.already_cached += 1;
-                continue;
-            }
-            for dir in dirs {
-                let source = dir.join(hash.to_hex());
-                let staged = self.staging_path(&hash);
-                match tokio::fs::copy(&source, &staged).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
-                }
-                match self.adopt(hash, &staged).await {
-                    Ok(_) => {
-                        report.ingested += 1;
-                        continue 'member;
-                    }
-                    Err(Error::HashMismatch { .. }) => report.mismatched.push(source),
-                    Err(e) => return Err(std::io::Error::other(e).into()),
-                }
-            }
-            report.missing.push(hash);
-        }
-        Ok(report)
-    }
-
-    // ─── Fetch ─────────────────────────────────────────────────────────────
-
-    fn staging_path(&self, hash: &BlakeHash) -> PathBuf {
-        self.0.cache.dir().join(INCOMING_DIR).join(hash.to_hex())
-    }
-
-    /// The plain file of `hash` if it is complete locally.
-    fn local(&self, hash: &BlakeHash) -> Option<(PathBuf, u64)> {
-        let (path, size) = self.0.cache.lookup(hash)?;
-        if path.is_file() {
-            Some((path, size))
-        } else {
-            tracing::warn!(%hash, "cached file vanished from {}", path.display());
-            self.0.cache.forget(hash);
-            None
-        }
-    }
-
-    /// Move the staged file to `<cache_dir>/<hex>`, have the store adopt it
-    /// in place, and admit it only when its content hashes to `hash`.
-    /// Returns its size. The file is gone again on any error.
-    async fn adopt(&self, hash: BlakeHash, staged: &Path) -> Result<u64> {
-        let path = self.0.cache.path_for(&hash);
-        let adopted: Result<u64> = async {
-            tokio::fs::rename(staged, &path).await?;
-            let size = tokio::fs::metadata(&path).await?.len();
-            let (actual, tag) = self.file_store()?
-                .import_reference(path.clone())
-                .await
-                .map_err(Error::Store)?;
-            if actual != hash {
-                return Err(Error::HashMismatch {
-                    expected: hash,
-                    actual,
-                });
-            }
-            // The index entry keeps the blob alive from here; the import's
-            // temporary tag is dropped after it.
-            self.0.cache.insert(hash, size);
-            if let Some(peers) = &self.0.peers {
-                peers.announce(to_iroh(&hash)).await;
-            }
-            drop(tag);
-            Ok(size)
-        }
-        .await;
-        if adopted.is_err() {
-            for leftover in [staged, path.as_path()] {
-                if let Err(e) = tokio::fs::remove_file(leftover).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(%hash, "removing {}: {e}", leftover.display());
-                    }
-                }
+    async fn cached_chunk(&self, hash: BlakeHash, size: u64) -> Result<Option<Fetched>> {
+        match self.0.cache.get(hash).await {
+            Ok(Some(chunk)) if chunk.body().len() as u64 == size => Ok(Some(Fetched::cached(chunk.body().clone()))),
+            Ok(Some(_)) => Err(Error::Store(format!("CAS chunk {hash} has an unexpected length"))),
+            Ok(None) => Ok(None),
+            Err(error) => {
+                tracing::warn!(%hash, %error, "refetch unreadable XLB chunk");
+                Ok(None)
             }
         }
-        adopted
     }
 
-    fn file_store(&self) -> Result<&BlobStore> {
-        self.0.store.as_ref()
-            .ok_or_else(|| Error::Config("plain files require a file asset class".into()))
-    }
-
-    async fn local_content(&self, hash: &BlakeHash, indexed_size: Option<u64>) -> Result<Option<Fetched>> {
-        if let Some(cas) = &self.0.cas {
-            let length = indexed_size.ok_or_else(|| Error::Config("CAS fetch requires an indexed chunk".into()))?;
-            match cas.cache.get(*hash).await {
-                Ok(Some(chunk)) if chunk.body().len() as u64 == length => {
-                    return Ok(Some(Fetched::cached(FetchedContent::Chunk(chunk.body().clone()), length)));
-                }
-                Ok(Some(_)) => return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length"))),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(%hash, %error, "refetch unreadable XLB chunk"),
-            }
-            return Ok(None);
+    fn join_flight(&self, hash: BlakeHash, size: u64) -> Result<(u64, Flight)> {
+        let mut flights = self.0.flights.lock().unwrap();
+        if self.0.shutdown.is_cancelled() {
+            return Err(Error::FetchFailed { hash, detail: "XLB is shutting down".into() });
         }
-        Ok(self.local(hash).map(|(path, size)| Fetched::cached(FetchedContent::File(path), size)))
-    }
-
-    /// Join the transfer in flight for `hash`, or start one.
-    fn join_flight(&self, hash: BlakeHash, indexed_size: Option<u64>) -> watch::Receiver<FlightState> {
-        let mut flights = self.0.flights.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(flight) = flights.get(&hash) {
-            // A closed channel is a transfer task that died; replace it.
+        if let Some((size, flight)) = flights.get(&hash) {
             if flight.has_changed().is_ok() {
-                return flight.clone();
+                return Ok((*size, flight.clone()));
             }
         }
-        let (tx, rx) = watch::channel(FlightState { indexed_size, ..Default::default() });
-        flights.insert(hash, rx.clone());
+        let (tx, rx) = watch::channel(None);
+        flights.insert(hash, (size, rx.clone()));
         let class = self.clone();
-        tokio::spawn(async move {
-            let tx: FlightSender = Arc::new(tx);
-            let outcome = class.transfer(hash, indexed_size, &tx).await;
-            // Unregister before publishing, so a fetch that arrives after the
-            // outcome starts from the cache rather than from this flight.
-            class
-                .0
-                .flights
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&hash);
-            tx.send_modify(|state| {
-                if let Some(stage) = state.stage.take() {
-                    stage.finished.cancel();
-                }
-                state.outcome = Some(outcome);
-            });
+        self.0.transfers.spawn(async move {
+            let outcome = tokio::select! {
+                result = class.transfer_chunk(hash, size) => result,
+                () = class.0.shutdown.cancelled() => Err(Error::FetchFailed {
+                    hash, detail: "XLB is shutting down".into(),
+                }),
+            };
+            class.0.flights.lock().unwrap().remove(&hash);
+            tx.send_replace(Some(outcome));
         });
-        rx
+        Ok((size, rx))
     }
 
-    /// Obtain `hash` from the local cache, or else from the peers and the
-    /// origin together.
-    // [impl -> dsn~xlb-fork~1]
-    // [impl -> dsn~xlb-swarm-fetch~1]
-    async fn transfer(&self, hash: BlakeHash, indexed_size: Option<u64>, flight: &FlightSender) -> Result<Fetched> {
-        if let Some(hit) = self.local_content(&hash, indexed_size).await? {
+    // [impl -> dsn~xlb-supervised-lifecycle~1]
+    async fn transfer_chunk(&self, hash: BlakeHash, size: u64) -> Result<Fetched> {
+        use transfer_policy::{ChunkAction, ChunkEvent, ChunkTransfer, Sources};
+
+        if size == 0 || size > xlb_core::chunks::CAS_CHUNK_BYTES {
+            return Err(Error::Store(format!("invalid CAS chunk length {size}")));
+        }
+        let hit = self.cached_chunk(hash, size).await?;
+        let peers = self.0.peers.as_ref();
+        let mut candidates = None;
+        let mut next_sources = || Sources {
+            peer: candidates.get_or_insert_with(|| {
+                peers.map_or_else(Vec::new, |peers| peers.candidates(hash)).into_iter()
+            }).next(),
+            origin_available: self.0.origin.is_some(),
+        };
+        let mut verified = None;
+        let mut tier = FetchTier::Origin;
+        let mut details = std::collections::BTreeMap::new();
+        let mut failure = Error::FetchFailed { hash, detail: "no eligible peer or backing store".into() };
+        let mut state = rust_fsm::StateMachine::<ChunkTransfer>::new();
+        let mut event = if hit.is_some() {
+            ChunkEvent::CacheHit
+        } else {
+            ChunkEvent::CacheMiss(next_sources())
+        };
+        loop {
+            let action = state.consume(&event).expect("valid transfer transition").expect("transfer action");
+            event = match action {
+                ChunkAction::ReadPeer(node) => {
+                    match peers.expect("peer directory").fetch(node, hash, size as usize).await {
+                        Ok(Some(chunk)) => {
+                            tier = FetchTier::Peer;
+                            details.insert(node.to_string(), size);
+                            verified = Some(chunk);
+                            ChunkEvent::Verified
+                        }
+                        Ok(None) => ChunkEvent::PeerSkipped(next_sources()),
+                        Err(error) => {
+                            failure = Error::FetchFailed { hash, detail: format!("peer {node}: {error}") };
+                            ChunkEvent::PeerFailed(next_sources())
+                        }
+                    }
+                }
+                ChunkAction::ReadOrigin => {
+                    let origin = self.0.origin.as_ref().expect("selected backing store");
+                    match origin.read_chunk(hash, size as usize).await {
+                        Ok(body) => match VerifiedChunk::verify(hash, size, body).await {
+                            Ok(chunk) => {
+                                verified = Some(chunk);
+                                ChunkEvent::Verified
+                            }
+                            Err(error) => {
+                                failure = Error::OriginRejected { hash, detail: error.to_string() };
+                                ChunkEvent::OriginFailed
+                            }
+                        },
+                        Err(error) => {
+                            failure = Error::FetchFailed { hash, detail: format!("origin: {error}") };
+                            ChunkEvent::OriginFailed
+                        }
+                    }
+                }
+                ChunkAction::Store => {
+                    self.0.cache.insert_verified(verified.as_ref().expect("verified chunk").clone());
+                    ChunkEvent::Stored
+                }
+                ChunkAction::Announce => {
+                    if let Some(peers) = peers {
+                        peers.announce(hash);
+                    }
+                    ChunkEvent::Announced
+                }
+                ChunkAction::Return => return hit.or_else(|| verified.map(|chunk| Fetched {
+                        content: chunk.body().clone(),
+                        size,
+                        tier,
+                        peer_bytes: if tier == FetchTier::Peer { size } else { 0 },
+                        origin_bytes: if tier == FetchTier::Origin { size } else { 0 },
+                        peers: details,
+                    })).ok_or(failure),
+            };
+        }
+    }
+
+    async fn fetch(&self, hash: BlakeHash, size: u64) -> Result<Fetched> {
+        if let Some(hit) = self.cached_chunk(hash, size).await? {
             return Ok(hit);
         }
-        let inner = &self.0;
-
-        let stage = if let Some(cas) = &inner.cas {
-            let length = indexed_size.expect("validated CAS index");
-            if length == 0 || length > xlb_core::chunks::CAS_CHUNK_BYTES {
-                return Err(Error::Store(format!("invalid CAS chunk length {length}")));
-            }
-            let permit = cas.transfers.clone().acquire_owned().await
-                .map_err(|_| Error::Store("CAS transfers are shutting down".into()))?;
-            let stage = Arc::new(StagedChunk::new(permit));
-            flight.send_modify(|state| state.stage = Some(stage.clone()));
-            Some(stage)
-        } else {
-            None
-        };
-
-        // The store can still hold a complete entry for a blob the cache
-        // evicted. The fetch would see it as done, so wait for the store to
-        // collect it first. This must precede the in-flight guard, which
-        // would keep the entry alive.
-        let (store, _in_flight) = if let Some(stage) = &stage {
-            (stage.store.clone(), None)
-        } else {
-            let store = self.file_store()?;
-            if store.complete_size(&hash).await.map_err(Error::Store)?.is_some()
-                && !store.wait_forgotten(&hash).await
-            {
-                return Err(Error::FetchFailed {
-                    hash,
-                    detail: "the store still holds an evicted entry".into(),
-                });
-            }
-            (store.api().clone(), Some(store.in_flight(hash)))
-        };
-
-        let incoming_dir = inner.cache.dir().join(INCOMING_DIR);
-        let sources = SwarmSources {
-            hash,
-            store: store.clone(),
-            peers: inner.peers.clone(),
-            origin: inner.origin.clone(),
-            incoming_dir,
-            indexed_size,
-            range_concurrency: inner.range_concurrency,
-        };
-        let admit = |size: u64| {
-            if stage.is_some() { Ok(()) } else { self.reserve(&hash, size) }
-        };
-        let report = flight.clone();
-        let progress = move |received: SwarmProgress| {
-            let sources = FetchSources { origin_bytes: received.origin_bytes, peers: received.peers };
-            report.send_modify(|state| {
-                state.progress = Some(FetchProgress {
-                    bytes_so_far: (received.peer_bytes + received.origin_bytes).min(received.size),
-                    total: Some(received.size),
-                    tier: if received.peer_bytes >= received.origin_bytes {
-                        FetchTier::Peer
-                    } else {
-                        FetchTier::Origin
-                    },
-                    sources,
-                })
-            });
-        };
-        let started = std::time::Instant::now();
-        let received = match swarm::fetch(sources, admit, progress).await {
-            Ok(received) => received,
-            Err(SwarmFailure::Fatal(e)) => return Err(e),
-            Err(SwarmFailure::Miss(detail)) => {
-                tracing::debug!(%hash, "fetch missed: {detail}");
-                return Err(Error::FetchFailed { hash, detail });
-            }
-        };
-        tracing::debug!(%hash, peer_bytes = received.peer_bytes, origin_bytes = received.origin_bytes,
-            elapsed_ms = started.elapsed().as_millis() as u64, "XLB verified the transfer");
-
-        let content = if let Some(cas) = &inner.cas {
-            let body = store.blobs().get_bytes(to_iroh(&hash)).await
-                .map_err(|error| Error::Store(format!("collect CAS chunk {hash}: {error}")))?;
-            let chunk = cas.cache.insert(hash, received.size, body).await?;
-            FetchedContent::Chunk(chunk.body().clone())
-        } else {
-            let path = inner.cache.path_for(&hash);
-            self.file_store()?.export_reference(&hash, path.clone()).await.map_err(Error::Store)?;
-            inner.cache.insert(hash, received.size);
-            FetchedContent::File(path)
-        };
-        if let Some(peers) = &inner.peers {
-            peers.announce(to_iroh(&hash)).await;
-        }
-        let tier = match (received.peer_bytes, received.origin_bytes) {
-            (0, 0) => FetchTier::Cache,
-            (peer, origin) if peer > origin => FetchTier::Peer,
-            _ => FetchTier::Origin,
-        };
-        Ok(Fetched {
-            content,
-            size: received.size,
-            tier,
-            peer_bytes: received.peer_bytes,
-            origin_bytes: received.origin_bytes,
-            peers: received.peers,
-        })
-    }
-
-    /// Refuse a blob larger than the whole budget, else evict ahead of it.
-    fn reserve(&self, hash: &BlakeHash, size: u64) -> Result<()> {
-        self.0
-            .cache
-            .admits(hash, size)
-            .map_err(|budget_bytes| Error::ExceedsBudget {
-                hash: *hash,
-                size,
-                budget_bytes,
-            })?;
-        self.0.cache.make_room(hash, size);
-        Ok(())
-    }
-
-    /// Fetch `hash` to its plain file and report which tier served it. The
-    /// class observer, if any, has been called when this returns.
-    async fn fetch_reported(
-        &self,
-        hash: BlakeHash,
-        indexed_size: Option<u64>,
-        sink: Option<ProgressSink>,
-    ) -> (Result<FetchedContent>, FetchReport) {
-        let started = std::time::Instant::now();
-        // File callers need the path to survive until this call returns.
-        // Chunk callers retain a Bytes handle from Foyer instead.
-        let _hold = self.0.store.as_ref().map(|_| self.0.cache.hold(hash));
-
-        let outcome = match self.local_content(&hash, indexed_size).await {
-            Ok(Some(hit)) => Ok(hit),
-            Err(error) => Err(error),
-            Ok(None) => loop {
-                let mut flight = self.join_flight(hash, indexed_size);
-                let same_length = flight.borrow().indexed_size == indexed_size;
-                let result = loop {
-                    let (progress, outcome) = {
-                        let state = flight.borrow_and_update();
-                        (state.progress.clone(), state.outcome.clone())
-                    };
-                    if let Some(outcome) = outcome {
-                        break outcome;
-                    }
-                    if let (true, Some(progress), Some(sink)) = (same_length, progress, &sink) {
-                        sink(progress);
-                    }
-                    if flight.changed().await.is_err() {
-                        break Err(Error::FetchFailed {
-                            hash,
-                            detail: "the transfer task ended without an outcome".into(),
-                        });
-                    }
-                };
-                if result.is_ok() || same_length {
-                    break result;
+        loop {
+            let (in_flight_size, mut flight) = self.join_flight(hash, size)?;
+            let outcome = flight.wait_for(Option::is_some).await.map_err(|_| Error::FetchFailed {
+                hash, detail: "the transfer task ended without an outcome".into(),
+            })?.clone().expect("completed transfer");
+            if let Ok(fetched) = &outcome {
+                if fetched.size != size {
+                    return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length")));
                 }
-                // Preserve a single staged transfer per digest, but give this
-                // caller another attempt using its own independently indexed length.
+                return outcome;
             }
-        };
-
-        let outcome = outcome.and_then(|fetched| {
-            if indexed_size.is_some_and(|length| length != fetched.size) {
-                return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length")));
+            if in_flight_size == size {
+                return outcome;
             }
-            Ok(fetched)
-        });
-        let (tier, bytes_served, peer_bytes, origin_bytes) = match &outcome {
-            Ok(fetched) => (
-                Some(fetched.tier),
-                fetched.size,
-                fetched.peer_bytes,
-                fetched.origin_bytes,
-            ),
-            Err(_) => (None, 0, 0, 0),
-        };
-        let report = FetchReport {
-            class: self.0.name,
-            hash,
-            tier,
-            peer_id: None,
-            bytes_served,
-            peer_bytes,
-            origin_bytes,
-            peers: outcome.as_ref().map(|fetched| fetched.peers.clone()).unwrap_or_default(),
-            duration_ms: started.elapsed().as_millis() as u64,
-        };
-        if let Some(observer) = &self.0.observer {
-            observer(&report);
         }
-        (outcome.map(|fetched| fetched.content), report)
     }
 }
 
-/// Rebuild the cache index from the plain files in the cache directory,
-/// oldest first so the LRU order survives a restart.
-async fn reconcile(cache: &Arc<Cache>, store: &BlobStore) -> Result<()> {
-    let mut found: Vec<(std::time::SystemTime, BlakeHash, PathBuf, u64)> = Vec::new();
-    let mut entries = tokio::fs::read_dir(cache.dir()).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let Some(hash) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| BlakeHash::from_hex(name).ok())
-        else {
-            continue;
-        };
-        let metadata = entry.metadata().await?;
-        if !metadata.is_file() {
-            continue;
-        }
-        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        found.push((modified, hash, entry.path(), metadata.len()));
-    }
-    found.sort_by_key(|(modified, hash, _, _)| (*modified, hash.to_hex()));
-
-    for (_, hash, path, len) in found {
-        // A stored length cannot detect a change to the referenced file.
-        match store.import_reference(path.clone()).await {
-            Ok((actual, tag)) if actual == hash => {
-                cache.insert(hash, len);
-                drop(tag);
-            }
-            Ok((actual, _)) => {
-                tracing::warn!(%hash, %actual, "removing cache file whose content does not match its name");
-                tokio::fs::remove_file(&path).await?;
-            }
-            Err(e) => {
-                tracing::warn!(%hash, "removing cache file the store cannot import: {e}");
-                tokio::fs::remove_file(&path).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-// ─── Asset ────────────────────────────────────────────────────────────────────
-
-/// A handle to a specific content-addressed blob within an [`AssetClass`].
+/// A chunk named by a validated model or image index.
 #[derive(Clone)]
 pub struct Asset {
     class: AssetClass,
     hash: BlakeHash,
-    indexed_size: Option<u64>,
+    size: u64,
 }
 
 impl Asset {
-    /// Fetch the blob and return the path of its plain file,
-    /// `<cache_dir>/<blake3-hex>`, trying the local cache, then the peer
-    /// set, then the origin. The content is BLAKE3-verified.
-    ///
-    /// Concurrent calls for the same hash share one transfer.
-    // [impl -> dsn~xlb-fork~1]
-    pub async fn fetch_to_file(&self) -> Result<PathBuf> {
-        self.fetch_to_file_reported(None).await.0
-    }
-
-    /// Open the verified file while the cache still holds it against eviction.
-    pub async fn open_file(&self) -> Result<tokio::fs::File> {
-        let _hold = self.class.0.cache.hold(self.hash);
-        let path = self.fetch_to_file().await?;
-        Ok(tokio::fs::File::open(path).await?)
-    }
-
-    /// As [`fetch_to_file`](Self::fetch_to_file), reporting cumulative bytes
-    /// and the serving tier to `sink`. A cache hit never invokes `sink`.
-    pub async fn fetch_to_file_with_progress(&self, sink: ProgressSink) -> Result<PathBuf> {
-        self.fetch_to_file_reported(Some(sink)).await.0
-    }
-
-    /// As [`fetch_to_file`](Self::fetch_to_file), returning the
-    /// [`FetchReport`] alongside. The report is produced on a miss too, with
-    /// `tier: None`.
-    pub async fn fetch_to_file_reported(
-        &self,
-        sink: Option<ProgressSink>,
-    ) -> (Result<PathBuf>, FetchReport) {
-        let (result, report) = self.class.fetch_reported(self.hash, self.indexed_size, sink).await;
-        (result.and_then(|content| match content {
-            FetchedContent::File(path) => Ok(path),
-            FetchedContent::Chunk(_) => Err(Error::Config("indexed CAS chunks are returned as bytes".into())),
-        }), report)
-    }
-
-    /// Read an indexed chunk from the node CAS, holding an owned byte buffer.
-    pub async fn read_chunk(&self) -> Result<bytes::Bytes> {
+    pub async fn read_chunk(&self) -> Result<Bytes> {
         self.read_chunk_reported().await.0
     }
 
-    pub async fn read_chunk_reported(&self) -> (Result<bytes::Bytes>, FetchReport) {
-        let (result, report) = self.class.fetch_reported(self.hash, self.indexed_size, None).await;
-        (result.and_then(|content| match content {
-            FetchedContent::Chunk(bytes) => Ok(bytes),
-            FetchedContent::File(_) => Err(Error::Config("chunk reads require the Foyer CAS class".into())),
-        }), report)
-    }
-
-    /// The file cache has a complete blob, or Foyer reports possible presence.
-    pub fn is_cached(&self) -> bool {
-        match &self.class.0.cas {
-            Some(cas) => cas.cache.may_hold(self.hash),
-            None => self.class.0.cache.contains(&self.hash),
+    pub async fn read_chunk_reported(&self) -> (Result<Bytes>, FetchReport) {
+        let started = Instant::now();
+        let outcome = self.class.fetch(self.hash, self.size).await;
+        let fetched = outcome.as_ref().ok();
+        let report = FetchReport {
+            class: self.class.0.name,
+            hash: self.hash,
+            tier: fetched.map(|chunk| chunk.tier),
+            peer_id: fetched.and_then(|chunk| chunk.peers.keys().next().cloned()),
+            bytes_served: fetched.map_or(0, |chunk| chunk.size),
+            peer_bytes: fetched.map_or(0, |chunk| chunk.peer_bytes),
+            origin_bytes: fetched.map_or(0, |chunk| chunk.origin_bytes),
+            peers: fetched.map(|chunk| chunk.peers.clone()).unwrap_or_default(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+        if let Some(observer) = &self.class.0.observer {
+            observer(&report);
         }
+        (outcome.map(|chunk| chunk.content), report)
     }
 
-    pub fn hash(&self) -> BlakeHash {
-        self.hash
+    pub fn is_cached(&self) -> bool {
+        self.class.0.cache.may_hold(self.hash)
     }
 }

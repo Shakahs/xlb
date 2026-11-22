@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yah-ai/xlb"
-description = "BLAKE3-verified blob distribution to plain files: local cache, iroh-blobs peers, ranged HTTP origin"
+description = "BLAKE3-verified CAS distribution through Foyer, p2panda peers, and S3"
 readme = "README.md"
 keywords = ["p2p", "content-addressed", "blob", "blake3", "iroh"]
 categories = ["network-programming", "caching"]
@@ -18,24 +18,26 @@ path = "src/lib.rs"
 # enclosing repository. These requirements mirror what that universe provides.
 [dependencies]
 xlb-core = { path = "../xlb-core", version = "0.8.51" }
-bao-tree = { version = "0.17", default-features = false }
+backon = "=1.6.0"
 blake3 = "1"
 bytes = { version = "1", features = ["serde"] }
 dashmap = "6"
 foyer = { version = "=0.22.6", features = ["serde"] }
 futures = "0.3"
-hex = "0.4"
-iroh = { version = "1.4", default-features = false, features = ["tls-aws-lc-rs"] }
-iroh-blobs = { version = "0.105", default-features = false, features = ["fs-store"] }
-iroh-gossip = { version = "0.103", default-features = false, features = ["net"] }
-iroh-smol-kv = { version = "0.5", default-features = false }
-irpc = "1"
+http = "1"
+iroh = { version = "=1.5.0", default-features = false, features = ["tls-aws-lc-rs"] }
 libc = "0.2"
+opendal = { version = "=0.59.5", default-features = false, features = ["executors-tokio", "http-transport-reqwest", "layers-retry", "layers-timeout", "services-s3"] }
+opendal-http-transport-reqwest = "=0.59.5"
+p2panda-core = "=0.8.1"
+p2panda-net = { version = "=0.8.1", default-features = false, features = ["address_book", "iroh_endpoint", "gossip", "discovery", "sync", "supervisor"] }
+p2panda-store = { version = "=0.8.1", features = ["sqlite"] }
+p2panda-sync = "=0.8.1"
 rand = "0.10"
+ractor = { version = "=0.16.6", default-features = false, features = ["tokio_runtime"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rust-fsm = "=0.8.0"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -43,4 +45,6 @@ tower = { version = "0.5", features = ["limit", "util"] }
 tracing = "0.1"
 
 [dev-dependencies]
+hex = "0.4"
+sha2 = "0.11"
 tempfile = "3"
