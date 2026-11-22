@@ -136,6 +136,36 @@ async fn disabling_peer_sourcing_uses_s3_even_with_a_known_holder() {
     }).await.expect("an S3-only reader must still serve an indexed chunk");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_limit_is_shared_across_asset_classes() {
+    let directory = tempfile::tempdir().unwrap();
+    let bodies = [Bytes::from_static(b"first chunk"), Bytes::from_static(b"second chunk")];
+    let entries: Vec<_> = bodies.iter().map(|body| (BlakeHash::hash(body), body.clone())).collect();
+    let origin = OriginServer::start_many(entries.clone()).await;
+    origin.pause(true);
+    let shared = tower::limit::GlobalConcurrencyLimitLayer::new(1);
+    let mut nodes = Vec::new();
+    for name in ["first", "second"] {
+        let mut config = AssetClassConfig::new(name, directory.path().join(name));
+        config.origin = Some(origin.config(2));
+        config.chunk_limit = Some(shared.clone());
+        nodes.push(AssetClass::register(config).await.unwrap());
+    }
+    let pulls: Vec<_> = nodes.iter().zip(&entries).map(|(node, (hash, body))| {
+        let chunk = node.indexed_chunk(*hash, body.len() as u64);
+        tokio::spawn(async move { chunk.read_chunk().await })
+    }).collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while origin.gets() == 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(origin.gets(), 1, "only one class may download at a time");
+    origin.pause(false);
+    for pull in pulls { assert!(pull.await.unwrap().is_ok()); }
+    assert_eq!(origin.gets(), 2);
+    for node in nodes { node.shutdown().await.unwrap(); }
+}
+
 // [itest -> dsn~xlb-swarm-fetch~1]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_serves_a_completed_chunk_while_the_next_chunk_is_downloading() {
@@ -199,13 +229,27 @@ async fn a_closed_transport_is_replaced_without_restarting_the_daemon() {
 }
 
 #[derive(Debug)]
-struct StalledProvider(std::sync::Arc<tokio::sync::Notify>);
+struct PacedProvider {
+    body: Bytes,
+    sent_prefix: Arc<tokio::sync::Notify>,
+    stall_after_prefix: bool,
+}
 
-impl iroh::protocol::ProtocolHandler for StalledProvider {
+impl iroh::protocol::ProtocolHandler for PacedProvider {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> std::result::Result<(), iroh::protocol::AcceptError> {
-        let (_send, mut receive) = connection.accept_bi().await?;
-        assert_eq!(receive.read_to_end(32).await.unwrap().len(), 32);
-        self.0.notify_one();
+        let (mut send, mut receive) = connection.accept_bi().await?;
+        let hash = BlakeHash::hash(&self.body);
+        assert_eq!(receive.read_to_end(32).await.unwrap(), hash.as_bytes());
+        let third = self.body.len() / 3;
+        send.write_chunk(self.body.slice(..third)).await.unwrap();
+        self.sent_prefix.notify_one();
+        if !self.stall_after_prefix {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            send.write_chunk(self.body.slice(third..2 * third)).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            send.write_chunk(self.body.slice(2 * third..)).await.unwrap();
+            send.finish().unwrap();
+        }
         connection.closed().await;
         Ok(())
     }
@@ -221,9 +265,59 @@ async fn fixture_endpoint(book: p2panda_net::AddressBook) -> p2panda_net::Endpoi
         }).spawn().await.unwrap()
 }
 
-// [itest -> dsn~xlb-chunk-discovery~1,dsn~xlb-supervised-lifecycle~1]
+fn selected_path_uses_bbr(connection: &iroh::endpoint::Connection) -> bool {
+    connection.paths().iter().find(|path| path.is_selected())
+        .and_then(|path| connection.congestion_state(path.id()))
+        .is_some_and(|controller| controller.into_any().is::<noq_proto::congestion::Bbr3>())
+}
+
+#[derive(Debug)]
+struct CheckPeerController;
+
+impl iroh::protocol::ProtocolHandler for CheckPeerController {
+    async fn accept(&self, connection: iroh::endpoint::Connection) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let (mut send, mut receive) = connection.accept_bi().await?;
+        assert_eq!(receive.read_to_end(1).await.unwrap(), [0]);
+        let uses_bbr = u8::from(selected_path_uses_bbr(&connection));
+        send.write_all(&[uses_bbr]).await.unwrap();
+        send.finish()?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stalled_peer_times_out_before_s3_fetches_the_chunk() {
+async fn xlb_endpoints_use_bbr_for_both_senders() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let directory = tempfile::tempdir().unwrap();
+        let locality = "aws/us-west-2a";
+        let reader = peer_node(&directory.path().join("reader"), locality, PeerReach::Local, None).await;
+        let holder = peer_node(&directory.path().join("holder"), locality, PeerReach::Local, None).await;
+        let holder_address = cache_address(&holder).await;
+        holder.set_peers(vec![cache_address(&reader).await]);
+        reader.set_peers(vec![holder_address.clone()]);
+        let body = Bytes::from_static(b"BBR controller test inventory");
+        let hash = BlakeHash::hash(&body);
+        cache_data(&holder, hash, body).await;
+        wait_for_records(&reader, hash, &[holder_address.node_id]).await;
+        let holder_endpoint = holder.0.peers.as_ref().unwrap().network_endpoint().unwrap();
+        let reader_endpoint = reader.0.peers.as_ref().unwrap().network_endpoint().unwrap();
+        let protocol = b"test/xlb/congestion-controller";
+        holder_endpoint.accept(protocol, CheckPeerController).await.unwrap();
+        let holder_id = p2panda_core::VerifyingKey::from_bytes(holder_address.node_id.as_bytes()).unwrap();
+        let connection = reader_endpoint.connect(holder_id, protocol).await.unwrap();
+        assert!(crate::peer::await_direct_path(&connection, Duration::from_secs(5)).await);
+        assert!(selected_path_uses_bbr(&connection), "dialing side must select BBRv3");
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(receive.read_to_end(1).await.unwrap(), [1], "accepting side must select BBRv3");
+        connection.close(iroh::endpoint::VarInt::from_u32(0), b"test complete");
+        tokio::try_join!(reader.shutdown(), holder.shutdown()).unwrap();
+    }).await.expect("verify the live QUIC controller on both ends");
+}
+
+async fn verify_paced_peer_fetch(stall_after_prefix: bool) {
     tokio::time::timeout(Duration::from_secs(15), async {
         let directory = tempfile::tempdir().unwrap();
         let body = test_data(96 * 1024);
@@ -233,8 +327,10 @@ async fn a_stalled_peer_times_out_before_s3_fetches_the_chunk() {
         let reader = peer_node(directory.path(), locality, PeerReach::Local, Some(origin.config(2))).await;
         let book = p2panda_net::AddressBook::builder().spawn().await.unwrap();
         let holder = fixture_endpoint(book).await;
-        let requested = Arc::new(tokio::sync::Notify::new());
-        holder.accept(crate::panda_chunks::CHUNK_PROTOCOL, StalledProvider(requested.clone())).await.unwrap();
+        let sent_prefix = Arc::new(tokio::sync::Notify::new());
+        holder.accept(crate::panda_chunks::CHUNK_PROTOCOL, PacedProvider {
+            body: Bytes::copy_from_slice(&body), sent_prefix: sent_prefix.clone(), stall_after_prefix,
+        }).await.unwrap();
         let endpoint = holder.endpoint().await.unwrap();
         let address = endpoint.addr();
         reader.set_peers(vec![PeerAddr {
@@ -257,17 +353,35 @@ async fn a_stalled_peer_times_out_before_s3_fetches_the_chunk() {
         let started = Instant::now();
         let asset = reader.indexed_chunk(digest, body.len() as u64);
         let downloading = tokio::spawn(async move { asset.read_chunk_reported().await });
-        requested.notified().await;
+        sent_prefix.notified().await;
         assert_eq!(origin.gets(), 0, "S3 must not race the peer");
         let (result, report) = downloading.await.unwrap();
-        assert!(started.elapsed() >= crate::panda_chunks::ATTEMPT_TIMEOUT);
+        assert!(started.elapsed() >= crate::panda_chunks::PEER_READ_IDLE);
         assert_eq!(result.unwrap().as_ref(), body);
-        assert_eq!((report.peer_bytes, report.origin_bytes), (0, body.len() as u64));
-        assert_eq!(origin.gets(), 1);
-        assert!(peers.candidates(digest).is_empty(), "the timed-out holder must be excluded");
+        let size = body.len() as u64;
+        if stall_after_prefix {
+            assert_eq!((report.peer_bytes, report.origin_bytes), (0, size));
+            assert_eq!(origin.gets(), 1);
+        } else {
+            assert_eq!((report.peer_bytes, report.origin_bytes), (size, 0));
+            assert_eq!(origin.gets(), 0);
+        }
+        assert!(peers.candidates(digest).contains(&address.id), "one timeout must not exclude the holder");
         reader.shutdown().await.unwrap();
         endpoint.close().await;
-    }).await.expect("the failed peer must give way to S3");
+    }).await.expect("the peer fetch must complete or fall back to S3");
+}
+
+// [itest -> dsn~xlb-chunk-discovery~1,dsn~xlb-supervised-lifecycle~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_peer_times_out_before_s3_fetches_the_chunk() {
+    verify_paced_peer_fetch(true).await;
+}
+
+// [itest -> dsn~xlb-chunk-discovery~1]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_progressing_peer_can_finish_after_the_idle_interval() {
+    verify_paced_peer_fetch(false).await;
 }
 
 // [itest -> dsn~xlb-peer-reach~1]
@@ -321,6 +435,24 @@ async fn retry_origin_after(first_get: FirstGet) {
 #[tokio::test]
 async fn a_throttled_origin_get_is_retried() {
     retry_origin_after(FirstGet::Throttle).await;
+}
+
+// [itest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test]
+async fn origin_chunk_gets_reuse_an_http1_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let chunks = [Bytes::from_static(b"first chunk"), Bytes::from_static(b"second chunk")]
+        .map(|body| (BlakeHash::hash(&body), body));
+    let origin = OriginServer::start_many(chunks.to_vec()).await;
+    let mut config = AssetClassConfig::new("chunks", directory.path());
+    config.origin = Some(origin.config(1));
+    let node = AssetClass::register(config).await.unwrap();
+    for (hash, body) in chunks {
+        assert_eq!(node.indexed_chunk(hash, body.len() as u64).read_chunk().await.unwrap(), body);
+    }
+    assert_eq!(origin.gets(), 2);
+    assert_eq!(origin.connections(), 1);
+    node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -379,6 +511,121 @@ async fn concurrent_indexed_chunks_use_the_direct_peer_path() {
         println!("Verified 256 MiB of indexed peer data in {elapsed:?} ({gbps:.2} Gbit/s)");
         tokio::try_join!(client.shutdown(), holder.shutdown()).unwrap();
     }).await.expect("verify a large peer fetch within 45 seconds");
+}
+
+// Explicitly run as a benchmark; excluded from the normal test gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn benchmark_hundred_concurrent_chunk_downloads() {
+    benchmark_chunk_sources(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn benchmark_hundred_concurrent_multi_peer_downloads() {
+    benchmark_chunk_sources(3).await;
+}
+
+async fn benchmark_chunk_sources(holder_count: usize) {
+    use futures::StreamExt;
+    use std::num::NonZeroUsize;
+
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).try_init();
+
+    const CHUNKS: usize = 120;
+    let directory = tempfile::tempdir().unwrap();
+    let seed = test_data(IMAGE_CHUNK_BYTES);
+    let chunks: Vec<_> = (0..CHUNKS).map(|ordinal| {
+        let mut body = seed.clone();
+        body[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+        let body = Bytes::from(body);
+        (BlakeHash::hash(&body), body)
+    }).collect();
+    let limit = NonZeroUsize::new(100).unwrap();
+    let limits = || RequestLimits::new(limit, limit, limit).unwrap();
+    let s3 = OriginServer::start_many(chunks.clone()).await;
+    let mut config = AssetClassConfig::new("chunks", directory.path().join("s3-client"));
+    config.cas_memory_bytes = 1536 << 20;
+    config.origin = Some(s3.config(100));
+    let s3_limits = limits();
+    config.request_limits = Some(s3_limits.clone());
+    config.chunk_limit = Some(tower::limit::GlobalConcurrencyLimitLayer::new(100));
+    let client = AssetClass::register(config).await.unwrap();
+    let started = Instant::now();
+    let results: Vec<_> = futures::stream::iter(chunks.iter().map(|(hash, body)| {
+        let client = &client;
+        async move { client.indexed_chunk(*hash, body.len() as u64).read_chunk_reported().await }
+    })).buffer_unordered(100).collect().await;
+    let elapsed = started.elapsed();
+    let success = results.iter().filter(|(result, report)| result.is_ok() && report.origin_bytes == IMAGE_CHUNK_BYTES as u64).count();
+    let stats = client.s3_request_stats().unwrap();
+    println!("S3: {success}/{CHUNKS} chunks, {elapsed:?}, {:.2} Gbit/s, peak {} S3 requests, {} GETs, limits {:?}", (success * IMAGE_CHUNK_BYTES) as f64 * 8.0 / elapsed.as_secs_f64() / 1e9, stats.peak_chunks, s3.gets(), s3_limits.stats());
+    assert_eq!(success, CHUNKS);
+    client.shutdown().await.unwrap();
+    drop(client);
+    drop(s3);
+
+    let peer_limits = limits();
+    let make_config = |path: &str| {
+        let mut config = AssetClassConfig::new("chunks", directory.path().join(path));
+        config.cas_memory_bytes = if path.starts_with("holder") { 2560 << 20 } else { 1536 << 20 };
+        config.request_limits = Some(peer_limits.clone());
+        config.chunk_limit = Some(tower::limit::GlobalConcurrencyLimitLayer::new(100));
+        config.peer = Some(PeerConfig { bind_addr: BIND, relay: RelaySetting::Disabled, concurrency: limit, ..PeerConfig::default() });
+        config
+    };
+    let mut holders = Vec::new();
+    for index in 0..holder_count {
+        holders.push(AssetClass::register(make_config(&format!("holder-{index}"))).await.unwrap());
+    }
+    let client = AssetClass::register(make_config("peer-client")).await.unwrap();
+    let topology = NodeTopology { provider: "aws".into(), location: "aws/us-west-2a".into(), region: None, zone: None, reach: PeerReach::Local };
+    client.set_node_topology(Some(topology.clone()));
+    let client_address = cache_address(&client).await;
+    let mut addresses = Vec::new();
+    let mut holder_ids = Vec::new();
+    for holder in &holders {
+        holder.set_node_topology(Some(topology.clone()));
+        holder.set_peers(vec![client_address.clone()]);
+        addresses.push(cache_address(holder).await);
+        holder_ids.push(holder.node_id().unwrap());
+        for (hash, body) in &chunks { cache_data(holder, *hash, body.clone()).await; }
+        for (hash, body) in &chunks {
+            assert!(holder.0.cache.get(*hash).await.unwrap().is_some(), "holder must retain chunk {hash} ({} bytes)", body.len());
+        }
+    }
+    client.set_peers(addresses);
+    for (hash, _) in &chunks { wait_for_records(&client, *hash, &holder_ids).await; }
+    const ROUNDS: usize = 5;
+    let started = Instant::now();
+    let mut success = 0;
+    let mut peer_transfers = 0;
+    let mut cache_hits = 0;
+    let mut peer_bytes = std::collections::BTreeMap::<String, u64>::new();
+    for round in 0..ROUNDS {
+        if round > 0 {
+            for (hash, _) in &chunks { client.0.cache.evict_for_test(*hash); }
+        }
+        let results: Vec<_> = futures::stream::iter(chunks.iter().map(|(hash, body)| {
+            let client = &client;
+            async move { client.indexed_chunk(*hash, body.len() as u64).read_chunk_reported().await }
+        })).buffer_unordered(100).collect().await;
+        let completed = results.iter().filter(|(result, _)| result.is_ok()).count();
+        let from_peers = results.iter().filter(|(result, report)| result.is_ok() && report.peer_bytes == IMAGE_CHUNK_BYTES as u64).count();
+        let from_cache = results.iter().filter(|(result, report)| result.is_ok() && matches!(report.tier, Some(FetchTier::Cache))).count();
+        peer_transfers += from_peers;
+        cache_hits += from_cache;
+        for (_, report) in &results {
+            for (peer, bytes) in &report.peers { *peer_bytes.entry(peer.clone()).or_default() += bytes; }
+        }
+        success += completed;
+        println!("Peer round {}: {completed}/{CHUNKS} chunks, {from_peers} peer, {from_cache} cached", round + 1);
+    }
+    let elapsed = started.elapsed();
+    println!("Peer total: {success}/{} chunks, {peer_transfers} peer, {cache_hits} cached, {elapsed:?}, {:.2} Gbit/s, limits {:?}, peer bytes {peer_bytes:?}", CHUNKS * ROUNDS, (peer_transfers * IMAGE_CHUNK_BYTES) as f64 * 8.0 / elapsed.as_secs_f64() / 1e9, peer_limits.stats());
+    client.shutdown().await.unwrap();
+    for holder in holders { holder.shutdown().await.unwrap(); }
+    assert_eq!(success, CHUNKS * ROUNDS);
 }
 
 // [itest -> dsn~xlb-foyer-cas~1]

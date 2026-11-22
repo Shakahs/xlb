@@ -131,6 +131,7 @@ impl ModelMount {
             tier: Some(fetch_tier(peer_bytes, sources.origin_bytes)), peer_id: None,
             bytes_served: total, peer_bytes, origin_bytes: sources.origin_bytes, peers: sources.peers,
             duration_ms: started.elapsed().as_millis() as u64,
+            failure_kind: None,
         })
     }
 

@@ -14,6 +14,9 @@ XLB_DEPS = [
         "@scheduler_crates//:bytes",
         "@scheduler_crates//:futures",
         "@scheduler_crates//:libc",
+        "@scheduler_crates//:opentelemetry",
+        "@scheduler_crates//:opentelemetry-otlp",
+        "@scheduler_crates//:opentelemetry_sdk",
         "@scheduler_crates//:rand",
         "@scheduler_crates//:ractor",
         "@scheduler_crates//:rust-fsm",
@@ -23,6 +26,8 @@ XLB_DEPS = [
         "@scheduler_crates//:tokio-util",
         "@scheduler_crates//:tower",
         "@scheduler_crates//:tracing",
+        "@scheduler_crates//:tracing-appender-0.2.5",
+        "@scheduler_crates//:tracing-opentelemetry",
         "@scheduler_crates//:tracing-subscriber",
 ]
 

@@ -21,7 +21,7 @@ mod swarm_tests;
 pub use metrics::{FetchObserver, FetchReport};
 pub use origin::{Credentials, OriginConfig, S3RequestEvent, S3RequestStats};
 pub use peer::{NodeId, PeerAddr, PeerConfig, RelaySetting, RelayUrl};
-pub use request_limits::RequestLimits;
+pub use request_limits::{RequestLimits, RequestStats};
 pub use source::{FetchProgress, FetchTier, ProgressSink};
 pub use xlb_core::{BlakeHash, FetchSources, InvalidHash, NodeTopology};
 
@@ -64,6 +64,21 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl Error {
+    fn failure_kind(&self) -> &'static str {
+        match self {
+            Self::FetchFailed { detail, .. } if detail.contains("timed out") => "timeout",
+            Self::FetchFailed { detail, .. } if detail.contains("wrong chunk length") => "invalid_length",
+            Self::FetchFailed { detail, .. } if detail.contains("does not hold") || detail.contains("no eligible peer") => "unavailable",
+            Self::FetchFailed { detail, .. } if detail.starts_with("origin:") => "origin",
+            Self::FetchFailed { .. } => "peer_or_source",
+            Self::OriginRejected { .. } | Self::HashMismatch { .. } => "integrity",
+            Self::Store(_) | Self::Io(_) => "storage",
+            Self::Config(_) | Self::InvalidHash(_) => "configuration",
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Configuration for one indexed CAS namespace.
@@ -75,6 +90,7 @@ pub struct AssetClassConfig {
     pub peer: Option<PeerConfig>,
     pub origin: Option<OriginConfig>,
     pub request_limits: Option<RequestLimits>,
+    pub chunk_limit: Option<tower::limit::GlobalConcurrencyLimitLayer>,
     pub observer: Option<FetchObserver>,
 }
 
@@ -88,6 +104,7 @@ impl AssetClassConfig {
             peer: None,
             origin: None,
             request_limits: None,
+            chunk_limit: None,
             observer: None,
         }
     }
@@ -135,6 +152,7 @@ struct ClassInner {
     origin: Option<Origin>,
     flights: Mutex<HashMap<BlakeHash, (u64, Flight)>>,
     transfers: TaskTracker,
+    chunk_limit: Option<tower::limit::GlobalConcurrencyLimitLayer>,
     shutdown: CancellationToken,
 }
 
@@ -174,6 +192,7 @@ impl AssetClass {
             origin,
             flights: Mutex::default(),
             transfers: TaskTracker::new(),
+            chunk_limit: config.chunk_limit,
             shutdown: CancellationToken::new(),
         })))
     }
@@ -290,16 +309,26 @@ impl AssetClass {
         let (tx, rx) = watch::channel(None);
         flights.insert(hash, (size, rx.clone()));
         let class = self.clone();
+        use tracing::Instrument;
         self.0.transfers.spawn(async move {
+            use tower::{Layer, ServiceExt};
+            let limit = class.0.chunk_limit.clone();
             let outcome = tokio::select! {
-                result = class.transfer_chunk(hash, size) => result,
+                result = async {
+                    if let Some(limit) = limit {
+                        let transfer = tower::service_fn(|()| class.transfer_chunk(hash, size));
+                        limit.layer(transfer).oneshot(()).await
+                    } else {
+                        class.transfer_chunk(hash, size).await
+                    }
+                } => result,
                 () = class.0.shutdown.cancelled() => Err(Error::FetchFailed {
                     hash, detail: "XLB is shutting down".into(),
                 }),
             };
             class.0.flights.lock().unwrap().remove(&hash);
             tx.send_replace(Some(outcome));
-        });
+        }.instrument(tracing::Span::current()));
         Ok((size, rx))
     }
 
@@ -423,6 +452,7 @@ impl Asset {
         self.read_chunk_reported().await.0
     }
 
+    #[tracing::instrument(name = "xlb.chunk.fetch", skip_all, fields(class = self.class.0.name, hash = %self.hash, source = tracing::field::Empty, peer = tracing::field::Empty, bytes = tracing::field::Empty, success = tracing::field::Empty, error = tracing::field::Empty))]
     pub async fn read_chunk_reported(&self) -> (Result<Bytes>, FetchReport) {
         let started = Instant::now();
         let outcome = self.class.fetch(self.hash, self.size).await;
@@ -437,7 +467,17 @@ impl Asset {
             origin_bytes: fetched.map_or(0, |chunk| chunk.origin_bytes),
             peers: fetched.map(|chunk| chunk.peers.clone()).unwrap_or_default(),
             duration_ms: started.elapsed().as_millis() as u64,
+            failure_kind: outcome.as_ref().err().map(Error::failure_kind),
         };
+        let span = tracing::Span::current();
+        span.record("source", report.tier_label());
+        span.record("peer", report.peer_id.as_deref().unwrap_or(""));
+        span.record("bytes", report.bytes_served);
+        span.record("success", outcome.is_ok());
+        if let Err(error) = &outcome {
+            span.record("error", tracing::field::display(error));
+            tracing::warn!(class = self.class.0.name, hash = %self.hash, cause = %error, kind = error.failure_kind(), "XLB chunk fetch failed");
+        }
         if let Some(observer) = &self.class.0.observer {
             observer(&report);
         }

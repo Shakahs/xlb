@@ -10,21 +10,71 @@ pub use iroh::RelayUrl;
 pub type NodeId = EndpointId;
 pub const DEFAULT_PEER_PORT: u16 = 4433;
 pub const DEFAULT_PEER_CONCURRENCY: usize = 16;
-const PEER_EXCLUSION: Duration = Duration::from_secs(60);
+pub(crate) const PEER_EXCLUSION: Duration = Duration::from_secs(60);
+pub(crate) const PEER_FAILURES: u8 = 3;
+
+#[derive(Clone, Copy, Debug)]
+enum PeerState {
+    Ready(u8),
+    Excluded(Instant),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PeerOutcome {
+    Success,
+    Failure(Instant),
+    Expire,
+}
+
+struct PeerHealth;
+
+impl rust_fsm::StateMachineImpl for PeerHealth {
+    type State = PeerState;
+    type Input = PeerOutcome;
+    type Output = ();
+
+    const INITIAL_STATE: PeerState = PeerState::Ready(0);
+
+    fn transition(state: &PeerState, outcome: &PeerOutcome) -> Option<PeerState> {
+        match (state, outcome) {
+            (PeerState::Ready(_), PeerOutcome::Success) => Some(PeerState::Ready(0)),
+            (PeerState::Ready(count), PeerOutcome::Failure(now)) if *count + 1 >= PEER_FAILURES => Some(PeerState::Excluded(*now + PEER_EXCLUSION)),
+            (PeerState::Ready(count), PeerOutcome::Failure(_)) => Some(PeerState::Ready(*count + 1)),
+            (PeerState::Excluded(_), PeerOutcome::Success | PeerOutcome::Expire) => Some(PeerState::Ready(0)),
+            (PeerState::Excluded(until), PeerOutcome::Failure(_)) => Some(PeerState::Excluded(*until)),
+            _ => None,
+        }
+    }
+
+    fn output(_: &PeerState, _: &PeerOutcome) -> Option<()> { None }
+}
 
 #[derive(Default)]
-pub(crate) struct FailedPeers(Mutex<HashMap<NodeId, Instant>>);
+pub(crate) struct FailedPeers(Mutex<HashMap<NodeId, rust_fsm::StateMachine<PeerHealth>>>);
 
 impl FailedPeers {
-    pub(crate) fn insert(&self, node: NodeId, now: Instant) {
+    pub(crate) fn insert(&self, node: NodeId, now: Instant) -> bool {
         let mut peers = self.0.lock().unwrap_or_else(|err| err.into_inner());
-        peers.retain(|_, until| *until > now);
-        peers.insert(node, now + PEER_EXCLUSION);
+        let state = peers.entry(node).or_default();
+        if matches!(state.state(), PeerState::Excluded(until) if *until <= now) {
+            state.consume(&PeerOutcome::Expire).expect("valid peer expiry");
+        }
+        let already_excluded = matches!(state.state(), PeerState::Excluded(_));
+        state.consume(&PeerOutcome::Failure(now)).expect("valid peer failure");
+        !already_excluded && matches!(state.state(), PeerState::Excluded(_))
     }
 
     pub(crate) fn contains(&self, node: &NodeId, now: Instant) -> bool {
-        self.0.lock().unwrap_or_else(|err| err.into_inner())
-            .get(node).is_some_and(|until| *until > now)
+        self.0.lock().unwrap_or_else(|err| err.into_inner()).get(node)
+            .is_some_and(|state| matches!(state.state(), PeerState::Excluded(until) if *until > now))
+    }
+
+    pub(crate) fn success(&self, node: NodeId) {
+        let mut peers = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(state) = peers.get_mut(&node) {
+            state.consume(&PeerOutcome::Success).expect("valid peer success");
+            peers.remove(&node);
+        }
     }
 }
 
@@ -34,11 +84,18 @@ mod retry_tests {
 
     // [utest -> dsn~xlb-chunk-discovery~1]
     #[test]
-    fn a_failure_excludes_only_that_holder_for_sixty_seconds() {
+    fn three_consecutive_failures_exclude_only_that_holder_for_sixty_seconds() {
         let failures = FailedPeers::default();
         let failed = iroh::SecretKey::generate().public();
         let healthy = iroh::SecretKey::generate().public();
         let now = Instant::now();
+        failures.insert(failed, now);
+        failures.insert(failed, now);
+        assert!(!failures.contains(&failed, now));
+        failures.success(failed);
+        failures.insert(failed, now);
+        failures.insert(failed, now);
+        assert!(!failures.contains(&failed, now));
         failures.insert(failed, now);
         assert!(failures.contains(&failed, now + Duration::from_secs(59)));
         assert!(!failures.contains(&failed, now + Duration::from_secs(60)));

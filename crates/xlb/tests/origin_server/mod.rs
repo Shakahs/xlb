@@ -3,6 +3,7 @@
 mod sigv4;
 
 use std::{
+    collections::HashMap,
     num::NonZeroUsize,
     sync::{Arc, atomic::{AtomicUsize, Ordering}},
 };
@@ -16,6 +17,7 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{BlakeHash, Credentials, OriginConfig};
+use bytes::Bytes;
 
 const BUCKET: &str = "artifacts";
 const REGION: &str = "auto";
@@ -47,11 +49,11 @@ pub enum FirstGet {
 
 struct Served {
     host: String,
-    path: String,
-    body: Vec<u8>,
+    bodies: HashMap<String, Bytes>,
     first_get: Option<FirstGet>,
     paused: watch::Sender<bool>,
     gets: AtomicUsize,
+    connections: AtomicUsize,
 }
 
 pub struct OriginServer {
@@ -65,14 +67,22 @@ impl OriginServer {
     }
 
     pub async fn start_with(hash: BlakeHash, body: Vec<u8>, first_get: Option<FirstGet>) -> Self {
+        Self::start_many_with(vec![(hash, Bytes::from(body))], first_get).await
+    }
+
+    pub async fn start_many(bodies: Vec<(BlakeHash, Bytes)>) -> Self {
+        Self::start_many_with(bodies, None).await
+    }
+
+    async fn start_many_with(bodies: Vec<(BlakeHash, Bytes)>, first_get: Option<FirstGet>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let served = Arc::new(Served {
             host: listener.local_addr().unwrap().to_string(),
-            path: format!("/{BUCKET}/models/blake3/{}", hash.to_hex()),
-            body,
+            bodies: bodies.into_iter().map(|(hash, body)| (format!("/{BUCKET}/models/blake3/{}", hash.to_hex()), body)).collect(),
             first_get,
             paused: watch::Sender::new(false),
             gets: AtomicUsize::new(0),
+            connections: AtomicUsize::new(0),
         });
         let accepting = served.clone();
         let server = tokio::spawn(async move {
@@ -81,6 +91,7 @@ impl OriginServer {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { return };
+                        accepting.connections.fetch_add(1, Ordering::Relaxed);
                         connections.spawn(serve_connection(stream, accepting.clone()));
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -92,6 +103,10 @@ impl OriginServer {
 
     pub fn gets(&self) -> usize {
         self.served.gets.load(Ordering::Relaxed)
+    }
+
+    pub fn connections(&self) -> usize {
+        self.served.connections.load(Ordering::Relaxed)
     }
 
     pub fn pause(&self, paused: bool) {
@@ -112,11 +127,15 @@ impl OriginServer {
 }
 
 async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
+    while serve_request(&mut stream, &served).await {}
+}
+
+async fn serve_request(stream: &mut TcpStream, served: &Served) -> bool {
     let mut buffer = Vec::new();
     while !buffer.ends_with(b"\r\n\r\n") {
         let mut bytes = [0; 4096];
         match stream.read(&mut bytes).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return false,
             Ok(length) => buffer.extend_from_slice(&bytes[..length]),
         }
     }
@@ -124,6 +143,7 @@ async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
     let mut request = head.lines().next().unwrap_or_default().split(' ');
     let method = request.next().unwrap_or_default();
     let path = request.next().unwrap_or_default();
+    let version = request.next().unwrap_or_default();
     let header = |name: &str| {
         head.lines().skip(1).find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -150,12 +170,14 @@ async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
         header("x-amz-date"),
     );
     let mut first_get = None;
-    let (status, length, payload) = if auth != expected.authorization || header("host") != served.host {
+    let (status, length, payload) = if version != "HTTP/1.1" {
+        ("505 HTTP Version Not Supported", 0, &[][..])
+    } else if auth != expected.authorization || header("host") != served.host {
         ("403 Forbidden", 0, &[][..])
-    } else if path != served.path {
+    } else if !served.bodies.contains_key(path) {
         ("404 Not Found", 0, &[][..])
     } else if method == "HEAD" {
-        ("200 OK", served.body.len(), &[][..])
+        ("200 OK", served.bodies[path].len(), &[][..])
     } else if method == "GET" && header("range").is_empty() {
         if served.gets.fetch_add(1, Ordering::Relaxed) == 0 {
             first_get = served.first_get;
@@ -165,17 +187,20 @@ async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
         if matches!(first_get, Some(FirstGet::Throttle)) {
             ("429 Too Many Requests", 0, &[][..])
         } else {
-            ("200 OK", served.body.len(), served.body.as_slice())
+            ("200 OK", served.bodies[path].len(), served.bodies[path].as_ref())
         }
     } else {
         ("400 Bad Request", 0, &[][..])
     };
-    let response = format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(response.as_bytes()).await.is_ok() {
-        let length = match first_get {
-            Some(FirstGet::Disconnect(prefix)) => prefix.min(payload.len()),
-            _ => payload.len(),
-        };
-        let _ = stream.write_all(&payload[..length]).await;
-    }
+    let keep_alive = !matches!(first_get, Some(FirstGet::Disconnect(_)))
+        && !header("connection").eq_ignore_ascii_case("close");
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: {connection}\r\n\r\n");
+    let payload_length = match first_get {
+        Some(FirstGet::Disconnect(prefix)) => prefix.min(payload.len()),
+        _ => payload.len(),
+    };
+    stream.write_all(response.as_bytes()).await.is_ok()
+        && stream.write_all(&payload[..payload_length]).await.is_ok()
+        && keep_alive
 }

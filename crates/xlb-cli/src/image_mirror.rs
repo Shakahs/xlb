@@ -16,7 +16,6 @@ use futures::{StreamExt, TryStreamExt, stream};
 use rand::seq::SliceRandom;
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::task::AbortOnDropHandle;
-use tower::{Layer, Service, ServiceExt, limit::GlobalConcurrencyLimitLayer, service_fn};
 use xlb::{Asset, AssetClass, BlakeHash};
 use xlb_core::chunks::positioned_value;
 use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_DIGEST_PREFIX, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex, is_digest_hex};
@@ -26,7 +25,6 @@ struct ImageMirror {
     class: AssetClass,
     index: Arc<RwLock<HashMap<String, Arc<ImageBlobIndex>>>>,
     concurrency: usize,
-    chunk_limit: GlobalConcurrencyLimitLayer,
 }
 
 // [impl -> dsn~xlb-image-mirror~1]
@@ -47,7 +45,6 @@ fn router(class: AssetClass, concurrency: usize) -> Router {
         .route("/v2/{*path}", get(serve_blob))
         .with_state(ImageMirror {
             class, index: Arc::default(), concurrency,
-            chunk_limit: GlobalConcurrencyLimitLayer::new(concurrency),
         })
 }
 
@@ -77,13 +74,12 @@ impl ImageMirror {
         anyhow::ensure!(blob.matches_root(hash), "OCI blob index differs from its BLAKE3 digest");
         HeaderValue::from_str(&blob.media_type).context("invalid indexed OCI media type")?;
         if blob.chunks.len() > 1 && blob.chaining_values.is_empty() {
-            let limit = &self.chunk_limit;
             let blob = &blob;
             let mut chunks = stream::iter(0..blob.chunks.len()).map(|position| {
                 let offset = position as u64 * IMAGE_CHUNK_BYTES as u64;
                 let size = (blob.size_bytes - offset).min(IMAGE_CHUNK_BYTES as u64);
                 let chunk = self.class.indexed_chunk(blob.chunks[position], size);
-                limit.layer(service_fn(open_slice)).oneshot((chunk, 0..size as usize, None))
+                open_slice((chunk, 0..size as usize, None))
             }).buffered(self.concurrency);
             let mut hasher = blake3::Hasher::new();
             while let Some(bytes) = chunks.try_next().await? {
@@ -169,7 +165,6 @@ impl ImageMirror {
         let first = start / chunk_bytes;
         let last = end.div_ceil(chunk_bytes);
         let width = self.concurrency;
-        let limit = self.chunk_limit.clone();
         let cached = self.index.clone();
         let resolved = blob.clone();
         let sources = stream::iter((first..last).step_by(width))
@@ -182,12 +177,8 @@ impl ImageMirror {
                     let asset = class.indexed_chunk(blob.chunks[position as usize], size);
                     let range = start.saturating_sub(offset) as usize..(end - offset).min(size) as usize;
                     let positioned = blob.chaining_values.get(position as usize).map(|value| (offset, *value));
-                    let mut open = limit.layer(service_fn(open_slice));
                     let pull = tokio::spawn(async move {
-                        open.ready().await?;
-                        // The asset store finishes a shared fetch after its caller drops.
-                        // Keep the Tower permit until that fetch finishes, too.
-                        tokio::spawn(open.call((asset, range, positioned))).await?
+                        open_slice((asset, range, positioned)).await
                     });
                     (position, AbortOnDropHandle::new(pull))
                 }).collect();

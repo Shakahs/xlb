@@ -22,10 +22,10 @@ use crate::{
     BlakeHash, Error, NodeId, NodeTopology, PeerAddr, PeerConfig, RequestLimits, Result,
     cas_cache::{CasCache, VerifiedChunk},
     inventory_publication::{InventoryPublication, Output as PublicationAction},
-    panda_chunks::{ATTEMPT_TIMEOUT, CHUNK_PROTOCOL, ChunkConnections, ChunkProvider},
+    panda_chunks::{CHUNK_PROTOCOL, ChunkConnections, ChunkProvider},
     panda_inventory::{InventoryRecord, InventoryView},
     panda_network::{PandaNetwork, inventory_network_id, network_error},
-    peer::FailedPeers,
+    peer::{FailedPeers, PEER_EXCLUSION, PEER_FAILURES},
 };
 
 rust_fsm::state_machine! {
@@ -452,6 +452,11 @@ impl PandaPeers {
         self.view.read().unwrap().endpoint.as_ref().map(|(_, endpoint)| endpoint.clone())
     }
 
+    #[cfg(test)]
+    pub(super) fn network_endpoint(&self) -> Option<p2panda_net::Endpoint> {
+        self.view.read().unwrap().endpoint.as_ref().map(|(endpoint, _)| endpoint.clone())
+    }
+
     pub(crate) fn candidates(&self, hash: BlakeHash) -> Vec<NodeId> {
         let view = self.view.read().unwrap();
         let Some(topology) = &view.settings.topology else { return Vec::new() };
@@ -469,6 +474,7 @@ impl PandaPeers {
         local
     }
 
+    #[tracing::instrument(name = "xlb.peer.attempt", skip_all, fields(peer = %node, hash = %hash, bytes = size, error = tracing::field::Empty))]
     pub(crate) async fn fetch(&self, node: NodeId, hash: BlakeHash, size: usize) -> Result<Option<VerifiedChunk>> {
         let _slot = self.limits.peer().await;
         let endpoint = {
@@ -479,14 +485,28 @@ impl PandaPeers {
             view.endpoint.as_ref().map(|(endpoint, _)| endpoint.clone())
         };
         let Some(endpoint) = endpoint else { return Ok(None) };
-        let transfer = async {
-            let bytes = self.connections.fetch(&endpoint, node, hash, size).await.map_err(Error::Store)?;
-            VerifiedChunk::verify(hash, size as u64, bytes).await.map(Some)
+        let result = match self.connections.fetch(&endpoint, node, hash, size).await {
+            Ok(bytes) => VerifiedChunk::verify(hash, size as u64, bytes).await.map(Some),
+            Err(error) => Err(Error::Store(error)),
         };
-        let result = tokio::time::timeout(ATTEMPT_TIMEOUT, transfer).await
-            .unwrap_or_else(|_| Err(Error::Store("peer attempt timed out".into())));
-        if result.is_err() {
-            self.failed.insert(node, Instant::now());
+        if let Err(error) = &result {
+            use opentelemetry::{KeyValue, global, metrics::Counter};
+            static FAILED: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
+            let detail = error.to_string();
+            let cause = if detail.contains("timed out") { "timeout" }
+                else if detail.contains("wrong chunk length") { "invalid_length" }
+                else if detail.contains("does not hold") { "unavailable" }
+                else if detail.contains("hash mismatch") { "integrity" }
+                else { "transport_or_storage" };
+            FAILED.get_or_init(|| global::meter("imgcloud.xlb").u64_counter("xlb.peer.attempt.failures").build())
+                .add(1, &[KeyValue::new("failure.kind", cause)]);
+            tracing::Span::current().record("error", tracing::field::display(error));
+            tracing::warn!(%node, %hash, %error, "XLB peer chunk attempt failed");
+            if self.failed.insert(node, Instant::now()) {
+                tracing::warn!(%node, %error, consecutive_failures = PEER_FAILURES, exclusion_seconds = PEER_EXCLUSION.as_secs(), "XLB peer temporarily excluded");
+            }
+        } else if matches!(result, Ok(Some(_))) {
+            self.failed.success(node);
         }
         result
     }

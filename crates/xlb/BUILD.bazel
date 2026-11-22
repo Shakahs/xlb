@@ -18,8 +18,10 @@ rust_library(
         "@scheduler_crates//:http",
         "@scheduler_crates//:iroh",
         "@scheduler_crates//:libc",
+        "@scheduler_crates//:noq-proto-1.5.0",
         "@scheduler_crates//:opendal",
         "@scheduler_crates//:opendal-http-transport-reqwest",
+        "@scheduler_crates//:opentelemetry",
         "@scheduler_crates//:p2panda-core",
         "@scheduler_crates//:p2panda-net",
         "@scheduler_crates//:p2panda-store",
@@ -49,7 +51,32 @@ rust_test(
         "@scheduler_crates//:hex",
         "@scheduler_crates//:sha2",
         "@scheduler_crates//:tempfile",
+        "@scheduler_crates//:tracing-subscriber",
     ],
+)
+
+rust_test(
+    name = "chunk_concurrency_benchmark",
+    crate = ":xlb",
+    args = ["--ignored", "--exact", "--nocapture", "swarm_tests::benchmark_hundred_concurrent_chunk_downloads"],
+    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    edition = "2021",
+    exec_properties = {"test.workload-isolation-type": "firecracker", "test.network-enable-ipv6": "true", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
+    size = "large",
+    tags = ["manual", "cpu:8"],
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+)
+
+rust_test(
+    name = "multi_peer_concurrency_benchmark",
+    crate = ":xlb",
+    args = ["--ignored", "--exact", "--nocapture", "swarm_tests::benchmark_hundred_concurrent_multi_peer_downloads"],
+    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    edition = "2021",
+    exec_properties = {"test.workload-isolation-type": "firecracker", "test.network-enable-ipv6": "true", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
+    size = "large",
+    tags = ["manual", "cpu:8"],
+    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])

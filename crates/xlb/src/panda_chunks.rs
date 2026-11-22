@@ -12,6 +12,8 @@ use iroh::{
 use p2panda_net::Endpoint;
 use tokio::sync::OnceCell;
 use tokio_util::task::AbortOnDropHandle;
+use opentelemetry::{KeyValue, global, metrics::Counter};
+use tracing::Instrument;
 
 use crate::{
     BlakeHash, NodeId,
@@ -20,7 +22,14 @@ use crate::{
 };
 
 pub(crate) const CHUNK_PROTOCOL: &[u8] = b"xlb/cas-chunk/1";
-pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PEER_READ_IDLE: Duration = Duration::from_secs(5);
+
+fn record_upload_failure(cause: &'static str) {
+    static FAILED: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
+    FAILED.get_or_init(|| global::meter("imgcloud.xlb").u64_counter("xlb.peer.upload.failures").build())
+        .add(1, &[KeyValue::new("failure.kind", cause)]);
+}
 
 #[derive(Clone)]
 pub(crate) struct ChunkProvider {
@@ -39,7 +48,7 @@ impl fmt::Debug for ChunkProvider {
 impl ProtocolHandler for ChunkProvider {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
-        if !(self.admitted)(peer) || !await_direct_path(&connection, ATTEMPT_TIMEOUT).await {
+        if !(self.admitted)(peer) || !await_direct_path(&connection, PEER_SETUP_TIMEOUT).await {
             connection.close(VarInt::from_u32(0), b"peer unavailable");
             return Ok(());
         }
@@ -48,9 +57,22 @@ impl ProtocolHandler for ChunkProvider {
             let streams = connection.accept_bi().await.ok()?;
             Some(((connection.clone(), streams), connection))
         })
-        .for_each_concurrent(self.concurrency, |(connection, (send, receive))| async move {
+        .for_each_concurrent(self.concurrency, |(connection, (mut send, receive))| async move {
             if (self.admitted)(peer) && connection_verdict(&connection) == PathVerdict::Direct {
-                let _ = tokio::time::timeout(ATTEMPT_TIMEOUT, self.serve(send, receive)).await;
+                let span = tracing::info_span!("xlb.peer.upload", %peer, hash = tracing::field::Empty, error = tracing::field::Empty);
+                async {
+                    match self.serve(&mut send, receive).await {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let _ = send.reset(VarInt::from_u32(1));
+                            tracing::Span::current().record("error", error.as_str());
+                            record_upload_failure("transfer_error");
+                            tracing::warn!(%peer, %error, "XLB peer upload failed");
+                        }
+                    }
+                }.instrument(span).await;
+            } else {
+                let _ = send.reset(VarInt::from_u32(1));
             }
         })
         .await;
@@ -59,12 +81,16 @@ impl ProtocolHandler for ChunkProvider {
 }
 
 impl ChunkProvider {
-    async fn serve(&self, mut send: SendStream, mut receive: RecvStream) -> Result<(), String> {
-        let mut digest = [0; 32];
-        receive.read_exact(&mut digest).await.map_err(|error| error.to_string())?;
-        if receive.read_chunk(1).await.map_err(|error| error.to_string())?.is_some() {
-            return Err("CAS request has trailing bytes".into());
-        }
+    async fn serve(&self, send: &mut SendStream, mut receive: RecvStream) -> Result<(), String> {
+        let digest = tokio::time::timeout(PEER_SETUP_TIMEOUT, async {
+            let mut digest = [0; 32];
+            receive.read_exact(&mut digest).await.map_err(|error| error.to_string())?;
+            if receive.read_chunk(1).await.map_err(|error| error.to_string())?.is_some() {
+                return Err("CAS request has trailing bytes".to_owned());
+            }
+            Ok(digest)
+        }).await.map_err(|_| "peer request timed out".to_owned())??;
+        tracing::Span::current().record("hash", tracing::field::display(BlakeHash::from_bytes(digest)));
         if let Some(chunk) = self.cache.get(BlakeHash::from_bytes(digest)).await.map_err(|error| error.to_string())? {
             send.write_chunk(chunk.body().clone()).await.map_err(|error| error.to_string())?;
         }
@@ -101,15 +127,30 @@ impl ChunkConnections {
             self.peers.remove_if(&node, |_, current| Arc::ptr_eq(current, &cell));
         }
         let cell = self.peers.entry(node).or_default().clone();
-        let peer = cell.get_or_try_init(|| connect(endpoint, node)).await?;
-        read_chunk(&peer.connection, digest, size).await
+        let (peer, mut receive) = tokio::time::timeout(PEER_SETUP_TIMEOUT, async {
+            let peer = cell.get_or_try_init(|| connect(endpoint, node)).await?;
+            let receive = request_chunk(&peer.connection, digest).await?;
+            Ok::<_, String>((peer, receive))
+        })
+        .await
+        .map_err(|_| "peer setup timed out before the CAS request was sent".to_owned())??;
+
+        read_chunk(&mut receive, size).await.map_err(|error| {
+            let paths = peer.connection.paths();
+            if let Some(path) = paths.iter().find(|path| path.is_selected()) {
+                let stats = path.stats();
+                format!("{error} (path RTT: {:?}, cumulative packet losses: {})", stats.rtt, stats.lost_packets)
+            } else {
+                error
+            }
+        })
     }
 }
 
 async fn connect(endpoint: &Endpoint, node: NodeId) -> Result<DirectConnection, String> {
     let node = p2panda_core::VerifyingKey::from_bytes(node.as_bytes()).map_err(|error| error.to_string())?;
     let connection = endpoint.connect(node, CHUNK_PROTOCOL).await.map_err(|error| error.to_string())?;
-    if !await_direct_path(&connection, ATTEMPT_TIMEOUT).await {
+    if !await_direct_path(&connection, PEER_SETUP_TIMEOUT).await {
         connection.close(VarInt::from_u32(0), b"no direct path");
         return Err("no direct path".into());
     }
@@ -117,15 +158,18 @@ async fn connect(endpoint: &Endpoint, node: NodeId) -> Result<DirectConnection, 
     Ok(DirectConnection { connection, _monitor: monitor })
 }
 
-async fn read_chunk(connection: &Connection, digest: BlakeHash, size: usize) -> Result<Bytes, String> {
+async fn request_chunk(connection: &Connection, digest: BlakeHash) -> Result<RecvStream, String> {
     if connection_verdict(connection) != PathVerdict::Direct {
         return Err("no direct path".into());
     }
-    let (mut send, mut receive) = connection.open_bi().await.map_err(|error| error.to_string())?;
+    let (mut send, receive) = connection.open_bi().await.map_err(|error| error.to_string())?;
     send.write_all(digest.as_bytes()).await.map_err(|error| error.to_string())?;
     send.finish().map_err(|error| error.to_string())?;
+    Ok(receive)
+}
 
-    let first = receive.read_chunk(size + 1).await.map_err(|error| error.to_string())?
+async fn read_chunk(receive: &mut RecvStream, size: usize) -> Result<Bytes, String> {
+    let first = read_with_idle_timeout(receive, size + 1, 0, size).await?
         .ok_or_else(|| "peer does not hold the chunk".to_owned())?;
     if first.len() > size {
         return Err("peer exceeded the indexed chunk length".into());
@@ -137,15 +181,27 @@ async fn read_chunk(connection: &Connection, digest: BlakeHash, size: usize) -> 
         data.extend_from_slice(&first);
         while data.len() < size {
             let available = size - data.len();
-            let Some(part) = receive.read_chunk(available).await.map_err(|error| error.to_string())? else {
+            let Some(part) = read_with_idle_timeout(receive, available, data.len(), size).await? else {
                 break;
             };
             data.extend_from_slice(&part);
         }
         data.freeze()
     };
-    if data.len() != size || receive.read_chunk(1).await.map_err(|error| error.to_string())?.is_some() {
-        return Err("peer sent the wrong chunk length".into());
+    if data.len() != size {
+        return Err(format!("peer sent the wrong chunk length: received {} bytes, expected {size}", data.len()));
+    }
+    if read_with_idle_timeout(receive, 1, data.len(), size).await?.is_some() {
+        return Err(format!("peer sent the wrong chunk length: more than {size} bytes"));
     }
     Ok(data)
+}
+
+async fn read_with_idle_timeout(
+    receive: &mut RecvStream, max_read: usize, received: usize, expected: usize,
+) -> Result<Option<Bytes>, String> {
+    tokio::time::timeout(PEER_READ_IDLE, receive.read_chunk(max_read))
+        .await
+        .map_err(|_| format!("peer response timed out after {PEER_READ_IDLE:?} without progress ({received}/{expected} bytes received)"))?
+        .map_err(|error| format!("peer response interrupted ({received}/{expected} bytes received): {error}"))
 }

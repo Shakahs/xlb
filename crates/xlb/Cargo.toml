@@ -17,6 +17,7 @@ path = "src/lib.rs"
 # The supported build is Bazel, against the pinned crate universe of the
 # enclosing repository. These requirements mirror what that universe provides.
 [dependencies]
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["metrics"] }
 xlb-core = { path = "../xlb-core", version = "0.8.51" }
 backon = "=1.6.0"
 blake3 = "1"
@@ -27,6 +28,7 @@ futures = "0.3"
 http = "1"
 iroh = { version = "=1.5.0", default-features = false, features = ["tls-aws-lc-rs"] }
 libc = "0.2"
+noq-proto = { version = "=1.5.0", default-features = false }
 opendal = { version = "=0.59.5", default-features = false, features = ["executors-tokio", "http-transport-reqwest", "layers-retry", "layers-timeout", "services-s3"] }
 opendal-http-transport-reqwest = "=0.59.5"
 p2panda-core = "=0.8.1"
@@ -48,3 +50,4 @@ tracing = "0.1"
 hex = "0.4"
 sha2 = "0.11"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -39,6 +39,8 @@ pub struct FetchReport {
     pub peers: std::collections::BTreeMap<String, u64>,
     /// Wall time for the whole call, including tiers that missed first.
     pub duration_ms: u64,
+    /// Bounded category for a failed fetch; detailed causes are in logs and spans.
+    pub failure_kind: Option<&'static str>,
 }
 
 impl FetchReport {
@@ -81,6 +83,7 @@ mod tests {
             origin_bytes: 0,
             peers: Default::default(),
             duration_ms: 0,
+            failure_kind: None,
         }
     }
 
@@ -105,5 +108,18 @@ mod tests {
     #[test]
     fn the_peer_tier_is_a_peer_hit() {
         assert!(report(Some(FetchTier::Peer)).is_peer_hit());
+    }
+
+    #[test]
+    fn transfer_failures_have_bounded_cause_labels() {
+        let hash = BlakeHash::hash(b"test");
+        for (detail, expected) in [
+            ("peer attempt timed out", "timeout"),
+            ("peer sent the wrong chunk length", "invalid_length"),
+            ("no eligible peer or backing store", "unavailable"),
+            ("origin: request failed", "origin"),
+        ] {
+            assert_eq!(crate::Error::FetchFailed { hash, detail: detail.into() }.failure_kind(), expected);
+        }
     }
 }

@@ -20,14 +20,8 @@
 //! core has to change, because core only knows about
 //! [`xlb::FetchObserver`].
 //!
-//! ## Why writes are blocking, and why that is fine here
-//!
-//! [`xlb::FetchObserver`] is invoked on the fetch task and must not block. A
-//! line append is a single `write(2)` on an already-open handle — microseconds,
-//! and bounded — whereas the alternative (spawning a task per fetch, or an
-//! unbounded channel) trades a bounded cost for an unbounded one. If the sink
-//! ever becomes a network client, that inverts and it must move behind a
-//! channel; the seam is here, not in core.
+//! Optional file writes use a bounded channel and a dedicated writer so disk
+//! I/O never holds up a transfer.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -35,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
+use opentelemetry::{global, KeyValue, metrics::{Counter, Histogram}};
 use xlb::{FetchObserver, FetchReport};
 
 use xlb_client::{ClassTotals, FetchMetric, NodeEvent};
@@ -53,11 +48,8 @@ pub struct MetricsSink {
     node_id: Arc<Mutex<String>>,
     peer_class: String,
     event_tx: broadcast::Sender<NodeEvent>,
-    /// `None` when no `metrics_path` is configured. The `Mutex` serialises
-    /// appends from concurrent fetch tasks so two rows can never interleave
-    /// mid-line — a half-written JSON row is worse than a dropped one, because
-    /// it breaks the reader rather than the reading.
-    file: Option<Arc<Mutex<std::fs::File>>>,
+    /// `None` when no `metrics_path` is configured. The writer serializes appends.
+    file: Option<std::sync::mpsc::SyncSender<String>>,
     /// R423-T6: in-process tail + cumulative counters, so `ClassStats` can
     /// answer "how many fetches, how many hits, who served them" without a
     /// collector being deployed first. `std::sync::Mutex` rather than tokio's
@@ -65,6 +57,9 @@ pub struct MetricsSink {
     /// [`FetchObserver`] and must not await; every critical section here is a
     /// push and a couple of adds.
     recent: Arc<Mutex<Recent>>,
+    fetches: Counter<u64>,
+    bytes: Counter<u64>,
+    duration: Histogram<f64>,
 }
 
 #[derive(Default)]
@@ -104,7 +99,16 @@ impl MetricsSink {
                     .append(true)
                     .open(&expanded)
                     .map_err(|e| anyhow::anyhow!("metrics_path {expanded}: {e}"))?;
-                Some(Arc::new(Mutex::new(f)))
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(256);
+                std::thread::spawn(move || {
+                    let mut file = f;
+                    while let Ok(line) = receiver.recv() {
+                        if let Err(error) = file.write_all(line.as_bytes()) {
+                            tracing::warn!(%error, "metrics append failed");
+                        }
+                    }
+                });
+                Some(sender)
             }
         };
         Ok(Self {
@@ -113,6 +117,9 @@ impl MetricsSink {
             event_tx,
             file,
             recent: Arc::new(Mutex::new(Recent::default())),
+            fetches: global::meter("imgcloud.xlb").u64_counter("xlb.fetches").build(),
+            bytes: global::meter("imgcloud.xlb").u64_counter("xlb.fetch.bytes").with_unit("By").build(),
+            duration: global::meter("imgcloud.xlb").f64_histogram("xlb.fetch.duration").with_unit("s").build(),
         })
     }
 
@@ -173,8 +180,12 @@ impl MetricsSink {
     // [impl -> dsn~xlb-swarm-fetch~1]
     pub fn emit(&self, report: &FetchReport) {
         let metric = self.to_metric(report);
+        let labels = [KeyValue::new("class", metric.class.clone()), KeyValue::new("source", metric.tier_source.clone()), KeyValue::new("failure.kind", report.failure_kind.unwrap_or("none"))];
+        self.fetches.add(1, &labels);
+        self.bytes.add(metric.bytes_served, &labels);
+        self.duration.record(metric.duration_ms as f64 / 1000.0, &labels);
         tracing::info!(class = %metric.class, blake3 = %metric.blake3, tier = %metric.tier_source, bytes = metric.bytes_served,
-            peer_bytes = metric.peer_bytes, origin_bytes = metric.origin_bytes, duration_ms = metric.duration_ms, "fetch finished");
+            peer_id = ?metric.peer_id, peer_bytes = metric.peer_bytes, origin_bytes = metric.origin_bytes, duration_ms = metric.duration_ms, "fetch finished");
 
         // R423-T6: record BEFORE the transports. The in-process tail is what
         // `xlb inspect` and the desktop card read, and it is the only one that
@@ -206,15 +217,8 @@ impl MetricsSink {
             return;
         };
         line.push('\n');
-        // A poisoned lock must not take the daemon down over telemetry: recover
-        // the guard and keep writing. Losing the mutex's poison signal is the
-        // cheaper failure here.
-        let mut guard = match file.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Err(e) = guard.write_all(line.as_bytes()) {
-            tracing::warn!("metrics append failed: {e}");
+        if file.try_send(line).is_err() {
+            tracing::warn!("metrics append queue full or closed");
         }
     }
 
@@ -229,6 +233,16 @@ impl MetricsSink {
 mod tests {
     use super::*;
     use xlb::{BlakeHash, FetchTier};
+
+    fn await_lines(path: &std::path::Path, count: usize) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            if body.lines().count() >= count { return body; }
+            assert!(std::time::Instant::now() < deadline, "metrics were not written");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
     fn sink(path: Option<&str>) -> (MetricsSink, broadcast::Receiver<NodeEvent>) {
         let (tx, rx) = broadcast::channel(16);
@@ -247,6 +261,7 @@ mod tests {
             origin_bytes: 0,
             peers: Default::default(),
             duration_ms: 42,
+            failure_kind: None,
         }
     }
 
@@ -307,7 +322,7 @@ mod tests {
         s.emit(&report(Some(FetchTier::Peer), Some("p1"), 1));
         s.emit(&report(None, None, 0));
 
-        let body = std::fs::read_to_string(&path).unwrap();
+        let body = await_lines(&path, 2);
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2, "one row per fetch: {body}");
         let first: FetchMetric = serde_json::from_str(lines[0]).unwrap();
@@ -331,7 +346,7 @@ mod tests {
         let (s2, _r2) = sink(Some(p));
         s2.emit(&report(Some(FetchTier::Origin), None, 2));
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        assert_eq!(await_lines(&path, 2).lines().count(), 2);
     }
 
     #[test]
@@ -370,7 +385,7 @@ mod tests {
             other => panic!("wrong event: {other:?}"),
         };
         let from_file: FetchMetric =
-            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+            serde_json::from_str(await_lines(&path, 1).trim()).unwrap();
         assert_eq!(from_socket, from_file);
     }
 

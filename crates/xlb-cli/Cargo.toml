@@ -13,6 +13,10 @@ name = "xlb"
 path = "src/main.rs"
 
 [dependencies]
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
+opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 blake3 = "1"
 xlb     = { path = "../xlb" }
 xlb-client = { path = "../xlb-client" }
@@ -30,6 +34,7 @@ rust-fsm = "=0.8.0"
 serde   = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow  = "1"
 libc    = "0.2"

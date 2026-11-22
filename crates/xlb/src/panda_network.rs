@@ -1,6 +1,7 @@
 //! The p2panda services for one XLB node.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use p2panda_core::SigningKey;
 use p2panda_net::{
@@ -51,6 +52,10 @@ impl PandaNetwork {
         let mut endpoint = Endpoint::builder(address_book.clone())
             .network_id(pool)
             .config(bind)
+            .quic_transport(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .congestion_controller_factory(Arc::new(noq_proto::congestion::Bbr3Config::default())),
+            )
             .signing_key(identity.clone());
         for relay in config.relay.relay_mode().map_err(Error::Config)?.relay_map().urls::<Vec<_>>() {
             endpoint = endpoint.relay_url(relay);

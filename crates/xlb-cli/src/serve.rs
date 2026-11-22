@@ -23,6 +23,18 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         cfg.node.s3_request_concurrency,
         cfg.node.peer_request_concurrency,
     )?;
+    let observed_limits = request_limits.clone();
+    let _limit_reporter = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let stats = observed_limits.stats();
+            tracing::info!(total = stats.total, s3 = stats.origin, peer = stats.peer,
+                total_peak = stats.total_peak, s3_peak = stats.origin_peak, peer_peak = stats.peer_peak,
+                "XLB request concurrency");
+        }
+    }));
 
     // Built before the classes because every class's observer is a handle to
     // it; the node ID is filled in once a class has bound its endpoint.
@@ -35,6 +47,10 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
     )?);
 
     let concurrency = cfg.node.chunk_concurrency.get();
+    let chunk_limit = tower::limit::GlobalConcurrencyLimitLayer::new(concurrency);
+    tracing::info!(chunk_limit = concurrency, total_limit = cfg.node.total_request_concurrency.get(),
+        s3_limit = cfg.node.s3_request_concurrency.get(), peer_limit = cfg.node.peer_request_concurrency.get(),
+        "XLB download limits");
     let mut classes = Vec::new();
     let mut model_sessions = Vec::new();
     for cc in &cfg.classes {
@@ -53,6 +69,7 @@ pub async fn run(config_path: &str, socket_flag: Option<&str>) -> Result<()> {
         config.peer = cc.peer_config()?;
         config.origin = cc.origin_config()?;
         config.request_limits = Some(request_limits.clone());
+        config.chunk_limit = Some(chunk_limit.clone());
         config.observer = Some(metrics.observer());
         let has_origin = config.origin.is_some();
         let class = AssetClass::register(config)

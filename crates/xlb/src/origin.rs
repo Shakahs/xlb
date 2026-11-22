@@ -164,6 +164,7 @@ impl Origin {
         let (chunk_prefix, _) = config.key_template.split_once(HASH_TOKEN)
             .ok_or_else(|| Error::Config("CAS key template must include {blake3}".into()))?;
         let client = reqwest::Client::builder()
+            .http1_only()
             .connect_timeout(ORIGIN_IDLE_TIMEOUT)
             .read_timeout(ORIGIN_IDLE_TIMEOUT)
             .build().map_err(|error| Error::Config(format!("build S3 client: {error}")))?;
