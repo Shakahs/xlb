@@ -11,6 +11,24 @@ use xlb_core::{
 
 pub const ORIGIN_OBJECT_PREFIX: &str = "models/blake3/";
 
+rust_fsm::state_machine! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    chunk_publication(Checking)
+
+    Checking => {
+        Found => Complete [Finish],
+        Missing => Writing [Write],
+    },
+    Writing => {
+        Stored => Complete [Finish],
+        Conflict => Rechecking [Check],
+    },
+    Rechecking => {
+        Found => Complete [Finish],
+        Missing => Retry [RetryWrite],
+    },
+}
+
 pub fn origin_object_key(blake3: &str) -> Result<String> {
     ensure!(is_digest_hex(blake3), "CAS origin requires a lowercase BLAKE3 content hash");
     Ok(format!("{ORIGIN_OBJECT_PREFIX}{blake3}"))
@@ -49,23 +67,30 @@ async fn store_cas_object(origin: &Operator, key: String, bytes: Bytes) -> Resul
             Err(error) => Err(error),
         }
     };
-    if check_object().await? {
-        return Ok(());
-    }
-    if origin.info().capability().write_with_if_not_exists {
-        match origin.write_with(&key, bytes).if_not_exists(true).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {
-                if !check_object().await? {
-                    return Err(error.set_temporary().into());
+    use chunk_publication::{Input, Output, StateMachine};
+    let mut machine = StateMachine::new();
+    let mut payload = Some(bytes);
+    let mut conflict: Option<Error> = None;
+    let mut event = if check_object().await? { Input::Found } else { Input::Missing };
+    loop {
+        event = match machine.consume(&event).expect("valid CAS publication transition") {
+            Some(Output::Finish) => return Ok(()),
+            Some(Output::Check) => if check_object().await? { Input::Found } else { Input::Missing },
+            Some(Output::RetryWrite) => return Err(conflict.expect("conditional write conflict").set_temporary().into()),
+            Some(Output::Write) => {
+                let bytes = payload.take().expect("CAS payload is written once");
+                let result = if origin.info().capability().write_with_if_not_exists {
+                    origin.write_with(&key, bytes).if_not_exists(true).await.map(|_| ())
+                } else { origin.write(&key, bytes).await.map(|_| ()) };
+                match result {
+                    Ok(()) => Input::Stored,
+                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => { conflict = Some(error); Input::Conflict },
+                    Err(error) => return Err(error.into()),
                 }
-            }
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        origin.write(&key, bytes).await?;
+            },
+            None => unreachable!("each CAS publication transition has an action"),
+        };
     }
-    Ok(())
 }
 
 // [impl -> dsn~xlb-fuse-snapshots~1]

@@ -15,6 +15,7 @@ rust_library(
         "@scheduler_crates//:futures",
         "@scheduler_crates//:opendal",
         "@scheduler_crates//:ruzstd",
+        "@scheduler_crates//:rust-fsm",
         "@scheduler_crates//:serde",
         "@scheduler_crates//:serde_json",
         "@scheduler_crates//:tokio",
