@@ -556,6 +556,36 @@ async fn an_interrupted_origin_body_resumes_from_the_received_offset() {
     assert_eq!(retry_origin_after(FirstGet::Disconnect(RECEIVED)).await.get_offsets(), [0, RECEIVED]);
 }
 
+// [utest -> dsn~xlb-swarm-fetch~1]
+#[tokio::test]
+async fn fetch_records_count_a_shared_transfer_once_and_cache_reads_by_served_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let body = Bytes::from_static(b"one chunk that several callers read");
+    let hash = BlakeHash::hash(&body);
+    let origin = OriginServer::start(hash, body.to_vec()).await;
+    let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut config = AssetClassConfig::new("chunks", directory.path());
+    config.origin = Some(origin.config(1));
+    let observed = records.clone();
+    config.observer = Some(std::sync::Arc::new(move |report: &FetchReport| observed.lock().unwrap().push(report.clone())));
+    let node = AssetClass::register(config).await.unwrap();
+    let asset = node.indexed_chunk(hash, body.len() as u64);
+
+    let (first, second, whole) = tokio::join!(
+        asset.read_chunk_serving(TransferPriority::Demand, 4),
+        asset.read_chunk_serving(TransferPriority::Demand, 4),
+        asset.read_chunk(),
+    );
+    assert!(first.0.is_ok() && second.0.is_ok() && whole.is_ok());
+    assert_eq!(asset.read_chunk_serving(TransferPriority::Demand, 5).await.0.unwrap(), body);
+    let length = body.len() as u64;
+    let records: Vec<_> = records.lock().unwrap().iter().map(|report| (report.tier, report.bytes_served, report.origin_bytes)).collect();
+    assert_eq!(records, [(Some(FetchTier::Origin), length, length), (Some(FetchTier::Cache), 5, 0)],
+        "the waiting reads share one transfer record, and the cache read records the bytes it serves");
+    assert_eq!(origin.gets(), 1);
+    node.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_corrupt_origin_chunk_never_enters_the_cache() {
     let directory = tempfile::tempdir().unwrap();

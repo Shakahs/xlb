@@ -16,7 +16,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use rand::seq::SliceRandom;
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::task::AbortOnDropHandle;
-use xlb::{Asset, AssetClass, BlakeHash};
+use xlb::{Asset, AssetClass, BlakeHash, TransferPriority};
 use xlb_core::chunks::positioned_value;
 use xlb_core::image::{IMAGE_CHUNK_BYTES, IMAGE_DIGEST_PREFIX, IMAGE_INDEX_LIMIT, IMAGE_INDEX_PREFIX, ImageBlobIndex, blake3_digest_hex, is_digest_hex};
 
@@ -49,7 +49,7 @@ fn router(class: AssetClass, concurrency: usize) -> Router {
 }
 
 async fn open_slice((asset, range, positioned): (Asset, Range<usize>, Option<(u64, BlakeHash)>)) -> Result<Bytes> {
-    let bytes = asset.read_chunk().await?;
+    let bytes = asset.read_chunk_serving(TransferPriority::Demand, range.len() as u64).await.0?;
     if let Some((offset, value)) = positioned {
         let payload = bytes.clone();
         let actual = tokio::task::spawn_blocking(move || positioned_value(offset, &payload)).await?;

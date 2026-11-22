@@ -1,11 +1,13 @@
 //! Per-fetch observability — which tier actually served a blob, how many
 //! bytes, and how long it took.
 //!
-//! One report per completed [`crate::Asset::read_chunk`] call, hit or miss.
-//! **A miss is a report too.** `tier: None` is the "no source had it" case; a
-//! hit rate built only from successes has no denominator.
+//! The observer receives one report per chunk transfer, when it completes or
+//! fails, however many reads wait for it, and one report per read served from
+//! the cache. **A miss is a report too.** `tier: None` is the "no source had
+//! it" case; a hit rate built only from successes has no denominator.
 //!
-//! `bytes_served` is download-side: bytes this node obtained. Bytes this node
+//! `bytes_served` is download-side: a transfer reports the chunk it obtained
+//! and a cache read reports the bytes its caller serves. Bytes this node
 //! served to a peer are not visible from the fetch path.
 
 use std::sync::Arc;
@@ -28,7 +30,7 @@ pub struct FetchReport {
     pub tier: Option<FetchTier>,
     /// Peer that supplied the complete chunk, for peer reads.
     pub peer_id: Option<String>,
-    /// Size of the blob obtained. `0` on a miss.
+    /// Bytes the fetch obtained or served from the cache. `0` on a miss.
     pub bytes_served: u64,
     /// Bytes this fetch read from peers. `0` on a cache hit and on a miss.
     pub peer_bytes: u64,
@@ -64,8 +66,8 @@ impl FetchReport {
     }
 }
 
-/// Called once per completed fetch. Must not block: it runs on the fetch
-/// caller's task.
+/// Called once per completed transfer and per cache read. Must not block: it
+/// runs on the transfer or the reading task.
 pub type FetchObserver = Arc<dyn Fn(&FetchReport) + Send + Sync>;
 
 #[cfg(test)]

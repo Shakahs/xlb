@@ -10,19 +10,26 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use fuser::{
-    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request, SessionACL,
+    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, KernelConfig, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyOpen, Request, SessionACL,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::seq::SliceRandom;
 use tokio::runtime::Handle;
 use xlb::{AssetClass, BlakeHash, FetchProgress, FetchReport, FetchSources, FetchTier, ProgressSink};
-use xlb_core::chunks::{CAS_INDEX_LIMIT, ModelIndex, MODEL_INDEX_PREFIX};
+use xlb_core::chunks::{CAS_CHUNK_BYTES, CAS_INDEX_LIMIT, ModelIndex, MODEL_INDEX_PREFIX};
 
 use crate::{chunk_file::ChunkFile, snapshotter::clear_disconnected_mount};
 
 const ENTRY_TTL: Duration = Duration::from_secs(60);
+/// Two CAS chunks, so the next chunk is in flight while the reader consumes
+/// the current one.
+const READAHEAD_BYTES: u64 = 2 * CAS_CHUNK_BYTES;
+/// The kernel's default FUSE readahead, its smallest readahead request.
+const DEFAULT_READAHEAD_BYTES: u64 = 128 * 1024;
+/// Background requests for a full readahead window of default-sized requests.
+const BACKGROUND_REQUESTS: u16 = (READAHEAD_BYTES / DEFAULT_READAHEAD_BYTES) as u16;
 
 pub async fn serve_model_sessions(
     sessions: Vec<BackgroundSession>,
@@ -88,8 +95,10 @@ impl ModelMount {
                 MountOption::NoExec, MountOption::DefaultPermissions, MountOption::FSName("xlb-models".into())];
             let root = filesystem.root.clone();
             clear_disconnected_mount(&root)?;
-            fuser::spawn_mount(filesystem, &root, &config)
-                .with_context(|| format!("mount XLB model files at {}", root.display()))
+            let session = fuser::spawn_mount(filesystem, &root, &config)
+                .with_context(|| format!("mount XLB model files at {}", root.display()))?;
+            raise_readahead(&root)?;
+            Ok::<_, anyhow::Error>(session)
         }).await??;
         Ok((mount, session))
     }
@@ -196,6 +205,17 @@ impl ModelMount {
     }
 }
 
+/// FUSE INIT can only lower the kernel's default readahead, so raise the
+/// mount's window through its backing device.
+// [impl -> dsn~xlb-fuse-snapshots~1]
+fn raise_readahead(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let device = std::fs::metadata(root).with_context(|| format!("stat XLB model mount {}", root.display()))?.dev();
+    let setting = format!("/sys/class/bdi/{}:{}/read_ahead_kb", libc::major(device), libc::minor(device));
+    std::fs::write(&setting, (READAHEAD_BYTES / 1024).to_string())
+        .with_context(|| format!("set the XLB model mount readahead at {setting}"))
+}
+
 fn fetch_tier(peer_bytes: u64, origin_bytes: u64) -> FetchTier {
     match (peer_bytes, origin_bytes) {
         (0, 0) => FetchTier::Cache,
@@ -217,6 +237,18 @@ fn attr(ino: INodeNo, size: u64) -> FileAttr {
 
 // [impl -> dsn~xlb-fuse-snapshots~1]
 impl Filesystem for ModelMount {
+    fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        config.set_max_background(BACKGROUND_REQUESTS).map_err(|_| std::io::Error::other("FUSE background request limit"))?;
+        config.set_congestion_threshold(BACKGROUND_REQUESTS).map_err(|_| std::io::Error::other("FUSE congestion threshold"))?;
+        Ok(())
+    }
+
+    /// Model files are immutable and named by their digest, so their page
+    /// cache stays valid across opens.
+    fn open(&self, _request: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE);
+    }
+
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(hash) = name.to_str().and_then(|name| BlakeHash::from_hex(name).ok()) else {
             return reply.error(Errno::ENOENT);

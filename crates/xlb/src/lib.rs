@@ -324,6 +324,7 @@ impl AssetClass {
         let class = self.clone();
         use tracing::Instrument;
         self.0.transfers.spawn(async move {
+            let started = Instant::now();
             let admission = class.0.chunk_limit.clone();
             let outcome = tokio::select! {
                 result = async {
@@ -338,9 +339,38 @@ impl AssetClass {
                 }),
             };
             class.0.flights.lock().unwrap().remove(&hash);
+            // A transfer records its fetch once, however many reads wait for
+            // it. When it found the chunk cached, each read records its hit.
+            if !outcome.as_ref().is_ok_and(|fetched| fetched.tier == FetchTier::Cache) {
+                let served = outcome.as_ref().map_or(0, |fetched| fetched.size);
+                class.observe(&class.fetch_report(hash, &outcome, served, started));
+            }
             tx.send_replace(Some(outcome));
         }.instrument(tracing::Span::current()));
         Ok((size, rx))
+    }
+
+    // [impl -> dsn~xlb-swarm-fetch~1]
+    fn fetch_report(&self, hash: BlakeHash, outcome: &Result<Fetched>, bytes_served: u64, started: Instant) -> FetchReport {
+        let fetched = outcome.as_ref().ok();
+        FetchReport {
+            class: self.0.name,
+            hash,
+            tier: fetched.map(|chunk| chunk.tier),
+            peer_id: fetched.and_then(|chunk| chunk.peers.keys().next().cloned()),
+            bytes_served,
+            peer_bytes: fetched.map_or(0, |chunk| chunk.peer_bytes),
+            origin_bytes: fetched.map_or(0, |chunk| chunk.origin_bytes),
+            peers: fetched.map(|chunk| chunk.peers.clone()).unwrap_or_default(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            failure_kind: outcome.as_ref().err().map(Error::failure_kind),
+        }
+    }
+
+    fn observe(&self, report: &FetchReport) {
+        if let Some(observer) = &self.0.observer {
+            observer(report);
+        }
     }
 
     // [impl -> dsn~xlb-supervised-lifecycle~1]
@@ -428,23 +458,34 @@ impl AssetClass {
         }
     }
 
-    async fn fetch(&self, hash: BlakeHash, size: u64, priority: TransferPriority) -> Result<Fetched> {
-        if let Some(hit) = self.cached_chunk(hash, size).await? {
-            return Ok(hit);
+    /// Fetch a chunk. The flag is set when the outcome is a transfer's, which
+    /// the transfer has already recorded.
+    async fn fetch(&self, hash: BlakeHash, size: u64, priority: TransferPriority) -> (Result<Fetched>, bool) {
+        match self.cached_chunk(hash, size).await {
+            Ok(Some(hit)) => return (Ok(hit), false),
+            Ok(None) => {}
+            Err(error) => return (Err(error), false),
         }
         loop {
-            let (in_flight_size, mut flight) = self.join_flight(hash, size, priority)?;
-            let outcome = flight.wait_for(Option::is_some).await.map_err(|_| Error::FetchFailed {
-                hash, detail: "the transfer task ended without an outcome".into(),
-            })?.clone().expect("completed transfer");
+            let (in_flight_size, mut flight) = match self.join_flight(hash, size, priority) {
+                Ok(flight) => flight,
+                Err(error) => return (Err(error), false),
+            };
+            let outcome = match flight.wait_for(Option::is_some).await {
+                Ok(outcome) => outcome.clone().expect("completed transfer"),
+                Err(_) => return (Err(Error::FetchFailed {
+                    hash, detail: "the transfer task ended without an outcome".into(),
+                }), false),
+            };
             if let Ok(fetched) = &outcome {
                 if fetched.size != size {
-                    return Err(Error::Store(format!("CAS chunk {hash} has an unexpected length")));
+                    return (Err(Error::Store(format!("CAS chunk {hash} has an unexpected length"))), false);
                 }
-                return outcome;
+                let recorded = fetched.tier != FetchTier::Cache;
+                return (outcome, recorded);
             }
             if in_flight_size == size {
-                return outcome;
+                return (outcome, true);
             }
         }
     }
@@ -468,23 +509,18 @@ impl Asset {
         self.read_chunk_with(TransferPriority::Demand).await
     }
 
-    #[tracing::instrument(name = "xlb.chunk.fetch", skip_all, fields(class = self.class.0.name, hash = %self.hash, ?priority, source = tracing::field::Empty, peer = tracing::field::Empty, bytes = tracing::field::Empty, success = tracing::field::Empty, error = tracing::field::Empty))]
     pub async fn read_chunk_with(&self, priority: TransferPriority) -> (Result<Bytes>, FetchReport) {
+        self.read_chunk_serving(priority, self.size).await
+    }
+
+    /// Read the chunk for a caller that serves `served` of its bytes. A cache
+    /// hit records the bytes served; a transfer records itself once.
+    #[tracing::instrument(name = "xlb.chunk.fetch", skip_all, fields(class = self.class.0.name, hash = %self.hash, ?priority, source = tracing::field::Empty, peer = tracing::field::Empty, bytes = tracing::field::Empty, success = tracing::field::Empty, error = tracing::field::Empty))]
+    pub async fn read_chunk_serving(&self, priority: TransferPriority, served: u64) -> (Result<Bytes>, FetchReport) {
         let started = Instant::now();
-        let outcome = self.class.fetch(self.hash, self.size, priority).await;
-        let fetched = outcome.as_ref().ok();
-        let report = FetchReport {
-            class: self.class.0.name,
-            hash: self.hash,
-            tier: fetched.map(|chunk| chunk.tier),
-            peer_id: fetched.and_then(|chunk| chunk.peers.keys().next().cloned()),
-            bytes_served: fetched.map_or(0, |chunk| chunk.size),
-            peer_bytes: fetched.map_or(0, |chunk| chunk.peer_bytes),
-            origin_bytes: fetched.map_or(0, |chunk| chunk.origin_bytes),
-            peers: fetched.map(|chunk| chunk.peers.clone()).unwrap_or_default(),
-            duration_ms: started.elapsed().as_millis() as u64,
-            failure_kind: outcome.as_ref().err().map(Error::failure_kind),
-        };
+        let (outcome, recorded) = self.class.fetch(self.hash, self.size, priority).await;
+        let served = outcome.as_ref().map_or(0, |chunk| served.min(chunk.size));
+        let report = self.class.fetch_report(self.hash, &outcome, served, started);
         let span = tracing::Span::current();
         span.record("source", report.tier_label());
         span.record("peer", report.peer_id.as_deref().unwrap_or(""));
@@ -494,8 +530,8 @@ impl Asset {
             span.record("error", tracing::field::display(error));
             tracing::warn!(class = self.class.0.name, hash = %self.hash, cause = %error, kind = error.failure_kind(), "XLB chunk fetch failed");
         }
-        if let Some(observer) = &self.class.0.observer {
-            observer(&report);
+        if !recorded {
+            self.class.observe(&report);
         }
         (outcome.map(|chunk| chunk.content), report)
     }
