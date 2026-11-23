@@ -23,9 +23,9 @@ use xlb_core::chunks::{CAS_CHUNK_BYTES, CAS_INDEX_LIMIT, ModelIndex, MODEL_INDEX
 use crate::{chunk_file::ChunkFile, snapshotter::clear_disconnected_mount};
 
 const ENTRY_TTL: Duration = Duration::from_secs(60);
-/// Two CAS chunks, so the next chunk is in flight while the reader consumes
-/// the current one.
-const READAHEAD_BYTES: u64 = 2 * CAS_CHUNK_BYTES;
+/// Eight CAS chunks, so a single sequential reader, such as ComfyUI faulting
+/// in a model, keeps several chunk requests in flight.
+const READAHEAD_BYTES: u64 = 8 * CAS_CHUNK_BYTES;
 /// The kernel's default FUSE readahead, its smallest readahead request.
 const DEFAULT_READAHEAD_BYTES: u64 = 128 * 1024;
 /// Background requests for a full readahead window of default-sized requests.
@@ -95,6 +95,7 @@ impl ModelMount {
                 MountOption::NoExec, MountOption::DefaultPermissions, MountOption::FSName("xlb-models".into())];
             let root = filesystem.root.clone();
             clear_disconnected_mount(&root)?;
+            raise_fuse_request_limit()?;
             let session = fuser::spawn_mount(filesystem, &root, &config)
                 .with_context(|| format!("mount XLB model files at {}", root.display()))?;
             raise_readahead(&root)?;
@@ -112,7 +113,22 @@ impl ModelMount {
         let (ino, file) = self.resolve(hash).await?.context("model has no CAS index")?;
         let total = file.index.size_bytes;
         let file = &file;
-        let mut ordinals: Vec<_> = (0..file.index.chunks.len() as u64).collect();
+        // [impl -> dsn~xlb-cached-model-prepare~1]
+        let mut bytes = 0;
+        let mut ordinals = Vec::new();
+        for ordinal in 0..file.index.chunks.len() as u64 {
+            let (chunk, length) = file.index.chunk(ordinal).context("CAS index is truncated")?;
+            if self.class.indexed_chunk(chunk, length).is_cached() {
+                bytes += length;
+            } else {
+                ordinals.push(ordinal);
+            }
+        }
+        if bytes > 0 && !ordinals.is_empty() {
+            report_progress(FetchProgress {
+                bytes_so_far: bytes, total: Some(total), tier: FetchTier::Cache, sources: FetchSources::default(),
+            });
+        }
         ordinals.shuffle(&mut rand::rng());
         let mut chunks = stream::iter(ordinals)
             .map(|ordinal| async move {
@@ -120,7 +136,6 @@ impl ModelMount {
                 Ok::<_, anyhow::Error>(report)
             }).buffer_unordered(self.concurrency);
         let mut sources = FetchSources::default();
-        let mut bytes = 0;
         let mut peer_bytes = 0;
         while let Some(report) = chunks.try_next().await? {
             bytes += report.bytes_served;
@@ -207,13 +222,37 @@ impl ModelMount {
 
 /// FUSE INIT can only lower the kernel's default readahead, so raise the
 /// mount's window through its backing device.
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 fn raise_readahead(root: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let device = std::fs::metadata(root).with_context(|| format!("stat XLB model mount {}", root.display()))?.dev();
     let setting = format!("/sys/class/bdi/{}:{}/read_ahead_kb", libc::major(device), libc::minor(device));
     std::fs::write(&setting, (READAHEAD_BYTES / 1024).to_string())
         .with_context(|| format!("set the XLB model mount readahead at {setting}"))
+}
+
+/// The kernel caps each FUSE request at this many pages when it creates a
+/// mount, so raise it to one CAS chunk before mounting.
+// [impl -> dsn~xlb-fuse-request-size~1]
+pub(crate) fn raise_fuse_request_limit() -> Result<()> {
+    const SETTING: &str = "/proc/sys/fs/fuse/max_pages_limit";
+    // SAFETY: sysconf reads a system constant and has no preconditions.
+    let page_bytes = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).context("query the page size")?;
+    let chunk_pages = CAS_CHUNK_BYTES.div_ceil(page_bytes);
+    let current = match std::fs::read_to_string(SETTING) {
+        Ok(value) => value.trim().parse::<u64>().with_context(|| format!("parse {SETTING}"))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            tracing::info!("the kernel has no {SETTING}; FUSE mounts keep its fixed request size");
+            return Ok(());
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {SETTING}")),
+    };
+    if current < chunk_pages {
+        std::fs::write(SETTING, chunk_pages.to_string())
+            .with_context(|| format!("raise the FUSE request limit at {SETTING}"))?;
+        tracing::info!(previous = current, pages = chunk_pages, "raised the FUSE request limit to one CAS chunk");
+    }
+    Ok(())
 }
 
 fn fetch_tier(peer_bytes: u64, origin_bytes: u64) -> FetchTier {
@@ -235,7 +274,7 @@ fn attr(ino: INodeNo, size: u64) -> FileAttr {
     }
 }
 
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 impl Filesystem for ModelMount {
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         config.set_max_background(BACKGROUND_REQUESTS).map_err(|_| std::io::Error::other("FUSE background request limit"))?;

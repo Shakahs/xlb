@@ -44,7 +44,7 @@ struct LayerMount {
 }
 
 /// Mount a layer and return its session with the archive it reads from.
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 pub(crate) fn mount_layer(
     index: LayerIndex, class: AssetClass, mountpoint: &Path, runtime: Handle,
 ) -> Result<(BackgroundSession, ChunkFile)> {
@@ -62,7 +62,7 @@ pub(crate) fn mount_layer(
 /// Fetch every archive chunk into the node cache, so container startup reads
 /// hit the cache instead of waiting for one chunk transfer at a time. The
 /// transfers are background transfers, so pending reads go first.
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 pub(crate) async fn prefetch_layer(archive: ChunkFile, concurrency: usize) -> Result<()> {
     let mut ordinals: Vec<u64> = (0..archive.index.chunks.len() as u64).collect();
     ordinals.shuffle(&mut rand::rng());

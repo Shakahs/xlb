@@ -22,7 +22,7 @@ use tonic::{Status, transport::Server};
 use xlb::AssetClass;
 use xlb_core::{BlakeHash, image::blake3_digest_hex, layer::{LAYER_INDEX_LABEL, LAYER_INDEX_LIMIT, LAYER_INDEX_PREFIX, LayerIndex}};
 
-use crate::{chunk_file::ChunkFile, layer_mount::{mount_layer, prefetch_layer}, model_mount::close_sessions, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
+use crate::{chunk_file::ChunkFile, layer_mount::{mount_layer, prefetch_layer}, model_mount::{close_sessions, raise_fuse_request_limit}, snapshot_store::{SnapshotRecord, SnapshotRecords, SnapshotStore, disk_usage, read_index, write_index}};
 
 const SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
@@ -47,13 +47,15 @@ struct CasSnapshotter {
     concurrency: usize,
 }
 
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 pub async fn serve_snapshots(
     config: SnapshotSettings,
     class: AssetClass,
     concurrency: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    // [impl -> dsn~xlb-fuse-request-size~1]
+    raise_fuse_request_limit()?;
     let (store, records) = SnapshotStore::open(config.root)?;
     let mut sessions = HashMap::new();
     for record in records.values() {

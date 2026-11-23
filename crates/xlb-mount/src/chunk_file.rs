@@ -57,7 +57,7 @@ impl ChunkFile {
         Ok((body, report))
     }
 
-    // [impl -> dsn~xlb-fuse-snapshots~1]
+    // [impl -> dsn~xlb-fuse-snapshots~2]
     pub(crate) async fn read(&self, offset: u64, size: u32) -> Result<Bytes> {
         let end = offset.saturating_add(u64::from(size)).min(self.index.size_bytes);
         if end <= offset {

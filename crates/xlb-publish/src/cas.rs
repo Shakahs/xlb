@@ -93,7 +93,7 @@ async fn store_cas_object(origin: &Operator, key: String, bytes: Bytes) -> Resul
     }
 }
 
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 pub fn publish_model_index(
     origin: &Operator, reader: impl AsyncRead + Unpin + Send + 'static, digest: &str, size: u64, concurrency: usize,
 ) -> BoxFuture<'static, Result<()>> {

@@ -75,7 +75,7 @@ impl ChunkAdmission {
 
     /// Wait for a transfer slot. A background wait moves to demand, keeping
     /// its arrival, as soon as `promoted` is notified.
-    // [impl -> dsn~xlb-fuse-snapshots~1]
+    // [impl -> dsn~xlb-fuse-snapshots~2]
     pub(crate) async fn admit(&self, priority: TransferPriority, promoted: &Notify) -> ChunkSlot {
         let mut queued = {
             let mut queue = self.queue();
@@ -114,7 +114,7 @@ mod tests {
     use super::*;
     use TransferPriority::{Background, Demand};
 
-    // [utest -> dsn~xlb-fuse-snapshots~1]
+    // [utest -> dsn~xlb-fuse-snapshots~2]
     #[tokio::test]
     async fn freed_slots_go_to_demand_before_queued_prefetch() {
         let admission = ChunkAdmission::new(1);
@@ -137,7 +137,7 @@ mod tests {
         drop(second.await);
     }
 
-    // [utest -> dsn~xlb-fuse-snapshots~1]
+    // [utest -> dsn~xlb-fuse-snapshots~2]
     #[tokio::test]
     async fn a_promoted_background_transfer_goes_before_queued_prefetch() {
         let admission = ChunkAdmission::new(1);
@@ -158,7 +158,7 @@ mod tests {
         drop(first.await);
     }
 
-    // [utest -> dsn~xlb-fuse-snapshots~1]
+    // [utest -> dsn~xlb-fuse-snapshots~2]
     #[tokio::test]
     async fn a_cancelled_waiter_returns_its_granted_slot() {
         let admission = ChunkAdmission::new(1);

@@ -304,7 +304,7 @@ impl AssetClass {
 
     // A demand read that joins a transfer still waiting for admission
     // promotes it.
-    // [impl -> dsn~xlb-fuse-snapshots~1]
+    // [impl -> dsn~xlb-fuse-snapshots~2]
     fn join_flight(&self, hash: BlakeHash, size: u64, priority: TransferPriority) -> Result<(u64, Flight)> {
         let mut flights = self.0.flights.lock().unwrap();
         if self.0.shutdown.is_cancelled() {

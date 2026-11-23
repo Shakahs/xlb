@@ -130,7 +130,7 @@ impl ApplicationImage {
 }
 
 impl LayerPublication {
-    // [impl -> dsn~xlb-fuse-snapshots~1]
+    // [impl -> dsn~xlb-fuse-snapshots~2]
     async fn publish(&self, blob: &ImageBlob, origin: &Operator, uploads: Arc<Semaphore>, concurrency: usize) -> anyhow::Result<()> {
         let bytes = read_metadata(&self.path, LAYER_INDEX_LIMIT)?;
         ensure!(self.key.ends_with(blake3::hash(&bytes).to_hex().as_str()), "OCI filesystem index differs from its descriptor");

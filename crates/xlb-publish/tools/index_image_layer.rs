@@ -39,7 +39,7 @@ impl<R: Read> Read for ArchiveHashes<R> {
 }
 
 /// Derive the filesystem index and diff ID from exactly the same archive bytes.
-// [impl -> dsn~xlb-fuse-snapshots~1]
+// [impl -> dsn~xlb-fuse-snapshots~2]
 pub fn read_layer(reader: impl Read) -> Result<(LayerIndex, blake3::Hash)> {
     let mut archive = tar::Archive::new(ArchiveHashes {
         reader, diff_id: blake3::Hasher::new(), chunk: blake3::Hasher::new(), chunks: Vec::new(), size: 0,
