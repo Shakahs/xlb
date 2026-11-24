@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Command>(json).unwrap(), cmd);
     }
 
-    // [utest -> dsn~xlb-peer-reach~1]
+    // [utest -> dsn~xlb-peer-reach~2]
     #[test]
     fn set_peers_carries_peer_addresses_admission_and_node_topology() {
         let cmd = Command::SetPeers {

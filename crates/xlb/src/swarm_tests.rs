@@ -477,7 +477,7 @@ async fn a_progressing_peer_can_finish_after_the_idle_interval() {
     verify_paced_peer_fetch(false).await;
 }
 
-// [itest -> dsn~xlb-peer-reach~1]
+// [itest -> dsn~xlb-peer-reach~2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_holder_refuses_a_direct_request_from_another_zone() {
     tokio::time::timeout(Duration::from_secs(20), async {

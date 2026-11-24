@@ -69,7 +69,7 @@ impl fmt::Debug for ChunkProvider {
     }
 }
 
-// [impl -> dsn~xlb-peer-reach~1]
+// [impl -> dsn~xlb-peer-reach~2]
 impl ProtocolHandler for ChunkProvider {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();

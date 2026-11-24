@@ -269,7 +269,7 @@ impl AssetClass {
         self.set_peer_sets(peers, admit);
     }
 
-    // [impl -> dsn~xlb-peer-reach~1]
+    // [impl -> dsn~xlb-peer-reach~2]
     pub fn set_peer_sets(&self, peers: Vec<PeerAddr>, admit: Vec<NodeId>) {
         if let Some(transport) = &self.0.peers {
             transport.set_peers(peers, admit);

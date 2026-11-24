@@ -339,7 +339,7 @@ async fn do_fetch(
 
 /// Replace the peer set of `class`, or of every class with a peer tier.
 /// `admit` names the nodes to serve; without it they are the peers.
-// [impl -> dsn~xlb-peer-reach~1]
+// [impl -> dsn~xlb-peer-reach~2]
 fn set_peers(
     state: &NodeState,
     peers: &[Peer],

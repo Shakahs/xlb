@@ -158,7 +158,7 @@ pub(crate) enum PathVerdict {
 /// Judge a connection by its open paths, each given as (selected for
 /// application data, direct IP path). Only the selected path counts: a
 /// direct path that is open but not selected carries no data.
-// [impl -> dsn~xlb-peer-reach~1]
+// [impl -> dsn~xlb-peer-reach~2]
 pub(crate) fn path_verdict(paths: impl IntoIterator<Item = (bool, bool)>) -> PathVerdict {
     match paths.into_iter().find(|(selected, _)| *selected) {
         Some((_, true)) => PathVerdict::Direct,
@@ -173,7 +173,7 @@ pub(crate) fn connection_verdict(connection: &Connection) -> PathVerdict {
 }
 
 /// Wait up to `limit` for `connection` to carry its data on a direct path.
-// [impl -> dsn~xlb-peer-reach~1]
+// [impl -> dsn~xlb-peer-reach~2]
 pub(crate) async fn await_direct_path(connection: &Connection, limit: Duration) -> bool {
     let direct = async {
         let mut snapshots = connection.paths_stream();
@@ -190,7 +190,7 @@ pub(crate) async fn await_direct_path(connection: &Connection, limit: Duration) 
 
 /// Close `connection` as soon as its data, having travelled on a direct
 /// path, would travel through a relay. Ends when the connection closes.
-// [impl -> dsn~xlb-peer-reach~1]
+// [impl -> dsn~xlb-peer-reach~2]
 pub(crate) async fn close_when_relayed(connection: Connection, mut was_direct: bool) {
     let mut snapshots = connection.paths_stream();
     while let Some(paths) = snapshots.next().await {
@@ -239,7 +239,7 @@ mod tests {
     use super::*;
 
     // Paths are (selected for application data, direct IP path).
-    // [utest -> dsn~xlb-peer-reach~1]
+    // [utest -> dsn~xlb-peer-reach~2]
     #[test]
     fn requests_are_allowed_only_while_data_travels_on_a_direct_path() {
         assert_eq!(path_verdict([(true, true)]), PathVerdict::Direct);
