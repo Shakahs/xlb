@@ -112,8 +112,9 @@ async fn serve_blob(
 }
 
 /// The BLAKE3 hex an OCI blob or manifest request names. Blobs are named by
-/// `blake3:<hex>`; manifests also by the tag `<hex>`, which pods reference
-/// because the kubelet rejects digest algorithms it does not register.
+/// `blake3:<hex>`; manifests also by a content-addressed tag, which pods
+/// reference because the kubelet rejects digest algorithms it does not
+/// register.
 fn image_digest(path: &str) -> Option<&str> {
     let (resource, reference) = path.rsplit_once('/')?;
     let (repository, kind) = resource.rsplit_once('/')?;
@@ -122,9 +123,18 @@ fn image_digest(path: &str) -> Option<&str> {
     }
     match kind {
         "blobs" => blake3_digest_hex(reference),
-        "manifests" => blake3_digest_hex(reference).or_else(|| is_digest_hex(reference).then_some(reference)),
+        "manifests" => blake3_digest_hex(reference).or_else(|| content_tag_hex(reference)),
         _ => None,
     }
+}
+
+/// The BLAKE3 hex of a content-addressed tag: `<hex>`, or `<label>-<hex>`,
+/// which resolves by its trailing hex alone. The label carries a version for
+/// consumers that read one from the tag, such as Talos for the Kubernetes
+/// component images.
+fn content_tag_hex(tag: &str) -> Option<&str> {
+    let hex = tag.rsplit_once('-').map_or(tag, |(_, hex)| hex);
+    is_digest_hex(hex).then_some(hex)
 }
 
 impl ImageMirror {

@@ -28,6 +28,9 @@ struct ConversionInputs {
     out_descriptor: PathBuf,
     out_manifest: PathBuf,
     out_config: PathBuf,
+    /// The manifest's digest alone, `blake3:<hex>`, for manifests that name
+    /// the image by it.
+    out_digest: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -151,9 +154,11 @@ fn main() -> anyhow::Result<()> {
         manifest["layers"][position]["annotations"][LAYER_INDEX_LABEL] = digest(layer.index).into();
     }
     let manifest_bytes = serde_json::to_vec(&manifest)?;
-    descriptor["digest"] = digest(blake3::hash(&manifest_bytes)).into();
+    let manifest_digest = digest(blake3::hash(&manifest_bytes));
+    descriptor["digest"] = manifest_digest.clone().into();
     descriptor["size"] = manifest_bytes.len().into();
 
+    std::fs::write(&inputs.out_digest, &manifest_digest)?;
     std::fs::write(&inputs.out_config, config_bytes)?;
     std::fs::write(&inputs.out_manifest, manifest_bytes)?;
     std::fs::write(&inputs.out_descriptor, serde_json::to_vec(&descriptor)?)?;
