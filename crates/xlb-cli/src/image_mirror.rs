@@ -28,6 +28,7 @@ struct ImageMirror {
 }
 
 // [impl -> dsn~xlb-image-mirror~1]
+#[expect(clippy::disallowed_methods, reason = "the XLB daemon's production OCI image mirror server")]
 pub async fn serve(class: AssetClass, concurrency: usize, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 5477))
         .await
@@ -37,6 +38,7 @@ pub async fn serve(class: AssetClass, concurrency: usize, cancel: tokio_util::sy
     Ok(())
 }
 
+#[expect(clippy::disallowed_methods, reason = "the XLB daemon's production OCI image mirror router")]
 fn router(class: AssetClass, concurrency: usize) -> Router {
     Router::new()
         .route("/v2/", get(|| async {

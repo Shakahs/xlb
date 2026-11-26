@@ -1,10 +1,10 @@
-load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("//tools/rust:rust_library.bzl", "rust_library")
 
 rust_library(
     name = "xlb_mount",
     srcs = glob(["src/**/*.rs"]),
     edition = "2021",
-    visibility = ["//vendor/xlb/crates/xlb-cli:__pkg__", "//scheduler:__pkg__"],
+    visibility = ["//vendor/xlb/crates/xlb-cli:__pkg__", "//imgcloud-restate:__pkg__"],
     deps = [
         "//vendor/xlb/crates/xlb",
         "//vendor/xlb/crates/xlb-core:xlb_core",

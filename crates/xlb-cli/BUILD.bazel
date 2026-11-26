@@ -1,6 +1,6 @@
 load("@bazel_lib//lib:transitions.bzl", "platform_transition_filegroup")
-load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
-load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//tools/rust:rust_binary.bzl", "rust_binary")
+load("//tools/rust:rust_test.bzl", "rust_test")
 load("//third_party/glibc:static_link.bzl", "STATIC_GLIBC_FLAGS", "STATIC_GLIBC_PLATFORM", "STATIC_GLIBC_RUNTIME")
 
 XLB_DEPS = [
@@ -55,7 +55,7 @@ platform_transition_filegroup(
     name = "xlb_talos",
     srcs = [":xlb_extension_binary"],
     target_platform = STATIC_GLIBC_PLATFORM,
-    visibility = ["//infra/talosimage:__pkg__", "//scheduler:__pkg__"],
+    visibility = ["//infra/talosimage:__pkg__", "//imgcloud-restate:__pkg__"],
 )
 
 rust_test(

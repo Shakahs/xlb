@@ -1,5 +1,5 @@
-load("@rules_rs//rs:rust_library.bzl", "rust_library")
-load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//tools/rust:rust_library.bzl", "rust_library")
+load("//tools/rust:rust_test.bzl", "rust_test")
 
 rust_library(
     name = "xlb_core",
