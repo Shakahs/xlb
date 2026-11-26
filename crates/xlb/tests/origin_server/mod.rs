@@ -1,16 +1,21 @@
-//! Test S3 endpoint that verifies signed requests for a whole CAS chunk.
-
-mod sigv4;
+//! The swarm tests' S3 origin: a real Garage server, the release pinned in
+//! MODULE.bazel, behind a fault proxy. The proxy forwards every request to
+//! Garage, which verifies the SigV4 signatures and serves the objects. It
+//! counts GETs and the first byte each asks for, holds GETs while paused, and
+//! forces the first GET's throttle or mid-body disconnect.
 
 use std::{
-    collections::HashMap,
     num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    time::Duration,
 };
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UnixStream},
+    process::{Child, Command},
     sync::watch,
     task::JoinSet,
 };
@@ -21,11 +26,15 @@ use bytes::Bytes;
 
 const BUCKET: &str = "artifacts";
 const REGION: &str = "auto";
+const ACCESS_KEY_ID: &str = "test-key-id";
+const SECRET_ACCESS_KEY: &str = "test-secret-access-key";
+const RPC_SECRET: &str = "786c6220737761726d2074657374206761726167652072706320736563726574";
+const READY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn credentials() -> Credentials {
     Credentials {
-        access_key_id: "test-key-id".into(),
-        secret_access_key: "test-secret".into(),
+        access_key_id: ACCESS_KEY_ID.into(),
+        secret_access_key: SECRET_ACCESS_KEY.into(),
     }
 }
 
@@ -48,8 +57,7 @@ pub enum FirstGet {
 }
 
 struct Served {
-    host: String,
-    bodies: HashMap<String, Bytes>,
+    garage: PathBuf,
     first_get: Option<FirstGet>,
     paused: watch::Sender<bool>,
     gets: AtomicUsize,
@@ -59,7 +67,34 @@ struct Served {
 
 pub struct OriginServer {
     served: Arc<Served>,
-    _server: AbortOnDropHandle<()>,
+    host: String,
+    _proxy: AbortOnDropHandle<()>,
+    _garage: Child,
+    _directory: tempfile::TempDir,
+}
+
+/// Starts a single-node Garage whose S3 API listens on a Unix socket in
+/// `directory`, with the test bucket and key.
+fn start_garage(directory: &Path) -> (Child, PathBuf) {
+    let socket = directory.join("s3.sock");
+    let configuration = directory.join("garage.toml");
+    std::fs::write(&configuration, format!(
+        "metadata_dir = \"{meta}\"\ndata_dir = \"{data}\"\ndb_engine = \"sqlite\"\nreplication_factor = 1\n\
+         rpc_bind_addr = \"127.0.0.1:0\"\nrpc_secret = \"{RPC_SECRET}\"\n\n\
+         [s3_api]\ns3_region = \"{REGION}\"\napi_bind_addr = \"{socket}\"\n",
+        meta = directory.join("meta").display(), data = directory.join("data").display(), socket = socket.display(),
+    )).unwrap();
+    let root = std::env::var_os("TEST_SRCDIR").expect("Bazel runfiles");
+    let binary = PathBuf::from(root).join(std::env::var("GARAGE").expect("GARAGE names the Garage runfile"));
+    let log = std::fs::File::create(directory.join("garage.log")).unwrap();
+    let garage = Command::new(binary).arg("-c").arg(&configuration)
+        .args(["server", "--single-node", "--default-access-key", "--default-bucket"])
+        .env("GARAGE_DEFAULT_ACCESS_KEY", ACCESS_KEY_ID)
+        .env("GARAGE_DEFAULT_SECRET_KEY", SECRET_ACCESS_KEY)
+        .env("GARAGE_DEFAULT_BUCKET", BUCKET)
+        .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log)
+        .kill_on_drop(true).spawn().expect("start Garage");
+    (garage, socket)
 }
 
 impl OriginServer {
@@ -75,11 +110,14 @@ impl OriginServer {
         Self::start_many_with(bodies, None).await
     }
 
+    #[expect(clippy::disallowed_methods, reason = "a fault proxy in front of the real Garage S3 server: it holds, throttles and disconnects GETs and forwards every request to Garage")]
     async fn start_many_with(bodies: Vec<(BlakeHash, Bytes)>, first_get: Option<FirstGet>) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let (garage, socket) = start_garage(directory.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
         let served = Arc::new(Served {
-            host: listener.local_addr().unwrap().to_string(),
-            bodies: bodies.into_iter().map(|(hash, body)| (format!("/{BUCKET}/models/blake3/{}", hash.to_hex()), body)).collect(),
+            garage: socket,
             first_get,
             paused: watch::Sender::new(false),
             gets: AtomicUsize::new(0),
@@ -87,7 +125,7 @@ impl OriginServer {
             connections: AtomicUsize::new(0),
         });
         let accepting = served.clone();
-        let server = tokio::spawn(async move {
+        let proxy = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
@@ -100,7 +138,38 @@ impl OriginServer {
                 }
             }
         });
-        Self { served, _server: AbortOnDropHandle::new(server) }
+        let mut origin = Self { served, host, _proxy: AbortOnDropHandle::new(proxy), _garage: garage, _directory: directory };
+        origin.store(bodies).await;
+        origin
+    }
+
+    /// Stores each body under its CAS key once Garage serves the bucket, then
+    /// clears the counters the uploads touched.
+    async fn store(&mut self, bodies: Vec<(BlakeHash, Bytes)>) {
+        opendal::install_default();
+        let operator = opendal::Operator::new(opendal::services::S3::default()
+            .endpoint(&format!("http://{}", self.host)).bucket(BUCKET).region(REGION)
+            .access_key_id(ACCESS_KEY_ID).secret_access_key(SECRET_ACCESS_KEY).disable_config_load()).unwrap();
+        let deadline = tokio::time::Instant::now() + READY_DEADLINE;
+        for (hash, body) in bodies {
+            let key = format!("models/blake3/{}", hash.to_hex());
+            loop {
+                match operator.write(&key, body.clone()).await {
+                    Ok(_) => break,
+                    Err(error) => {
+                        let status = self._garage.try_wait().expect("check Garage's exit status");
+                        if status.is_some() || tokio::time::Instant::now() >= deadline {
+                            let log = std::fs::read_to_string(self._directory.path().join("garage.log")).unwrap_or_default();
+                            panic!("Garage did not store {key} (exit: {status:?}): {error:?}\n{log}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+        self.served.gets.store(0, Ordering::Relaxed);
+        self.served.get_offsets.lock().unwrap().clear();
+        self.served.connections.store(0, Ordering::Relaxed);
     }
 
     pub fn gets(&self) -> usize {
@@ -122,7 +191,7 @@ impl OriginServer {
 
     pub fn config(&self, concurrency: usize) -> OriginConfig {
         OriginConfig {
-            endpoint: format!("http://{}", self.served.host),
+            endpoint: format!("http://{}", self.host),
             bucket: BUCKET.into(),
             region: REGION.into(),
             key_template: "models/blake3/{blake3}".into(),
@@ -133,98 +202,89 @@ impl OriginServer {
     }
 }
 
-/// The `[start, end)` span of a single `bytes=start-[last]` range.
-fn byte_range(value: &str, length: usize) -> Option<(usize, usize)> {
-    let (start, last) = value.strip_prefix("bytes=")?.split_once('-')?;
-    let start: usize = start.parse().ok()?;
-    let end = if last.is_empty() { length } else { last.parse::<usize>().ok()?.saturating_add(1).min(length) };
-    (start < end).then_some((start, end))
+/// The start of a single `bytes=start-[last]` range.
+fn range_start(value: &str) -> Option<usize> {
+    value.strip_prefix("bytes=")?.split_once('-')?.0.parse().ok()
 }
 
-async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
-    while serve_request(&mut stream, &served).await {}
-}
-
-async fn serve_request(stream: &mut TcpStream, served: &Served) -> bool {
-    let mut buffer = Vec::new();
-    while !buffer.ends_with(b"\r\n\r\n") {
-        let mut bytes = [0; 4096];
+/// Reads one HTTP/1.1 message head, keeping any bytes read past it.
+async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S, buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    loop {
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let rest = buffer.split_off(end + 4);
+            return Some(std::mem::replace(buffer, rest));
+        }
+        let mut bytes = [0; 8192];
         match stream.read(&mut bytes).await {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return None,
             Ok(length) => buffer.extend_from_slice(&bytes[..length]),
         }
     }
-    let head = String::from_utf8_lossy(&buffer);
-    let mut request = head.lines().next().unwrap_or_default().split(' ');
-    let method = request.next().unwrap_or_default();
-    let path = request.next().unwrap_or_default();
-    let version = request.next().unwrap_or_default();
-    let header = |name: &str| {
-        head.lines().skip(1).find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.eq_ignore_ascii_case(name).then(|| value.trim())
-        }).unwrap_or_default()
-    };
-    let auth = header("authorization");
-    let signed = auth.split("SignedHeaders=").nth(1).and_then(|value| value.split_once(',')).map(|(names, _)| names);
-    let extra: Vec<_> = signed.unwrap_or_default().split(';')
-        .filter(|name| !matches!(*name, "" | "host" | "x-amz-date" | "x-amz-content-sha256"))
-        .map(|name| (name, header(name)))
-        .collect();
-    let expected = sigv4::sign_with_date(
-        &credentials(),
-        &sigv4::SigningInput {
-            method,
-            host: header("host"),
-            path,
-            headers: &extra,
-            payload_sha256: header("x-amz-content-sha256"),
-            region: REGION,
-            unix_secs: 0,
-        },
-        header("x-amz-date"),
-    );
+}
+
+/// Reads `length` bytes, starting with any already buffered.
+async fn read_body<S: AsyncReadExt + Unpin>(stream: &mut S, buffer: &mut Vec<u8>, length: usize) -> Option<Vec<u8>> {
+    while buffer.len() < length {
+        let mut bytes = [0; 65536];
+        match stream.read(&mut bytes).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => buffer.extend_from_slice(&bytes[..read]),
+        }
+    }
+    let rest = buffer.split_off(length);
+    Some(std::mem::replace(buffer, rest))
+}
+
+fn header<'a>(head: &'a str, name: &str) -> &'a str {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    }).unwrap_or_default()
+}
+
+async fn serve_connection(mut client: TcpStream, served: Arc<Served>) {
+    let Ok(mut garage) = UnixStream::connect(&served.garage).await else { return };
+    let (mut from_client, mut from_garage) = (Vec::new(), Vec::new());
+    while forward_request(&mut client, &mut garage, &mut from_client, &mut from_garage, &served).await {}
+}
+
+/// Forwards one request to Garage and its response to the client, applying
+/// the configured faults to GETs. Returns whether the connection stays open.
+async fn forward_request(
+    client: &mut TcpStream, garage: &mut UnixStream, from_client: &mut Vec<u8>, from_garage: &mut Vec<u8>, served: &Served,
+) -> bool {
+    let Some(request) = read_head(client, from_client).await else { return false };
+    let head = String::from_utf8_lossy(&request).into_owned();
+    let method = head.split(' ').next().unwrap_or_default().to_owned();
+    let length = header(&head, "content-length").parse().unwrap_or(0);
+    let Some(body) = read_body(client, from_client, length).await else { return false };
     let mut first_get = None;
-    let mut content_range = String::new();
-    let (status, length, payload) = if version != "HTTP/1.1" {
-        ("505 HTTP Version Not Supported", 0, &[][..])
-    } else if auth != expected.authorization || header("host") != served.host {
-        ("403 Forbidden", 0, &[][..])
-    } else if !served.bodies.contains_key(path) {
-        ("404 Not Found", 0, &[][..])
-    } else if method == "HEAD" {
-        ("200 OK", served.bodies[path].len(), &[][..])
-    } else if method == "GET" {
-        let body = served.bodies[path].as_ref();
-        let range = header("range");
-        let span = if range.is_empty() { Some((0, body.len())) } else { byte_range(range, body.len()) };
+    if method == "GET" {
         if served.gets.fetch_add(1, Ordering::Relaxed) == 0 {
             first_get = served.first_get;
         }
-        served.get_offsets.lock().unwrap().push(span.map_or(0, |(start, _)| start));
+        served.get_offsets.lock().unwrap().push(range_start(header(&head, "range")).unwrap_or(0));
         let mut paused = served.paused.subscribe();
         let _ = paused.wait_for(|paused| !paused).await;
-        match span {
-            _ if matches!(first_get, Some(FirstGet::Throttle)) => ("429 Too Many Requests", 0, &[][..]),
-            Some((start, end)) if !range.is_empty() => {
-                content_range = format!("Content-Range: bytes {start}-{}/{}\r\n", end - 1, body.len());
-                ("206 Partial Content", end - start, &body[start..end])
-            }
-            Some(_) => ("200 OK", body.len(), body),
-            None => ("416 Range Not Satisfiable", 0, &[][..]),
+        if matches!(first_get, Some(FirstGet::Throttle)) {
+            return client.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n").await.is_ok();
         }
+    }
+    if garage.write_all(&request).await.is_err() || garage.write_all(&body).await.is_err() {
+        return false;
+    }
+    let Some(response) = read_head(garage, from_garage).await else { return false };
+    let response_head = String::from_utf8_lossy(&response).into_owned();
+    let status = response_head.split(' ').nth(1).unwrap_or_default();
+    let length = if method == "HEAD" || matches!(status, "204" | "304") {
+        0
     } else {
-        ("400 Bad Request", 0, &[][..])
+        header(&response_head, "content-length").parse().unwrap_or(0)
     };
-    let keep_alive = !matches!(first_get, Some(FirstGet::Disconnect(_)))
-        && !header("connection").eq_ignore_ascii_case("close");
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\n{content_range}Connection: {connection}\r\n\r\n");
-    let payload_length = match first_get {
-        Some(FirstGet::Disconnect(prefix)) => prefix.min(payload.len()),
-        _ => payload.len(),
+    let Some(payload) = read_body(garage, from_garage, length).await else { return false };
+    let (payload, keep_alive) = match first_get {
+        Some(FirstGet::Disconnect(prefix)) => (&payload[..prefix.min(payload.len())], false),
+        _ => (&payload[..], !header(&head, "connection").eq_ignore_ascii_case("close")),
     };
-    stream.write_all(response.as_bytes()).await.is_ok()
-        && stream.write_all(&payload[..payload_length]).await.is_ok()
-        && keep_alive
+    client.write_all(&response).await.is_ok() && client.write_all(payload).await.is_ok() && keep_alive
 }

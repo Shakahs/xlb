@@ -1,5 +1,11 @@
-load("@rules_rs//rs:rust_library.bzl", "rust_library")
-load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//tools/rust:rust_library.bzl", "rust_library")
+load("//tools/rust:rust_test.bzl", "rust_test")
+
+# The swarm tests' S3 origin is a real Garage server behind a fault proxy
+# (tests/origin_server).
+GARAGE_DATA = ["@garage_binary//file"]
+
+GARAGE_ENV = {"GARAGE": "$(rlocationpath @garage_binary//file)"}
 
 rust_library(
     name = "xlb",
@@ -44,13 +50,12 @@ rust_test(
     crate = ":xlb",
     compile_data = [
         "tests/origin_server/mod.rs",
-        "tests/origin_server/sigv4.rs",
     ],
+    data = GARAGE_DATA,
     edition = "2021",
+    env = GARAGE_ENV,
     deps = [
-        "@scheduler_crates//:hex",
         "@scheduler_crates//:opentelemetry_sdk",
-        "@scheduler_crates//:sha2",
         "@scheduler_crates//:tempfile",
         "@scheduler_crates//:tracing-subscriber",
     ],
@@ -60,42 +65,50 @@ rust_test(
     name = "chunk_concurrency_benchmark",
     crate = ":xlb",
     args = ["--ignored", "--exact", "--nocapture", "swarm_tests::benchmark_hundred_concurrent_chunk_downloads"],
-    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    compile_data = ["tests/origin_server/mod.rs"],
+    data = GARAGE_DATA,
+    env = GARAGE_ENV,
     edition = "2021",
     exec_properties = {"test.workload-isolation-type": "firecracker", "test.network-enable-ipv6": "true", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
     size = "large",
     tags = ["manual", "cpu:8"],
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 rust_test(
     name = "multi_peer_concurrency_benchmark",
     crate = ":xlb",
     args = ["--ignored", "--exact", "--nocapture", "swarm_tests::benchmark_hundred_concurrent_multi_peer_downloads"],
-    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    compile_data = ["tests/origin_server/mod.rs"],
+    data = GARAGE_DATA,
+    env = GARAGE_ENV,
     edition = "2021",
     exec_properties = {"test.workload-isolation-type": "firecracker", "test.network-enable-ipv6": "true", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
     size = "large",
     tags = ["manual", "cpu:8"],
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 rust_test(
     name = "s3_telemetry_test",
     crate = ":xlb",
     args = ["--ignored", "--exact", "swarm_tests::s3_metrics_report_active_requests_and_response_rates"],
-    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    compile_data = ["tests/origin_server/mod.rs"],
+    data = GARAGE_DATA,
+    env = GARAGE_ENV,
     edition = "2021",
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 rust_test(
     name = "peer_telemetry_test",
     crate = ":xlb",
     args = ["--ignored", "--exact", "swarm_tests::peer_metrics_report_connections_and_transferred_bytes"],
-    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    compile_data = ["tests/origin_server/mod.rs"],
+    data = GARAGE_DATA,
+    env = GARAGE_ENV,
     edition = "2021",
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 # Each CAS memory budget test reads its own process's resident memory, so it
@@ -104,24 +117,28 @@ rust_test(
     name = "origin_cas_memory_budget_test",
     crate = ":xlb",
     args = ["--ignored", "--exact", "--nocapture", "swarm_tests::origin_fetches_stay_within_the_cas_memory_budget"],
-    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    compile_data = ["tests/origin_server/mod.rs"],
+    data = GARAGE_DATA,
+    env = GARAGE_ENV,
     edition = "2021",
     exec_properties = {"test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
     size = "large",
     tags = ["cpu:8"],
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 rust_test(
     name = "uring_cas_memory_budget_test",
     crate = ":xlb",
     args = ["--ignored", "--exact", "--nocapture", "cas_cache::tests::uring_cache_stays_within_its_memory_budget_under_chunk_churn"],
-    compile_data = ["tests/origin_server/mod.rs", "tests/origin_server/sigv4.rs"],
+    compile_data = ["tests/origin_server/mod.rs"],
+    data = GARAGE_DATA,
+    env = GARAGE_ENV,
     edition = "2021",
     exec_properties = {"test.workload-isolation-type": "firecracker", "test.EstimatedMemory": "8GB", "test.EstimatedCPU": "8"},
     size = "large",
     tags = ["cpu:8"],
-    deps = ["@scheduler_crates//:hex", "@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:sha2", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
+    deps = ["@scheduler_crates//:opentelemetry_sdk", "@scheduler_crates//:tempfile", "@scheduler_crates//:tracing-subscriber"],
 )
 
 filegroup(name = "traced_sources", srcs = glob(["src/**/*.rs", "tests/**/*.rs"], allow_empty = True), visibility = ["//doc:__pkg__"])
